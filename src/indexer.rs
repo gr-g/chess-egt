@@ -34,16 +34,16 @@ fn initialize_kings_map() -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
     let mut r = vec![vec![999; 64]; 28]; // from kings positions to index
     let mut i = 0;
     let mut wk;
-    wk = 0; for bk in (2..8).chain(10..16).chain(18..24).chain(27..32).chain(36..40).chain(45..48).chain(54..56).chain(63..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 1; for bk in (3..8).chain(11..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 2; for bk in (0..1).chain(4..9).chain(12..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 3; for bk in (0..2).chain(5..10).chain(13..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 9; for bk in (3..8).chain(11..16).chain(19..24).chain(27..32).chain(36..40).chain(45..48).chain(54..56).chain(63..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 10; for bk in (0..1).chain(4..9).chain(12..17).chain(20..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 11; for bk in (0..2).chain(5..10).chain(13..18).chain(21..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 18; for bk in (0..8).chain(12..16).chain(20..24).chain(28..32).chain(36..40).chain(45..48).chain(54..56).chain(63..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 19; for bk in (0..10).chain(13..18).chain(21..26).chain(29..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 27; for bk in (0..8).chain(9..16).chain(21..24).chain(29..32).chain(37..40).chain(45..48).chain(54..56).chain(63..64) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 0; for bk in (1..7).chain(9..15).chain(17..23).chain(26..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 1; for bk in (2..7).chain(10..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 2; for bk in (0..1).chain(3..8).chain(11..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 3; for bk in (0..2).chain(4..9).chain(12..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 9; for bk in (3..8).chain(10..15).chain(18..23).chain(26..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 10; for bk in (0..1).chain(4..9).chain(11..16).chain(19..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 11; for bk in (0..2).chain(5..10).chain(12..17).chain(20..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 18; for bk in (0..8).chain(12..16).chain(19..23).chain(27..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 19; for bk in (0..10).chain(13..18).chain(20..25).chain(28..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
+    wk = 27; for bk in (0..8).chain(9..16).chain(21..24).chain(28..31).chain(36..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
     assert_eq!(i, 462);
     (m, r)
 }
@@ -396,6 +396,7 @@ impl Indexer {
             //println!("buffer_pidx: {:?}", self.buffer_pidx);
         } else {
             // `buffer_pidx` has values in [0..462, 0..1, 0..62, 0..61, ...].
+            //println!("buffer_pidx: {:?}", self.buffer_pidx);
             self.unmap_kings();
             // Now `buffer_pidx` has values in [0..64, 0..63, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", self.buffer_pidx);
@@ -503,13 +504,6 @@ impl Indexer {
 
     // Builds a board using the coordinates stored in `buffer_pos`.
     fn pos_to_board(&mut self, side_to_move: Color) -> Option<Board> {
-        // If the black king is in the upper diagonal, the index encodes
-        // an invalid position.
-        // TODO: Remove after reencoding kings
-        if self.n_pawns == 0 && self.buffer_pos[1].0 > self.buffer_pos[1].1 {
-            return None;
-        }
-
         if self.n_pawns > 0 && side_to_move == Color::Black {
             // The ranks are encoded from the point of view of the side to move. Switch them up.
             for i in 0..self.n_pieces {
