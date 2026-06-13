@@ -172,8 +172,8 @@ impl Indexer {
         let ep_options = Self::setup_ep_options(&mut piece_set[0..n_unique_pawns], combinations_without_ep);
         let current_ep_option = ep_options[0];
 
-        println!("pieces: {:?}", &piece_set);
-        println!("ep_options: {:?}", &ep_options);
+        //println!("pieces: {:?}", &piece_set);
+        //println!("ep_options: {:?}", &ep_options);
 
         let index_range = ep_options.last().unwrap().range_end;
 

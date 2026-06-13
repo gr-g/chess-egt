@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use chess::{Board, BoardBuilder, Color, File, Piece, Square};
 use crate::DtcOutcome;
@@ -66,7 +67,7 @@ impl Arena {
 
 /// A stack-allocated, copyable key representing the pawn file assignments for both sides.
 /// This avoids all string formatting and heap allocations during tablebase probing.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PawnKey {
     files: [u8; 8],  // Up to 8 pawns, padded with 255
 }
@@ -127,35 +128,19 @@ impl EgtFile {
                 if is_canonical(stm_files, sntm_files) {
                     let pieces = build_pieces(stm_files, sntm_files, &other_pieces);
                     let egt = Egt::from_pieces(pieces)?;
-                    let name = get_tablename(&egt.pieces);
-                    egt_pairs.push((name, egt));
+                    let key = PawnKey::new(stm_files, sntm_files);
+                    egt_pairs.push((key, egt));
                 }
             }
         }
 
-        // Sort alphabetically by tablename to ensure a stable, deterministic order
-        egt_pairs.sort_by(|(name1, _), (name2, _)| name1.cmp(name2));
+        // Sort by PawnKey to ensure a stable, deterministic order
+        egt_pairs.sort_by_key(|(key, _)| *key);
 
         let mut egts = Vec::with_capacity(egt_pairs.len());
         let mut egt_map = HashMap::with_capacity(egt_pairs.len());
 
-        for (idx, (_name, egt)) in egt_pairs.into_iter().enumerate() {
-            let mut stm_files = Vec::new();
-            let mut sntm_files = Vec::new();
-            for &(piece, side, multiplicity) in &egt.pieces {
-                if let EgtPiece::Pawn(file) = piece {
-                    for _ in 0..multiplicity {
-                        if side == EgtSide::SideToMove {
-                            stm_files.push(file);
-                        } else {
-                            sntm_files.push(file);
-                        }
-                    }
-                }
-            }
-            stm_files.sort_by_key(|f| f.to_index());
-            sntm_files.sort_by_key(|f| f.to_index());
-            let key = PawnKey::new(&stm_files, &sntm_files);
+        for (idx, (key, egt)) in egt_pairs.into_iter().enumerate() {
             egt_map.insert(key, idx);
             egts.push(egt);
         }
@@ -236,18 +221,61 @@ impl EgtFile {
         }
     }
 
-    /// Flushes all dirty frames to disk using seekable Zstd compression.
-    pub fn flush(&mut self) -> Result<(), ()> {
-        for frame in &mut self.frames {
-            if let FrameState::Uncompressed { compressed, uncompressed: _, dirty } = frame {
-                if *dirty {
-                    // In a full implementation, we would bit-slice `uncompressed`
-                    // and compress it using Zstd, then write to disk.
-                    *compressed = Some(vec![]); // Stub compressed bytes
-                    *dirty = false;
+    /// Saves the entire EgtFile to disk using seekable Zstd compression.
+    pub fn save_to_disk(&mut self, arena: &mut Arena) -> Result<(), ()> {
+        use std::fs::File;
+        use std::io::BufWriter;
+        use zeekstd::Encoder;
+
+        let file = File::create(&self.path).map_err(|_| ())?;
+        let writer = BufWriter::new(file);
+        let mut encoder = Encoder::new(writer).map_err(|_| ())?;
+
+        for frame_idx in 0..self.frames.len() {
+            // Ensure the frame is loaded (either uncompressed or compressed)
+            // If it is Unallocated, we treat it as all zeros (unknown/invalid)
+            let uncompressed_data = match &mut self.frames[frame_idx] {
+                FrameState::Uncompressed { uncompressed, .. } => uncompressed.clone(),
+                FrameState::Compressed(_compressed_bytes) => {
+                    self.ensure_uncompressed(frame_idx, arena);
+                    if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
+                        uncompressed.clone()
+                    } else {
+                        return Err(());
+                    }
                 }
+                FrameState::Unallocated => {
+                    vec![0u16; self.frame_size]
+                }
+            };
+
+            // Transpose (bit-slice) the frame
+            let transposed = transpose_frame(&uncompressed_data);
+
+            // Compress the transposed frame
+            encoder.compress(&transposed).map_err(|_| ())?;
+            encoder.end_frame().map_err(|_| ())?;
+        }
+
+        // Finish the seekable Zstd file (writes the seek table)
+        encoder.finish().map_err(|_| ())?;
+
+        Ok(())
+    }
+
+    /// Saves the entire EgtFile to disk and evicts all uncompressed frames,
+    /// returning their memory to the arena.
+    pub fn save_and_evict_all(&mut self, arena: &mut Arena) -> Result<(), ()> {
+        self.save_to_disk(arena)?;
+
+        // Evict all frames
+        for frame_idx in 0..self.frames.len() {
+            if let FrameState::Uncompressed { .. } = &self.frames[frame_idx] {
+                self.frames[frame_idx] = FrameState::Compressed(vec![]);
+                arena.deallocate(self.frame_size * 2);
             }
         }
+
         Ok(())
     }
 
@@ -345,12 +373,33 @@ impl EgtFile {
                 let mem_size = self.frame_size * 2;
                 arena.allocate(mem_size);
 
-                // Stub decompression: in full implementation, we would decompress
-                // `compressed_bytes` using Zstd and reverse the bit-slicing.
-                let uncompressed = vec![0; self.frame_size];
+                let mut transposed = vec![0u8; self.frame_size * 2];
+
+                if compressed_bytes.is_empty() {
+                    // Load and decompress from disk on demand!
+                    use std::fs::File;
+                    use zeekstd::Decoder;
+
+                    let file = File::open(&self.path).expect("Failed to open EgtFile");
+                    let mut decoder = Decoder::new(file).expect("Failed to create Decoder");
+
+                    let uncompressed_offset = (frame_idx * self.frame_size * 2) as u64;
+                    decoder.seek(SeekFrom::Start(uncompressed_offset)).expect("Failed to seek");
+                    decoder.read_exact(&mut transposed).expect("Failed to read");
+                } else {
+                    // Decompress from memory!
+                    use zeekstd::{BytesWrapper, Decoder};
+
+                    let wrapper = BytesWrapper::new(compressed_bytes);
+                    let mut decoder = Decoder::new(wrapper).expect("Failed to create Decoder");
+                    decoder.read_exact(&mut transposed).expect("Failed to read");
+                }
+
+                // Detranspose the frame
+                let uncompressed = detranspose_frame(&transposed, self.frame_size);
 
                 self.frames[frame_idx] = FrameState::Uncompressed {
-                    compressed: Some(compressed_bytes.clone()),
+                    compressed: if compressed_bytes.is_empty() { None } else { Some(compressed_bytes.clone()) },
                     uncompressed,
                     dirty: false,
                 };
@@ -393,6 +442,116 @@ impl SimplePrng {
         let val = self.next();
         min + (val % (max - min + 1))
     }
+}
+
+/// Transposes (bit-slices) a frame of N positions to maximize Zstd compressibility.
+pub fn transpose_frame(uncompressed: &[u16]) -> Vec<u8> {
+    let n = uncompressed.len();
+    let mut output = vec![0u8; n * 2];
+
+    let set_bit = |slice: &mut [u8], bit_idx: usize, bit_val: u16| {
+        if bit_val != 0 {
+            slice[bit_idx / 8] |= 1 << (bit_idx % 8);
+        }
+    };
+
+    // Slice offsets in bytes
+    let offset_0 = 0;
+    let offset_1 = n / 8;
+    let offset_2 = (n / 8) * 2;
+    let offset_3 = (n / 8) * 3;
+    let offset_4 = offset_3 + (n / 2);
+    let offset_5 = offset_4 + (n / 2);
+
+    for i in 0..n {
+        let val = uncompressed[i];
+
+        // Slice 0 (bit 0)
+        set_bit(&mut output[offset_0..], i, val & 1);
+
+        // Slice 1 (bit 1)
+        set_bit(&mut output[offset_1..], i, val & 2);
+
+        // Slice 2 (bit 2)
+        set_bit(&mut output[offset_2..], i, val & 4);
+
+        // Slice 3 (bits 3-6)
+        let val_3 = (val >> 3) & 0xF;
+        for b in 0..4 {
+            set_bit(&mut output[offset_3..], i * 4 + b, val_3 & (1 << b));
+        }
+
+        // Slice 4 (bits 7-10)
+        let val_4 = (val >> 7) & 0xF;
+        for b in 0..4 {
+            set_bit(&mut output[offset_4..], i * 4 + b, val_4 & (1 << b));
+        }
+
+        // Slice 5 (bits 11-15)
+        let val_5 = (val >> 11) & 0x1F;
+        for b in 0..5 {
+            set_bit(&mut output[offset_5..], i * 5 + b, val_5 & (1 << b));
+        }
+    }
+
+    output
+}
+
+/// Reverses the transposition (un-bit-slices) of a frame.
+pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<u16> {
+    let n = frame_size;
+    let mut output = vec![0u16; n];
+
+    let get_bit = |slice: &[u8], bit_idx: usize| -> u16 {
+        let byte = slice[bit_idx / 8];
+        ((byte >> (bit_idx % 8)) & 1) as u16
+    };
+
+    // Slice offsets in bytes
+    let offset_0 = 0;
+    let offset_1 = n / 8;
+    let offset_2 = (n / 8) * 2;
+    let offset_3 = (n / 8) * 3;
+    let offset_4 = offset_3 + (n / 2);
+    let offset_5 = offset_4 + (n / 2);
+
+    for i in 0..n {
+        let mut val = 0u16;
+
+        // Slice 0 (bit 0)
+        val |= get_bit(&transposed[offset_0..], i);
+
+        // Slice 1 (bit 1)
+        val |= get_bit(&transposed[offset_1..], i) << 1;
+
+        // Slice 2 (bit 2)
+        val |= get_bit(&transposed[offset_2..], i) << 2;
+
+        // Slice 3 (bits 3-6)
+        let mut val_3 = 0u16;
+        for b in 0..4 {
+            val_3 |= get_bit(&transposed[offset_3..], i * 4 + b) << b;
+        }
+        val |= val_3 << 3;
+
+        // Slice 4 (bits 7-10)
+        let mut val_4 = 0u16;
+        for b in 0..4 {
+            val_4 |= get_bit(&transposed[offset_4..], i * 4 + b) << b;
+        }
+        val |= val_4 << 7;
+
+        // Slice 5 (bits 11-15)
+        let mut val_5 = 0u16;
+        for b in 0..5 {
+            val_5 |= get_bit(&transposed[offset_5..], i * 5 + b) << b;
+        }
+        val |= val_5 << 11;
+
+        output[i] = val;
+    }
+
+    output
 }
 
 /// Parses the top-level tablename (e.g., "KRP_KP") to extract:
@@ -508,74 +667,6 @@ fn build_pieces(
     }
 
     pieces
-}
-
-/// Formats a list of pieces into a canonical tablename string (e.g., "KPaPdPf_KPbPf").
-pub fn get_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
-    let mut stm_king = String::new();
-    let mut stm_others = String::new();
-    let mut stm_pawns = String::new();
-
-    let mut sntm_king = String::new();
-    let mut sntm_others = String::new();
-    let mut sntm_pawns = String::new();
-
-    for &(piece, side, multiplicity) in pieces {
-        let (king, others, pawns) = if side == EgtSide::SideToMove {
-            (&mut stm_king, &mut stm_others, &mut stm_pawns)
-        } else {
-            (&mut sntm_king, &mut sntm_others, &mut sntm_pawns)
-        };
-
-        match piece {
-            EgtPiece::King => {
-                for _ in 0..multiplicity {
-                    king.push('K');
-                }
-            }
-            EgtPiece::Queen => {
-                for _ in 0..multiplicity {
-                    others.push('Q');
-                }
-            }
-            EgtPiece::Rook => {
-                for _ in 0..multiplicity {
-                    others.push('R');
-                }
-            }
-            EgtPiece::Bishop => {
-                for _ in 0..multiplicity {
-                    others.push('B');
-                }
-            }
-            EgtPiece::Knight => {
-                for _ in 0..multiplicity {
-                    others.push('N');
-                }
-            }
-            EgtPiece::Pawn(file) => {
-                let file_char = match file {
-                    File::A => 'a',
-                    File::B => 'b',
-                    File::C => 'c',
-                    File::D => 'd',
-                    File::E => 'e',
-                    File::F => 'f',
-                    File::G => 'g',
-                    File::H => 'h',
-                };
-                for _ in 0..multiplicity {
-                    pawns.push_str(&format!("P{}", file_char));
-                }
-            }
-        }
-    }
-
-    format!(
-        "{}{}{}_{}{}{}",
-        stm_king, stm_others, stm_pawns,
-        sntm_king, sntm_others, sntm_pawns
-    )
 }
 
 /// Mirrors a chess board horizontally.
@@ -750,5 +841,30 @@ mod tests {
     fn egt_file_decode_encode_kpp_kp() {
         // KPP_KP has ~15 million positions across 156 sub-tables.
         run_round_trip_test("KPP_KP", 500);
+    }
+
+    #[test]
+    fn egt_file_compression_decompression() {
+        let path = PathBuf::from("test_compression.egt");
+        let mut egt_file = EgtFile::new(path.clone(), "KP_K", true).unwrap();
+        let mut arena = Arena::new(16 * 1024 * 1024);
+
+        // Generate random outcomes
+        egt_file.generate_random_outcomes(&mut arena);
+
+        // Sample a position
+        let board = Board::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").unwrap();
+        let original_outcome = egt_file.probe(&board, &mut arena);
+
+        // Save and evict
+        egt_file.save_and_evict_all(&mut arena).unwrap();
+        assert_eq!(arena.used(), 0);
+
+        // Probe again (triggers on-demand decompression from disk)
+        let loaded_outcome = egt_file.probe(&board, &mut arena);
+        assert_eq!(original_outcome, loaded_outcome);
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
     }
 }

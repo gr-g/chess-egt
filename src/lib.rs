@@ -118,19 +118,22 @@ impl EgtGenerator {
 
     pub fn generate(&self, tablename: &str) {
         println!("Generating table {} at {:?}", tablename, self.path);
-        
+
+        // Derive the file path from the folder path and tablename
+        let file_path = self.path.join(format!("{}.egt", tablename));
+
         // Create an EgtFile from scratch
-        let mut egt_file = crate::egt_file::EgtFile::new(self.path.clone(), tablename, true)
+        let mut egt_file = crate::egt_file::EgtFile::new(file_path, tablename, true)
             .expect("Failed to create EgtFile");
 
-        // Create a temporary Arena (e.g., 16GB capacity)
-        let mut arena = crate::egt_file::Arena::new(16 * 1024 * 1024 * 1024);
+        // Create a temporary Arena (e.g., 4GB capacity)
+        let mut arena = crate::egt_file::Arena::new(4 * 1024 * 1024 * 1024);
 
         // Generate random outcomes
         egt_file.generate_random_outcomes(&mut arena);
 
-        // Flush to disk (currently a stub)
-        egt_file.flush().expect("Failed to flush EgtFile");
+        // Save to disk
+        egt_file.save_to_disk(&mut arena).expect("Failed to flush EgtFile");
 
         println!(
             "Successfully generated table {} with {} positions.",
