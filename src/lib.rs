@@ -71,8 +71,7 @@ impl PartialOrd for DtcOutcome {
 impl DtcOutcome {
     pub fn from_u16(value: u16) -> Self {
         let n = value >> 3;
-        match value & 0x111 {
-            0b000 => panic!("invalid value used to create DtcOutcome"),
+        match value & 0b111 {
             0b001 => Self::Draw,
             0b010 => Self::Win(ConversionType::Checkmate, n),
             0b100 => Self::Win(ConversionType::Promotion, n),
@@ -80,19 +79,19 @@ impl DtcOutcome {
             0b011 => Self::Loss(ConversionType::Checkmate, n),
             0b101 => Self::Loss(ConversionType::Promotion, n),
             0b111 => Self::Loss(ConversionType::Capture, n),
-            _ => unreachable!(),
+            _ => panic!("invalid value used to create DtcOutcome"),
         }
     }
 
     pub fn to_u16(&self) -> u16 {
         match self {
             Self::Draw => 0b001,
-            Self::Win(ConversionType::Checkmate, n) => 0b010 + n << 3,
-            Self::Win(ConversionType::Promotion, n) => 0b100 + n << 3,
-            Self::Win(ConversionType::Capture, n) => 0b0110 + n << 3,
-            Self::Loss(ConversionType::Checkmate, n) => 0b011 + n << 3,
-            Self::Loss(ConversionType::Promotion, n) => 0b101 + n << 3,
-            Self::Loss(ConversionType::Capture, n) => 0b0111 + n << 3,
+            Self::Win(ConversionType::Checkmate, n) => 0b010 | (n << 3),
+            Self::Win(ConversionType::Promotion, n) => 0b100 | (n << 3),
+            Self::Win(ConversionType::Capture, n) => 0b0110 | (n << 3),
+            Self::Loss(ConversionType::Checkmate, n) => 0b011 | (n << 3),
+            Self::Loss(ConversionType::Promotion, n) => 0b101 | (n << 3),
+            Self::Loss(ConversionType::Capture, n) => 0b0111 | (n << 3),
         }
     }
 }
