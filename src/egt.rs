@@ -51,6 +51,15 @@ impl Egt {
         self.indexer.index_range
     }
 
+    // Setup an endgame table from a set of pieces.
+    pub fn from_pieces(mut pieces: Vec<(EgtPiece, EgtSide, usize)>) -> Result<Self, ()> {
+        // Sort: first the pawns, then the kings, then all other pieces.
+        pieces.sort();
+
+        let indexer = Indexer::from_pieces(&pieces)?;
+        Ok(Egt { pieces, indexer })
+    }
+
     // Setup an endgame table from a string such as "KQ_KRPb"
     pub fn from_tablename(tablename: &str) -> Result<Self, ()> {
         let (stm, sntm) = tablename.split_once('_').ok_or(())?;
@@ -98,10 +107,7 @@ impl Egt {
                 }
             }
         }
-           // Sort: first the pawns, then the kings, then all other pieces.
-        pieces.sort();
 
-        let indexer = Indexer::from_pieces(&pieces)?;
-        Ok(Egt { pieces, indexer })
+        Egt::from_pieces(pieces)
     }
 }

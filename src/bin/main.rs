@@ -1,8 +1,6 @@
-use chess::Color;
 use clap::Parser;
-use chess_egt::{egt, EgtGenerator, EgtProber};
+use chess_egt::egt;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "chess-egt")]

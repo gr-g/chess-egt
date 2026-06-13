@@ -1,6 +1,7 @@
 mod indexer;
 pub mod piece_set;
 pub mod egt;
+pub mod egt_file;
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -96,6 +97,7 @@ impl DtcOutcome {
     }
 }
 
+#[allow(dead_code)]
 pub struct EgtGenerator {
     path: PathBuf,
     save_wdl_oneside: bool,
@@ -116,10 +118,29 @@ impl EgtGenerator {
 
     pub fn generate(&self, tablename: &str) {
         println!("Generating table {} at {:?}", tablename, self.path);
-        // Implementation goes here
+        
+        // Create an EgtFile from scratch
+        let mut egt_file = crate::egt_file::EgtFile::new(self.path.clone(), tablename, true)
+            .expect("Failed to create EgtFile");
+
+        // Create a temporary Arena (e.g., 16GB capacity)
+        let mut arena = crate::egt_file::Arena::new(16 * 1024 * 1024 * 1024);
+
+        // Generate random outcomes
+        egt_file.generate_random_outcomes(&mut arena);
+
+        // Flush to disk (currently a stub)
+        egt_file.flush().expect("Failed to flush EgtFile");
+
+        println!(
+            "Successfully generated table {} with {} positions.",
+            tablename,
+            egt_file.total_positions()
+        );
     }
 }
 
+#[allow(dead_code)]
 pub struct EgtProber {
     path: PathBuf,
 }
