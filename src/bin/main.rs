@@ -42,9 +42,10 @@ fn main() {
     } else if cli.generate_all_3 {
         println!("Generating all 3-men tables...");
     } else if let Some(fen) = cli.position {
-        let board = chess::Board::from_str(&fen).expect("Invalid FEN");
+        let fen_obj = shakmaty::fen::Fen::from_str(&fen).expect("Invalid FEN");
+        let setup: shakmaty::Setup = fen_obj.into();
         let _prober = EgtProber::new(&cli.path);
-        println!("Probing position: {}", board);
+        println!("Probing position: {:?}", setup);
     } else {
         println!("No action specified. Use --help for options.");
     }

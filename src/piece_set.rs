@@ -1,4 +1,4 @@
-use chess::{File, Piece};
+use shakmaty::{File, Role};
 use std::cmp::Ordering;
 
 pub static ALL_EGT_PIECES: [EgtPiece; 13] = [
@@ -35,14 +35,14 @@ impl EgtPiece {
         }
     }
 
-    pub fn to_piece(&self) -> Piece {
+    pub fn to_role(&self) -> Role {
         match self {
-            EgtPiece::Pawn(_) => Piece::Pawn,
-            EgtPiece::King => Piece::King,
-            EgtPiece::Queen => Piece::Queen,
-            EgtPiece::Rook => Piece::Rook,
-            EgtPiece::Bishop => Piece::Bishop,
-            EgtPiece::Knight => Piece::Knight,
+            EgtPiece::Pawn(_) => Role::Pawn,
+            EgtPiece::King => Role::King,
+            EgtPiece::Queen => Role::Queen,
+            EgtPiece::Rook => Role::Rook,
+            EgtPiece::Bishop => Role::Bishop,
+            EgtPiece::Knight => Role::Knight,
         }
     }
 

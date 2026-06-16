@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use chess::{Board, BoardBuilder, Color, File, Piece, Square};
-use crate::DtcOutcome;
+use shakmaty::{File, Setup};
+use crate::MaybeDtcOutcome;
 use crate::egt::Egt;
 use crate::piece_set::{EgtPiece, EgtSide};
 
@@ -20,8 +20,8 @@ pub enum FrameState {
     Uncompressed {
         /// Cached compressed bytes to avoid re-compression if not dirty on eviction.
         compressed: Option<Vec<u8>>,
-        /// Uncompressed DtcOutcome values (stored as u16 for efficiency).
-        uncompressed: Vec<u16>,
+        /// Uncompressed MaybeDtcOutcome values.
+        uncompressed: Vec<MaybeDtcOutcome>,
         /// True if the frame has been modified since it was loaded or created.
         dirty: bool,
     },
@@ -79,11 +79,11 @@ impl PawnKey {
         let mut arr = [255; 8];
         let mut i = 0;
         for &f in stm {
-            arr[i] = f.to_index() as u8;
+            arr[i] = f.to_usize() as u8;
             i += 1;
         }
         for &f in sntm {
-            arr[i] = f.to_index() as u8 + 8;
+            arr[i] = f.to_usize() as u8 + 8;
             i += 1;
         }
         Self {
@@ -173,7 +173,7 @@ impl EgtFile {
     }
 
     /// Probes the outcome of a specific board position.
-    pub fn probe(&mut self, board: &Board, arena: &mut Arena) -> Option<DtcOutcome> {
+    pub fn probe(&mut self, board: &Setup, arena: &mut Arena) -> Option<MaybeDtcOutcome> {
         let (egt_idx, local_index) = self.map_position_to_egt(board)?;
         let global_index = self.get_global_index(egt_idx, local_index);
 
@@ -187,19 +187,14 @@ impl EgtFile {
         self.ensure_uncompressed(frame_idx, arena);
 
         if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
-            let val = uncompressed[offset];
-            if val == 0 {
-                None // Invalid/unknown
-            } else {
-                Some(DtcOutcome::from_u16(val))
-            }
+            Some(uncompressed[offset])
         } else {
             None
         }
     }
 
     /// Writes the outcome of a specific board position.
-    pub fn write_outcome(&mut self, board: &Board, outcome: DtcOutcome, arena: &mut Arena) -> Result<(), ()> {
+    pub fn write_outcome(&mut self, board: &Setup, outcome: MaybeDtcOutcome, arena: &mut Arena) -> Result<(), ()> {
         let (egt_idx, local_index) = self.map_position_to_egt(board).ok_or(())?;
         let global_index = self.get_global_index(egt_idx, local_index);
 
@@ -213,7 +208,7 @@ impl EgtFile {
         self.ensure_uncompressed(frame_idx, arena);
 
         if let FrameState::Uncompressed { uncompressed, dirty, .. } = &mut self.frames[frame_idx] {
-            uncompressed[offset] = outcome.to_u16();
+            uncompressed[offset] = outcome;
             *dirty = true;
             Ok(())
         } else {
@@ -241,11 +236,11 @@ impl EgtFile {
                     if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
                         uncompressed.clone()
                     } else {
-                        return Err(());
+                        unreachable!()
                     }
                 }
                 FrameState::Unallocated => {
-                    vec![0u16; self.frame_size]
+                    vec![MaybeDtcOutcome::INVALID; self.frame_size]
                 }
             };
 
@@ -280,18 +275,18 @@ impl EgtFile {
     }
 
     /// Maps a board position to the corresponding Egt index and local index.
-    fn map_position_to_egt(&self, board: &Board) -> Option<(usize, usize)> {
-        let stm_color = board.side_to_move();
+    fn map_position_to_egt(&self, board: &Setup) -> Option<(usize, usize)> {
+        let stm_color = board.turn;
         let sntm_color = !stm_color;
 
-        let stm_pawns_bb = *board.pieces(Piece::Pawn) & board.color_combined(stm_color);
-        let sntm_pawns_bb = *board.pieces(Piece::Pawn) & board.color_combined(sntm_color);
+        let stm_pawns_bb = board.board.pawns() & board.board.by_color(stm_color);
+        let sntm_pawns_bb = board.board.pawns() & board.board.by_color(sntm_color);
 
-        let mut stm_files: Vec<File> = stm_pawns_bb.into_iter().map(|sq| sq.get_file()).collect();
-        let mut sntm_files: Vec<File> = sntm_pawns_bb.into_iter().map(|sq| sq.get_file()).collect();
+        let mut stm_files: Vec<File> = stm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
+        let mut sntm_files: Vec<File> = sntm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
 
-        stm_files.sort_by_key(|f| f.to_index());
-        sntm_files.sort_by_key(|f| f.to_index());
+        stm_files.sort_by_key(|f| f.to_usize());
+        sntm_files.sort_by_key(|f| f.to_usize());
 
         let canonical = is_canonical(&stm_files, &sntm_files);
 
@@ -300,7 +295,7 @@ impl EgtFile {
         } else {
             let stm_ref = reflect_files(&stm_files);
             let sntm_ref = reflect_files(&sntm_files);
-            let mirrored = mirror_board_horizontally(board);
+            let mirrored = mirror_setup_horizontally(board);
             (stm_ref, sntm_ref, mirrored)
         };
 
@@ -336,25 +331,23 @@ impl EgtFile {
                     // 70% Draw, 15% Win, 15% Loss
                     let r = prng.next_range(0, 99);
                     let outcome = if r < 70 {
-                        DtcOutcome::Draw
+                        MaybeDtcOutcome::DRAW
                     } else {
                         // Random conversion type
                         let ct_r = prng.next_range(0, 2);
                         let ct = match ct_r {
                             0 => crate::ConversionType::Checkmate,
-                            1 => crate::ConversionType::Promotion,
-                            _ => crate::ConversionType::Capture,
+                            1 => crate::ConversionType::Capture,
+                            _ => crate::ConversionType::Promotion,
                         };
-                        // Random distance (1 to 100 moves)
                         let dist = prng.next_range(1, 100) as u16;
-
                         if r < 85 {
-                            DtcOutcome::Win(ct, dist)
+                            MaybeDtcOutcome::new_win(ct, dist)
                         } else {
-                            DtcOutcome::Loss(ct, dist)
+                            MaybeDtcOutcome::new_loss(ct, dist)
                         }
                     };
-                    *val = outcome.to_u16();
+                    *val = outcome;
                 }
                 *dirty = true;
             }
@@ -409,7 +402,7 @@ impl EgtFile {
                 let mem_size = self.frame_size * 2;
                 arena.allocate(mem_size);
 
-                let uncompressed = vec![0; self.frame_size];
+                let uncompressed = vec![MaybeDtcOutcome::INVALID; self.frame_size];
 
                 self.frames[frame_idx] = FrameState::Uncompressed {
                     compressed: None,
@@ -445,7 +438,7 @@ impl SimplePrng {
 }
 
 /// Transposes (bit-slices) a frame of N positions to maximize Zstd compressibility.
-pub fn transpose_frame(uncompressed: &[u16]) -> Vec<u8> {
+pub fn transpose_frame(uncompressed: &[MaybeDtcOutcome]) -> Vec<u8> {
     let n = uncompressed.len();
     let mut output = vec![0u8; n * 2];
 
@@ -464,7 +457,7 @@ pub fn transpose_frame(uncompressed: &[u16]) -> Vec<u8> {
     let offset_5 = offset_4 + (n / 2);
 
     for i in 0..n {
-        let val = uncompressed[i];
+        let val = uncompressed[i].to_u16();
 
         // Slice 0 (bit 0)
         set_bit(&mut output[offset_0..], i, val & 1);
@@ -498,9 +491,9 @@ pub fn transpose_frame(uncompressed: &[u16]) -> Vec<u8> {
 }
 
 /// Reverses the transposition (un-bit-slices) of a frame.
-pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<u16> {
+pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<MaybeDtcOutcome> {
     let n = frame_size;
-    let mut output = vec![0u16; n];
+    let mut output = vec![MaybeDtcOutcome::INVALID; n];
 
     let get_bit = |slice: &[u8], bit_idx: usize| -> u16 {
         let byte = slice[bit_idx / 8];
@@ -548,7 +541,7 @@ pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<u16> {
         }
         val |= val_5 << 11;
 
-        output[i] = val;
+        output[i] = MaybeDtcOutcome::from_u16(val);
     }
 
     output
@@ -605,7 +598,7 @@ fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
             return;
         }
         for idx in start_file_idx..8 {
-            let file = File::from_index(idx);
+            let file = File::new(idx as u32);
             current.push(file);
             recurse(k, idx, current, results);
             current.pop();
@@ -617,8 +610,8 @@ fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
 
 /// Reflects a list of files horizontally (file f becomes 7 - f).
 fn reflect_files(files: &[File]) -> Vec<File> {
-    let mut reflected: Vec<File> = files.iter().map(|f| File::from_index(7 - f.to_index())).collect();
-    reflected.sort_by_key(|f| f.to_index());
+    let mut reflected: Vec<File> = files.iter().map(|f| File::new(7 - f.to_usize() as u32)).collect();
+    reflected.sort_by_key(|f| f.to_usize());
     reflected
 }
 
@@ -627,11 +620,11 @@ fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
     let stm_ref = reflect_files(stm_files);
     let sntm_ref = reflect_files(sntm_files);
 
-    let stm_idx: Vec<usize> = stm_files.iter().map(|f| f.to_index()).collect();
-    let sntm_idx: Vec<usize> = sntm_files.iter().map(|f| f.to_index()).collect();
+    let stm_idx: Vec<usize> = stm_files.iter().map(|f| f.to_usize()).collect();
+    let sntm_idx: Vec<usize> = sntm_files.iter().map(|f| f.to_usize()).collect();
 
-    let stm_ref_idx: Vec<usize> = stm_ref.iter().map(|f| f.to_index()).collect();
-    let sntm_ref_idx: Vec<usize> = sntm_ref.iter().map(|f| f.to_index()).collect();
+    let stm_ref_idx: Vec<usize> = stm_ref.iter().map(|f| f.to_usize()).collect();
+    let sntm_ref_idx: Vec<usize> = sntm_ref.iter().map(|f| f.to_usize()).collect();
 
     (stm_idx.clone(), sntm_idx.clone()) <= (stm_ref_idx, sntm_ref_idx)
 }
@@ -647,22 +640,22 @@ fn build_pieces(
     // Count stm pawns by file
     let mut stm_pawn_counts = [0; 8];
     for f in stm_files {
-        stm_pawn_counts[f.to_index()] += 1;
+        stm_pawn_counts[f.to_usize()] += 1;
     }
     for (idx, &count) in stm_pawn_counts.iter().enumerate() {
         if count > 0 {
-            pieces.push((EgtPiece::Pawn(File::from_index(idx)), EgtSide::SideToMove, count));
+            pieces.push((EgtPiece::Pawn(File::new(idx as u32)), EgtSide::SideToMove, count));
         }
     }
 
     // Count sntm pawns by file
     let mut sntm_pawn_counts = [0; 8];
     for f in sntm_files {
-        sntm_pawn_counts[f.to_index()] += 1;
+        sntm_pawn_counts[f.to_usize()] += 1;
     }
     for (idx, &count) in sntm_pawn_counts.iter().enumerate() {
         if count > 0 {
-            pieces.push((EgtPiece::Pawn(File::from_index(idx)), EgtSide::SideNotToMove, count));
+            pieces.push((EgtPiece::Pawn(File::new(idx as u32)), EgtSide::SideNotToMove, count));
         }
     }
 
@@ -670,43 +663,19 @@ fn build_pieces(
 }
 
 /// Mirrors a chess board horizontally.
-fn mirror_board_horizontally(board: &Board) -> Board {
-    let mut builder = BoardBuilder::new();
-    builder.side_to_move(board.side_to_move());
-
-    if let Some(ep_square) = board.en_passant() {
-        let mirrored_file = File::from_index(7 - ep_square.get_file().to_index());
-        builder.en_passant(Some(mirrored_file));
-    }
-
-    let pieces = [
-        Piece::Pawn,
-        Piece::King,
-        Piece::Queen,
-        Piece::Rook,
-        Piece::Bishop,
-        Piece::Knight,
-    ];
-    let colors = [Color::White, Color::Black];
-
-    for &piece in &pieces {
-        for &color in &colors {
-            let bb = *board.pieces(piece) & board.color_combined(color);
-            for square in bb {
-                let mirrored_file = File::from_index(7 - square.get_file().to_index());
-                let mirrored_square = Square::make_square(square.get_rank(), mirrored_file);
-                builder.piece(mirrored_square, piece, color);
-            }
-        }
-    }
-
-    builder.try_into().expect("Failed to build mirrored board")
+fn mirror_setup_horizontally(setup: &Setup) -> Setup {
+    let mut mirrored = setup.clone();
+    mirrored.board.flip_horizontal();
+    mirrored.ep_square = mirrored.ep_square.map(|sq| sq.flip_horizontal());
+    mirrored
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use shakmaty::fen::Fen;
+    use shakmaty::Color;
 
     #[test]
     fn test_parse_top_level_tablename() {
@@ -761,14 +730,14 @@ mod tests {
 
         // A canonical position: White pawn on a2, White king on a1, Black king on h8
         // FEN: 8/8/8/8/8/8/P7/K6k w - - 0 1
-        let board = Board::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").unwrap();
+        let board = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
 
-        // Probing should succeed (returns None because the frame is initialized to 0/invalid)
+        // Probing should succeed (returns Invalid because the frame is initialized to 0/invalid)
         let outcome = egt_file.probe(&board, &mut arena);
-        assert_eq!(outcome, None);
+        assert_eq!(outcome, Some(MaybeDtcOutcome::INVALID));
 
         // Write an outcome
-        let expected_outcome = DtcOutcome::Win(crate::ConversionType::Checkmate, 12);
+        let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
         egt_file.write_outcome(&board, expected_outcome, &mut arena).unwrap();
 
         // Probe again
@@ -785,11 +754,11 @@ mod tests {
         // A mirrored (non-canonical) position: White pawn on h2, White king on h1, Black king on a1
         // This is the horizontal reflection of the canonical position above.
         // FEN: 8/8/8/8/8/8/7P/k6K w - - 0 1
-        let board_mirrored = Board::from_str("8/8/8/8/8/8/7P/k6K w - - 0 1").unwrap();
-        let board_canonical = Board::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").unwrap();
+        let board_mirrored = Fen::from_str("8/8/8/8/8/8/7P/k6K w - - 0 1").map(Setup::from).unwrap();
+        let board_canonical = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
 
         // Write to the canonical position
-        let expected_outcome = DtcOutcome::Win(crate::ConversionType::Checkmate, 12);
+        let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
         egt_file.write_outcome(&board_canonical, expected_outcome, &mut arena).unwrap();
 
         // Probing the mirrored position should return the same outcome because it gets canonicalized/mirrored!
@@ -853,7 +822,7 @@ mod tests {
         egt_file.generate_random_outcomes(&mut arena);
 
         // Sample a position
-        let board = Board::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").unwrap();
+        let board = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
         let original_outcome = egt_file.probe(&board, &mut arena);
 
         // Save and evict

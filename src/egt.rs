@@ -1,4 +1,4 @@
-use chess::File;
+use shakmaty::File;
 use crate::indexer::Indexer;
 use crate::piece_set::{ALL_EGT_PIECES, EgtPiece, EgtSide};
 

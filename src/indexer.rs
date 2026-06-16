@@ -1,4 +1,4 @@
-use chess::{BoardBuilder, Board, Color, File, Piece, Rank, Square, get_file};
+use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Chess, FromSetup};
 use crate::piece_set::{EgtPiece, EgtSide};
 use std::cmp::Reverse;
 
@@ -284,7 +284,7 @@ impl Indexer {
 
                             range_end = range_start + combinations;
                             ep_options.push(EnpassantOption {
-                                square: Some(Square::make_square(Rank::Fifth, File::from_index(i_file))),
+                                square: Some(Square::from_coords(File::new(i_file as u32), Rank::Fifth)),
                                 pawn_idx_sntm: Some(i),
                                 pawn_idx_stm: istm,
                                 range_start,
@@ -302,10 +302,11 @@ impl Indexer {
 
     // Encodes the status of a board into an index, which represents the positions
     // of the pieces (up to symmetries).
-    pub fn board_to_index(&mut self, board: &Board) -> usize {
+    pub fn board_to_index(&mut self, board: &Setup) -> usize {
         //println!("board_to_index: {}", board);
         //println!("en passant: {:?}", board.en_passant());
-        let index_offset = self.adjust_ep_from_board(board.en_passant());
+        let ep_pawn_square = board.ep_square.map(|sq| Square::from_coords(sq.file(), Rank::Fifth));
+        let index_offset = self.adjust_ep_from_board(ep_pawn_square);
         // Now `current_ep_option` reflects the en passant status of the board.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
@@ -366,7 +367,7 @@ impl Indexer {
     // Decodes an index and recreates a board with the corresponding positions of the
     // pieces in this endgame (up to symmetries). If the index represents an invalid
     // position, returns None.
-    pub fn board_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Board> {
+    pub fn board_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Setup> {
         //println!("board_from_index: {}", index);
         assert!(index < self.index_range);
         let index_offset = self.adjust_ep_from_index(index);
@@ -472,28 +473,28 @@ impl Indexer {
     }
 
     // Extracts the coordinates of the pieces from the board and stores them in `buffer_pos`.
-    fn board_to_pos(&mut self, board: &Board) {
-        assert_eq!(board.combined().popcnt() as usize, self.n_pieces, "board_to_pos() called with a board that does not match the piece set");
+    fn board_to_pos(&mut self, board: &Setup) {
+        assert_eq!(board.board.occupied().count(), self.n_pieces, "board_to_pos() called with a board that does not match the piece set");
         for p in &self.piece_set {
             let mut bb = match p.piece {
-                EgtPiece::Pawn(f) => *board.pieces(Piece::Pawn) & get_file(f),
-                EgtPiece::King => *board.pieces(Piece::King),
-                EgtPiece::Queen => *board.pieces(Piece::Queen),
-                EgtPiece::Rook => *board.pieces(Piece::Rook),
-                EgtPiece::Bishop => *board.pieces(Piece::Bishop),
-                EgtPiece::Knight => *board.pieces(Piece::Knight),
+                EgtPiece::Pawn(f) => board.board.by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
+                EgtPiece::King => board.board.by_role(Role::King),
+                EgtPiece::Queen => board.board.by_role(Role::Queen),
+                EgtPiece::Rook => board.board.by_role(Role::Rook),
+                EgtPiece::Bishop => board.board.by_role(Role::Bishop),
+                EgtPiece::Knight => board.board.by_role(Role::Knight),
             };
             bb &= match p.side {
-                EgtSide::SideToMove => board.color_combined(board.side_to_move()),
-                EgtSide::SideNotToMove => board.color_combined(!board.side_to_move()),
+                EgtSide::SideToMove => board.board.by_color(board.turn),
+                EgtSide::SideNotToMove => board.board.by_color(!board.turn),
             };
-            assert_eq!(bb.popcnt() as usize, p.span.1 - p.span.0, "board_to_pos() called with a board that does not match the piece set");
-            for (square, i) in bb.zip(p.span.0..p.span.1) {
-                self.buffer_pos[i] = (square.get_rank().to_index(), square.get_file().to_index());
+            assert_eq!(bb.count(), p.span.1 - p.span.0, "board_to_pos() called with a board that does not match the piece set");
+            for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
+                self.buffer_pos[i] = (square.rank().to_usize(), square.file().to_usize());
             }
         }
 
-        if self.n_pawns > 0 && board.side_to_move() == Color::Black {
+        if self.n_pawns > 0 && board.turn == Color::Black {
             // Switch the perspective so that the ranks are encoded from the
             // point of view of the side to move.
             for i in 0..self.n_pieces {
@@ -503,7 +504,7 @@ impl Indexer {
     }
 
     // Builds a board using the coordinates stored in `buffer_pos`.
-    fn pos_to_board(&mut self, side_to_move: Color) -> Option<Board> {
+    fn pos_to_board(&mut self, side_to_move: Color) -> Option<Setup> {
         if self.n_pawns > 0 && side_to_move == Color::Black {
             // The ranks are encoded from the point of view of the side to move. Switch them up.
             for i in 0..self.n_pieces {
@@ -511,27 +512,35 @@ impl Indexer {
             }
         }
 
-        let mut board = BoardBuilder::new();
-        board.side_to_move(side_to_move);
+        let mut setup = Setup::empty();
+        setup.turn = side_to_move;
         for p in &self.piece_set {
-            let piece = p.piece.to_piece();
+            let role = p.piece.to_role();
             let color = match p.side {
                 EgtSide::SideToMove => side_to_move,
                 EgtSide::SideNotToMove => !side_to_move,
             };
+            let piece = Piece { color, role };
             for i in p.span.0..p.span.1 {
                 let (r, f) = self.buffer_pos[i];
-                let square = Square::make_square(Rank::from_index(r), File::from_index(f));
-                board.piece(square, piece, color);
+                let square = Square::from_coords(File::new(f as u32), Rank::new(r as u32));
+                setup.board.set_piece_at(square, piece);
             }
         }
 
         if let Some(square) = self.current_ep_option.square {
-            board.en_passant(Some(square.get_file()));
-            // If en passant is not possible, the index is not a valid position.
-            return board.try_into().ok().filter(|b: &Board| b.en_passant() == Some(square));
+            let target_rank = match side_to_move {
+                Color::White => Rank::Sixth,
+                Color::Black => Rank::Third,
+            };
+            let target_square = Square::from_coords(square.file(), target_rank);
+            setup.ep_square = Some(target_square);
+        }
+
+        if Chess::from_setup(setup.clone(), CastlingMode::Standard).is_ok() {
+            Some(setup)
         } else {
-            return board.try_into().ok();
+            None
         }
     }
 

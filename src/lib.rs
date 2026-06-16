@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConversionType {
-    Capture,
     Promotion,
+    Capture,
     Checkmate,
 }
 
@@ -71,28 +71,87 @@ impl PartialOrd for DtcOutcome {
 
 impl DtcOutcome {
     pub fn from_u16(value: u16) -> Self {
-        let n = value >> 3;
-        match value & 0b111 {
-            0b001 => Self::Draw,
-            0b010 => Self::Win(ConversionType::Checkmate, n),
-            0b100 => Self::Win(ConversionType::Promotion, n),
-            0b110 => Self::Win(ConversionType::Capture, n),
-            0b011 => Self::Loss(ConversionType::Checkmate, n),
-            0b101 => Self::Loss(ConversionType::Promotion, n),
-            0b111 => Self::Loss(ConversionType::Capture, n),
-            _ => panic!("invalid value used to create DtcOutcome"),
-        }
+        MaybeDtcOutcome::from_u16(value).unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaybeDtcOutcome(pub u16);
+
+impl MaybeDtcOutcome {
+    pub const INVALID: Self = Self(0b000);
+    pub const DRAW: Self = Self(0b001);
+    pub const UNKNOWN: Self = Self(0b1111111111111000);
+
+    pub fn from_u16(value: u16) -> Self {
+        Self(value)
     }
 
     pub fn to_u16(&self) -> u16 {
-        match self {
-            Self::Draw => 0b001,
-            Self::Win(ConversionType::Checkmate, n) => 0b010 | (n << 3),
-            Self::Win(ConversionType::Promotion, n) => 0b100 | (n << 3),
-            Self::Win(ConversionType::Capture, n) => 0b0110 | (n << 3),
-            Self::Loss(ConversionType::Checkmate, n) => 0b011 | (n << 3),
-            Self::Loss(ConversionType::Promotion, n) => 0b101 | (n << 3),
-            Self::Loss(ConversionType::Capture, n) => 0b0111 | (n << 3),
+        self.0
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.0 == 0b000
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        (self.0 & 0b111) == 0b000 && (self.0 >> 3) != 0
+    }
+
+    pub fn is_draw(&self) -> bool {
+        self.0 == 0b001
+    }
+
+    pub fn is_win(&self) -> bool {
+        match self.0 & 0b111 {
+            0b010 | 0b100 | 0b110 => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_loss(&self) -> bool {
+        match self.0 & 0b111 {
+            0b011 | 0b101 | 0b111 => true,
+            _ => false,
+        }
+    }
+
+    pub fn new_win(ct: ConversionType, distance: u16) -> Self {
+        let bits = match ct {
+            ConversionType::Checkmate => 0b010,
+            ConversionType::Capture => 0b100,
+            ConversionType::Promotion => 0b110,
+        };
+        Self(bits | (distance << 3))
+    }
+
+    pub fn new_loss(ct: ConversionType, distance: u16) -> Self {
+        let bits = match ct {
+            ConversionType::Checkmate => 0b011,
+            ConversionType::Capture => 0b101,
+            ConversionType::Promotion => 0b111,
+        };
+        Self(bits | (distance << 3))
+    }
+
+    pub fn new_unknown(moves_counter: u16) -> Self {
+        Self(moves_counter << 3)
+    }
+
+    pub fn unwrap(self) -> DtcOutcome {
+        let n = self.0 >> 3;
+        match self.0 & 0b111 {
+            0b000 if n == 0 => panic!("invalid value used to create DtcOutcome"),
+            0b000 if n != 0 => panic!("unknown value used to create DtcOutcome"),
+            0b001 => DtcOutcome::Draw,
+            0b010 => DtcOutcome::Win(ConversionType::Checkmate, n),
+            0b100 => DtcOutcome::Win(ConversionType::Capture, n),
+            0b110 => DtcOutcome::Win(ConversionType::Promotion, n),
+            0b011 => DtcOutcome::Loss(ConversionType::Checkmate, n),
+            0b101 => DtcOutcome::Loss(ConversionType::Capture, n),
+            0b111 => DtcOutcome::Loss(ConversionType::Promotion, n),
+            _ => unreachable!(),
         }
     }
 }
@@ -153,12 +212,12 @@ impl EgtProber {
         Self { path: path.into() }
     }
 
-    //pub fn probe_wdl(&self, board: &Board) -> WdlOutcome {
+    //pub fn probe_wdl(&self, board: &shakmaty::Setup) -> WdlOutcome {
         // Implementation goes here
     //    WdlOutcome::Draw
     //}
 
-    //pub fn probe_dtc(&self, board: &Board) -> DtcOutcome {
+    //pub fn probe_dtc(&self, board: &shakmaty::Setup) -> DtcOutcome {
         // Implementation goes here
     //    DtcOutcome::Draw
     //}
