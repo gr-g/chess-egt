@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 zeekstd = "0.6.2"
 clap = { version = "4.4", features = ["derive"] }
-shakmaty = { path = "/home/user/repos/shakmaty/shakmaty" }
+shakmaty = { git = "https://github.com/gr-g/shakmaty.git", branch = "main" }
 
 [[bin]]
 name = "chess-egt"
