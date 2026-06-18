@@ -4,10 +4,41 @@ use crate::{MaybeDtcOutcome, ConversionType, DtcOutcome};
 use crate::egt_file::{EgtFile, Arena, PawnKey};
 use crate::piece_set::{EgtPiece, EgtSide};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RetrogradeTable {
+    pub file_idx: usize,
     pub egt_idx: usize,
-    pub is_table_b: bool,
+}
+
+pub struct RetrogradeSolver {
+    pub files: Vec<EgtFile>,
+    pub is_symmetric: bool,
+}
+
+impl RetrogradeSolver {
+    pub fn new(file_a: EgtFile, file_b: Option<EgtFile>) -> Self {
+        let is_symmetric = file_b.is_none();
+        let mut files = vec![file_a];
+        if let Some(fb) = file_b {
+            files.push(fb);
+        }
+        Self {
+            files,
+            is_symmetric,
+        }
+    }
+
+    pub fn read_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize, arena: &mut Arena) -> MaybeDtcOutcome {
+        let file = &mut self.files[file_idx];
+        let global_index = file.get_global_index(egt_idx, local_index);
+        file.read_by_global_index(global_index, arena).unwrap()
+    }
+
+    pub fn write_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize, outcome: MaybeDtcOutcome, arena: &mut Arena) {
+        let file = &mut self.files[file_idx];
+        let global_index = file.get_global_index(egt_idx, local_index);
+        file.write_by_global_index(global_index, outcome, arena).unwrap();
+    }
 }
 
 fn get_pawn_files(pieces: &[(EgtPiece, EgtSide, usize)]) -> (Vec<shakmaty::File>, Vec<shakmaty::File>) {
@@ -29,28 +60,22 @@ fn get_pawn_files(pieces: &[(EgtPiece, EgtSide, usize)]) -> (Vec<shakmaty::File>
 }
 
 fn read_outcome(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
     local_index: usize,
     arena: &mut Arena,
 ) -> MaybeDtcOutcome {
-    let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-    let global_index = file.get_global_index(table.egt_idx, local_index);
-    file.read_by_global_index(global_index, arena).unwrap()
+    solver.read_outcome(table.file_idx, table.egt_idx, local_index, arena)
 }
 
 fn write_outcome(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
     local_index: usize,
     outcome: MaybeDtcOutcome,
     arena: &mut Arena,
 ) {
-    let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-    let global_index = file.get_global_index(table.egt_idx, local_index);
-    file.write_by_global_index(global_index, outcome, arena).unwrap();
+    solver.write_outcome(table.file_idx, table.egt_idx, local_index, outcome, arena);
 }
 
 fn both_kings_on_diagonal(chess: &Chess) -> bool {
@@ -65,29 +90,25 @@ fn reflect_setup_diagonally(setup: &Setup) -> Setup {
 }
 
 pub fn quiet_unmoves(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
-    twin: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
+    twin: RetrogradeTable,
     local_index: usize,
-    _arena: &mut Arena,
 ) -> Vec<usize> {
     let mut predecessors = Vec::new();
     let setup = {
-        let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-        file.egts[table.egt_idx].indexer.board_from_index(local_index, Color::White)
+        let file = &mut solver.files[table.file_idx];
+        file.egts[table.egt_idx].board_from_index(local_index, Color::White)
     };
     let setup = match setup {
         Some(s) => s,
         None => return predecessors,
     };
 
-    let mut indexer_copy = {
-        let twin_file = if !twin.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-        twin_file.egts[twin.egt_idx].indexer.clone()
+    let pawnless = {
+        let twin_file = &solver.files[twin.file_idx];
+        twin_file.egts[twin.egt_idx].is_pawnless()
     };
-
-    let pawnless = indexer_copy.n_pawns == 0;
 
     if let Ok(chess) = Chess::from_setup(setup, CastlingMode::Standard) {
         let current_on_diagonal = both_kings_on_diagonal(&chess);
@@ -96,13 +117,15 @@ pub fn quiet_unmoves(
             .with_castling_mode(CastlingRetrogradeMode::NoCastling)
             .quiet_unmoves(|pred_chess, _m| {
                 let pred_setup = pred_chess.to_setup(EnPassantMode::Legal);
-                let pred_idx = indexer_copy.board_to_index(&pred_setup);
+
+                let twin_file = &mut solver.files[twin.file_idx];
+                let pred_idx = twin_file.egts[twin.egt_idx].board_to_index(&pred_setup);
                 predecessors.push(pred_idx);
 
                 if pawnless && !current_on_diagonal && both_kings_on_diagonal(&pred_chess) {
                     // #p=4 and #p'=8: push the diagonal reflection of the predecessor
                     let reflected_setup = reflect_setup_diagonally(&pred_setup);
-                    let reflected_idx = indexer_copy.board_to_index(&reflected_setup);
+                    let reflected_idx = twin_file.egts[twin.egt_idx].board_to_index(&reflected_setup);
                     predecessors.push(reflected_idx);
                 }
             });
@@ -131,26 +154,24 @@ fn symmetry_adjusted_move_counter(
 }
 
 fn initialize_table(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
-    twin: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
+    twin: RetrogradeTable,
     arena: &mut Arena,
 ) {
     let (size, pawnless) = {
-        let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-        let indexer = &file.egts[table.egt_idx].indexer;
-        (indexer.index_range, indexer.n_pawns == 0)
+        let egt = &solver.files[table.file_idx].egts[table.egt_idx];
+        (egt.index_range(), egt.is_pawnless())
     };
 
     for idx in 0..size {
         // Decode position using Color::White as side-to-move
         let setup_opt = {
-            let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-            file.egts[table.egt_idx].indexer.board_from_index(idx, Color::White)
+            let file = &mut solver.files[table.file_idx];
+            file.egts[table.egt_idx].board_from_index(idx, Color::White)
         };
         if setup_opt.is_none() {
-            write_outcome(file_a, file_b, table, idx, MaybeDtcOutcome::INVALID, arena);
+            write_outcome(solver, table, idx, MaybeDtcOutcome::INVALID, arena);
             continue;
         }
 
@@ -161,46 +182,42 @@ fn initialize_table(
         if legals.is_empty() {
             if chess.is_check() {
                 // Checkmate!
-                write_outcome(file_a, file_b, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0), arena);
                 // Propagate to twin as win in 1 ply
-                let predecessors = quiet_unmoves(file_a, file_b, table, twin, idx, arena);
+                let predecessors = quiet_unmoves(solver, table, twin, idx);
                 for pred_idx in predecessors {
-                    let pred_outcome = read_outcome(file_a, file_b, twin, pred_idx, arena);
+                    let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
                     if pred_outcome.is_invalid() || pred_outcome.is_unknown() || pred_outcome == MaybeDtcOutcome::INVALID {
-                        write_outcome(file_a, file_b, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1), arena);
+                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1), arena);
                     }
                 }
             } else {
                 // Stalemate!
-                write_outcome(file_a, file_b, table, idx, MaybeDtcOutcome::DRAW, arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::DRAW, arena);
             }
         } else {
             // Unknown position, initialize move counter if not already marked as win
-            let current_outcome = read_outcome(file_a, file_b, table, idx, arena);
+            let current_outcome = read_outcome(solver, table, idx, arena);
             if current_outcome.is_invalid() {
                 let counter = symmetry_adjusted_move_counter(&chess, pawnless);
-                write_outcome(file_a, file_b, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
             }
         }
     }
 }
 
 fn propagate_wins_to_losses(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
-    twin: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
+    twin: RetrogradeTable,
     plies: u16,
     arena: &mut Arena,
 ) -> bool {
     let mut marked_any = false;
-    let size = {
-        let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-        file.egts[table.egt_idx].indexer.index_range
-    };
+    let size = solver.files[table.file_idx].egts[table.egt_idx].index_range();
 
     for idx in 0..size {
-        let outcome = read_outcome(file_a, file_b, table, idx, arena);
+        let outcome = read_outcome(solver, table, idx, arena);
         if outcome.is_win() && outcome.get_win_loss_distance() == Some(plies) {
             // Get conversion type
             let ct = match outcome.unwrap() {
@@ -209,19 +226,19 @@ fn propagate_wins_to_losses(
             };
 
             // Find quiet predecessors in twin
-            let predecessors = quiet_unmoves(file_a, file_b, table, twin, idx, arena);
+            let predecessors = quiet_unmoves(solver, table, twin, idx);
             for pred_idx in predecessors {
-                let pred_outcome = read_outcome(file_a, file_b, twin, pred_idx, arena);
+                let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
                 if pred_outcome.is_unknown() {
                     let counter = pred_outcome.get_unknown_counter();
                     assert!(counter > 0);
                     if counter == 1 {
                         // Counter reaches 0! Mark as loss in plies + 1
-                        write_outcome(file_a, file_b, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1), arena);
+                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1), arena);
                         marked_any = true;
                     } else {
                         // Decrement counter
-                        write_outcome(file_a, file_b, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
+                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
                     }
                 }
             }
@@ -232,21 +249,17 @@ fn propagate_wins_to_losses(
 }
 
 fn propagate_losses_to_wins(
-    file_a: &mut EgtFile,
-    file_b: &mut Option<EgtFile>,
-    table: &RetrogradeTable,
-    twin: &RetrogradeTable,
+    solver: &mut RetrogradeSolver,
+    table: RetrogradeTable,
+    twin: RetrogradeTable,
     plies: u16,
     arena: &mut Arena,
 ) -> bool {
     let mut marked_any = false;
-    let size = {
-        let file = if !table.is_table_b { &mut *file_a } else { file_b.as_mut().unwrap() };
-        file.egts[table.egt_idx].indexer.index_range
-    };
+    let size = solver.files[table.file_idx].egts[table.egt_idx].index_range();
 
     for idx in 0..size {
-        let outcome = read_outcome(file_a, file_b, table, idx, arena);
+        let outcome = read_outcome(solver, table, idx, arena);
         if outcome.is_loss() && outcome.get_win_loss_distance() == Some(plies) {
             // Get conversion type
             let ct = match outcome.unwrap() {
@@ -255,11 +268,11 @@ fn propagate_losses_to_wins(
             };
 
             // Find quiet predecessors in twin
-            let predecessors = quiet_unmoves(file_a, file_b, table, twin, idx, arena);
+            let predecessors = quiet_unmoves(solver, table, twin, idx);
             for pred_idx in predecessors {
-                let pred_outcome = read_outcome(file_a, file_b, twin, pred_idx, arena);
+                let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
                 if pred_outcome.is_unknown() {
-                    write_outcome(file_a, file_b, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
+                    write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
                     marked_any = true;
                 }
             }
@@ -276,8 +289,8 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
 
     let is_symmetric = tablename == twin_tablename;
 
-    let mut file_a = EgtFile::new(base_path.join(format!("{}.egt", tablename)), tablename, true).unwrap();
-    let mut file_b = if is_symmetric {
+    let file_a = EgtFile::new(base_path.join(format!("{}.egt", tablename)), tablename, true).unwrap();
+    let file_b = if is_symmetric {
         None
     } else {
         Some(EgtFile::new(base_path.join(format!("{}.egt", twin_tablename)), &twin_tablename, true).unwrap())
@@ -285,37 +298,39 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
 
     println!("Initializing retrograde analysis for {} and {}...", tablename, twin_tablename);
 
+    let mut solver = RetrogradeSolver::new(file_a, file_b);
+
     // Match Egt sub-tables into pairs
     let mut table_pairs = Vec::new();
 
-    for (egt_idx_a, egt_a) in file_a.egts.iter().enumerate() {
+    for (egt_idx_a, egt_a) in solver.files[0].egts.iter().enumerate() {
         let (stm_files, sntm_files) = get_pawn_files(egt_a.pieces());
         let twin_key = PawnKey::new(&sntm_files, &stm_files);
 
-        let egt_idx_b = if is_symmetric {
-            *file_a.egt_map.get(&twin_key).unwrap()
+        let egt_idx_b = if solver.is_symmetric {
+            *solver.files[0].egt_map.get(&twin_key).unwrap()
         } else {
-            *file_b.as_ref().unwrap().egt_map.get(&twin_key).unwrap()
+            *solver.files[1].egt_map.get(&twin_key).unwrap()
         };
 
         let table_a = RetrogradeTable {
+            file_idx: 0,
             egt_idx: egt_idx_a,
-            is_table_b: false,
         };
 
         let table_b = RetrogradeTable {
+            file_idx: if solver.is_symmetric { 0 } else { 1 },
             egt_idx: egt_idx_b,
-            is_table_b: !is_symmetric,
         };
 
         table_pairs.push((table_a, table_b));
     }
 
     // Initialization Phase
-    for (table_a, table_b) in &table_pairs {
-        initialize_table(&mut file_a, &mut file_b, table_a, table_b, arena);
-        if !is_symmetric {
-            initialize_table(&mut file_a, &mut file_b, table_b, table_a, arena);
+    for &(table_a, table_b) in &table_pairs {
+        initialize_table(&mut solver, table_a, table_b, arena);
+        if !solver.is_symmetric {
+            initialize_table(&mut solver, table_b, table_a, arena);
         }
     }
 
@@ -324,18 +339,18 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
     loop {
         let mut marked_any = false;
 
-        for (table_a, table_b) in &table_pairs {
+        for &(table_a, table_b) in &table_pairs {
             if plies % 2 == 1 {
                 // Odd plies: propagate wins of distance `plies` to losses of distance `plies + 1`
-                marked_any |= propagate_wins_to_losses(&mut file_a, &mut file_b, table_a, table_b, plies, arena);
-                if !is_symmetric {
-                    marked_any |= propagate_wins_to_losses(&mut file_a, &mut file_b, table_b, table_a, plies, arena);
+                marked_any |= propagate_wins_to_losses(&mut solver, table_a, table_b, plies, arena);
+                if !solver.is_symmetric {
+                    marked_any |= propagate_wins_to_losses(&mut solver, table_b, table_a, plies, arena);
                 }
             } else {
                 // Even plies: propagate losses of distance `plies` to wins of distance `plies + 1`
-                marked_any |= propagate_losses_to_wins(&mut file_a, &mut file_b, table_a, table_b, plies, arena);
-                if !is_symmetric {
-                    marked_any |= propagate_losses_to_wins(&mut file_a, &mut file_b, table_b, table_a, plies, arena);
+                marked_any |= propagate_losses_to_wins(&mut solver, table_a, table_b, plies, arena);
+                if !solver.is_symmetric {
+                    marked_any |= propagate_losses_to_wins(&mut solver, table_b, table_a, plies, arena);
                 }
             }
         }
@@ -348,27 +363,31 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
     }
 
     // Mark all remaining 'unknown' positions as draws
-    for (table_a, table_b) in &table_pairs {
-        let size_a = file_a.egts[table_a.egt_idx].indexer.index_range;
+    for &(table_a, table_b) in &table_pairs {
+        let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
-            let outcome = read_outcome(&mut file_a, &mut file_b, table_a, idx, arena);
+            let outcome = read_outcome(&mut solver, table_a, idx, arena);
             if outcome.is_unknown() {
-                write_outcome(&mut file_a, &mut file_b, table_a, idx, MaybeDtcOutcome::DRAW, arena);
+                write_outcome(&mut solver, table_a, idx, MaybeDtcOutcome::DRAW, arena);
             }
         }
 
-        if !is_symmetric {
-            let size_b = file_b.as_ref().unwrap().egts[table_b.egt_idx].indexer.index_range;
+        if !solver.is_symmetric {
+            let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
-                let outcome = read_outcome(&mut file_a, &mut file_b, table_b, idx, arena);
+                let outcome = read_outcome(&mut solver, table_b, idx, arena);
                 if outcome.is_unknown() {
-                    write_outcome(&mut file_a, &mut file_b, table_b, idx, MaybeDtcOutcome::DRAW, arena);
+                    write_outcome(&mut solver, table_b, idx, MaybeDtcOutcome::DRAW, arena);
                 }
             }
         }
     }
 
     println!("Retrograde analysis complete! Max plies: {}", plies - 1);
+
+    let mut files = solver.files;
+    let file_a = files.remove(0);
+    let file_b = if is_symmetric { None } else { Some(files.remove(0)) };
 
     (file_a, file_b)
 }

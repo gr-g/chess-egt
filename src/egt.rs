@@ -1,5 +1,6 @@
-use shakmaty::File;
-use crate::indexer::Indexer;
+use shakmaty::{Color, File, Setup};
+mod indexer;
+use indexer::{Indexer, IndexerScratch};
 use crate::piece_set::{ALL_EGT_PIECES, EgtPiece, EgtSide};
 
 #[derive(Clone, Debug)]
@@ -10,6 +11,9 @@ pub struct Egt {
     // The helper object storing the piece set and the information required
     // to convert positions to tablebase indexes.
     pub indexer: Indexer,
+
+    // A mutable scratch buffer used to encode/decode positions.
+    pub scratch: IndexerScratch,
 }
 
 impl Egt {
@@ -57,7 +61,16 @@ impl Egt {
         pieces.sort();
 
         let indexer = Indexer::from_pieces(&pieces)?;
-        Ok(Egt { pieces, indexer })
+        let scratch = indexer.create_scratch();
+        Ok(Egt { pieces, indexer, scratch })
+    }
+
+    pub fn board_to_index(&mut self, board: &Setup) -> usize {
+        self.indexer.board_to_index(&mut self.scratch, board)
+    }
+
+    pub fn board_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Setup> {
+        self.indexer.board_from_index(&mut self.scratch, index, side_to_move)
     }
 
     // Setup an endgame table from a string such as "KQ_KRPb"

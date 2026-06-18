@@ -275,7 +275,7 @@ impl EgtFile {
     }
 
     /// Maps a board position to the corresponding Egt index and local index.
-    fn map_position_to_egt(&self, board: &Setup) -> Option<(usize, usize)> {
+    pub fn map_position_to_egt(&mut self, board: &Setup) -> Option<(usize, usize)> {
         let stm_color = board.turn;
         let sntm_color = !stm_color;
 
@@ -301,8 +301,7 @@ impl EgtFile {
 
         let key = PawnKey::new(&target_stm_files, &target_sntm_files);
         let &egt_idx = self.egt_map.get(&key)?;
-        let mut indexer = self.egts[egt_idx].indexer.clone();
-        let local_index = indexer.board_to_index(&target_board);
+        let local_index = self.egts[egt_idx].board_to_index(&target_board);
 
         Some((egt_idx, local_index))
     }
@@ -806,16 +805,16 @@ mod tests {
 
     fn run_round_trip_test(tablename: &str, stride: usize) {
         let path = PathBuf::from(format!("test_{}.egt", tablename.to_lowercase()));
-        let egt_file = EgtFile::new(path, tablename, true).unwrap();
+        let mut egt_file = EgtFile::new(path, tablename, true).unwrap();
 
         let mut offset = 0;
-        for (_egt_idx, egt) in egt_file.egts.iter().enumerate() {
-            let range = egt.index_range();
-            let mut indexer = egt.indexer.clone();
+        let num_egts = egt_file.egts.len();
+        for egt_idx in 0..num_egts {
+            let range = egt_file.egts[egt_idx].index_range();
             let mut local_index = 0;
             while local_index < range {
                 let global_index = offset + local_index;
-                if let Some(board) = indexer.board_from_index(local_index, Color::White) {
+                if let Some(board) = egt_file.egts[egt_idx].board_from_index(local_index, Color::White) {
                     let (mapped_egt_idx, mapped_local_index) = egt_file.map_position_to_egt(&board).unwrap();
                     let mapped_global_index = egt_file.get_global_index(mapped_egt_idx, mapped_local_index);
                     assert_eq!(global_index, mapped_global_index);

@@ -1,4 +1,3 @@
-mod indexer;
 pub mod piece_set;
 pub mod egt;
 pub mod egt_file;
