@@ -216,6 +216,66 @@ impl EgtFile {
         }
     }
 
+    /// Counts the number of wins, draws, losses, and invalid positions in the EgtFile.
+    pub fn count_outcomes(&mut self, arena: &mut Arena) -> (usize, usize, usize, usize) {
+        let mut wins = 0;
+        let mut draws = 0;
+        let mut losses = 0;
+        let mut invalid = 0;
+
+        for frame_idx in 0..self.frames.len() {
+            if let FrameState::Unallocated = &self.frames[frame_idx] {
+                invalid += self.frame_size;
+                continue;
+            }
+
+            self.ensure_uncompressed(frame_idx, arena);
+            if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
+                for &outcome in uncompressed {
+                    if outcome.is_win() {
+                        wins += 1;
+                    } else if outcome.is_loss() {
+                        losses += 1;
+                    } else if outcome.is_draw() {
+                        draws += 1;
+                    } else if outcome.is_invalid() {
+                        invalid += 1;
+                    }
+                }
+            }
+        }
+
+        (wins, draws, losses, invalid)
+    }
+
+    /// Prints table-specific statistics (wins, draws, losses, compression) and returns the number of canonical positions.
+    pub fn print_single_table_stats(&mut self, arena: &mut Arena) -> usize {
+        let (wins, draws, losses, _) = self.count_outcomes(arena);
+        let canonical_positions = wins + draws + losses;
+        let compressed_size_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let compressed_size_mb = compressed_size_bytes as f64 / (1024.0 * 1024.0);
+        let bits_per_pos = if canonical_positions > 0 {
+            (compressed_size_bytes as f64 * 8.0) / canonical_positions as f64
+        } else {
+            0.0
+        };
+
+        let tablename = self.path.file_stem().unwrap().to_str().unwrap();
+
+        println!(
+            "Generated table {} with {} positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MB ({:.2} bits/pos).",
+            tablename,
+            canonical_positions,
+            wins,
+            draws,
+            losses,
+            compressed_size_mb,
+            bits_per_pos
+        );
+
+        canonical_positions
+    }
+
     /// Saves the entire EgtFile to disk using seekable Zstd compression.
     pub fn save_to_disk(&mut self, arena: &mut Arena) -> Result<(), ()> {
         use std::fs::File;
@@ -705,6 +765,39 @@ fn mirror_setup_horizontally(setup: &Setup) -> Setup {
     mirrored.board.flip_horizontal();
     mirrored.ep_square = mirrored.ep_square.map(|sq| sq.flip_horizontal());
     mirrored
+}
+
+/// Prints detailed statistics about a pair of generated tables (or a single table if symmetric).
+pub fn print_generation_stats_pair(
+    file_a: &mut EgtFile,
+    file_b: Option<&mut EgtFile>,
+    duration: std::time::Duration,
+    arena: &mut Arena,
+) {
+    let mut total_canonical = file_a.print_single_table_stats(arena);
+
+    if let Some(fb) = file_b {
+        total_canonical += fb.print_single_table_stats(arena);
+    }
+
+    let us_per_pos = if total_canonical > 0 {
+        duration.as_micros() as f64 / total_canonical as f64
+    } else {
+        0.0
+    };
+
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    let format_dur = format!("{:02}h:{:02}m:{:02}s", hours, minutes, seconds);
+
+    println!(
+        "Time used {} ({:.2} μs/pos). Memory usage: {:.0}MB.",
+        format_dur,
+        us_per_pos,
+        arena.used() as f64 / (1024.0 * 1024.0)
+    );
 }
 
 #[cfg(test)]

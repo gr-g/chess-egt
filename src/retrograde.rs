@@ -261,10 +261,16 @@ impl DependencyCache {
                 EgtFile::new(path, tablename, false).unwrap()
             } else {
                 println!("Dependency table {} not found. Generating on the fly...", tablename);
-                let (mut file_a, file_b) = retrograde_analysis(&self.base_path, tablename, arena);
+                let start_time = std::time::Instant::now();
+                let (mut file_a, mut file_b) = retrograde_analysis(&self.base_path, tablename, arena);
                 file_a.save_to_disk(arena).unwrap();
-                if let Some(mut fb) = file_b {
+                if let Some(ref mut fb) = file_b {
                     fb.save_to_disk(arena).unwrap();
+                }
+                let duration = start_time.elapsed();
+                crate::egt_file::print_generation_stats_pair(&mut file_a, file_b.as_mut(), duration, arena);
+
+                if let Some(fb) = file_b {
                     let twin_name = fb.path.file_stem().unwrap().to_str().unwrap().to_string();
                     self.cache.insert(twin_name, fb);
                 }
@@ -290,6 +296,11 @@ fn initialize_table(
         (egt.index_range(), egt.is_pawnless())
     };
 
+    let mut checkmate_count = 0;
+    let mut stalemate_count = 0;
+    let mut unknown_count = 0;
+    let mut invalid_count = 0;
+
     for idx in 0..size {
         // Decode position using Color::White as side-to-move
         let setup_opt = {
@@ -298,6 +309,7 @@ fn initialize_table(
         };
         if setup_opt.is_none() {
             write_outcome(solver, table, idx, MaybeDtcOutcome::INVALID, arena);
+            invalid_count += 1;
             continue;
         }
 
@@ -309,6 +321,7 @@ fn initialize_table(
             if chess.is_check() {
                 // Checkmate!
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0), arena);
+                checkmate_count += 1;
                 // Propagate to twin as win in 1 ply
                 let predecessors = quiet_unmoves(solver, table, twin, idx);
                 for pred_idx in predecessors {
@@ -321,6 +334,7 @@ fn initialize_table(
             } else {
                 // Stalemate!
                 write_outcome(solver, table, idx, MaybeDtcOutcome::DRAW, arena);
+                stalemate_count += 1;
             }
         } else {
             // Unknown position, initialize move counter if not already marked as win
@@ -328,6 +342,9 @@ fn initialize_table(
             if current_outcome.is_invalid() {
                 let counter = symmetry_adjusted_move_counter(&chess, pawnless);
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
+                unknown_count += 1;
+            } else {
+                unknown_count += 1;
             }
         }
     }
@@ -395,6 +412,17 @@ fn initialize_table(
             }
         }
     }
+
+    let tablename = solver.files[table.file_idx].egts[table.egt_idx].tablename();
+    println!(
+        "Initialized table {} with {} indexed positions corresponding to {} canonical positions: {} checkmate, {} stalemate, {} unknown.",
+        tablename,
+        size,
+        size - invalid_count,
+        checkmate_count,
+        stalemate_count,
+        unknown_count
+    );
 }
 
 fn propagate_loss_to_wins_queue(
@@ -567,6 +595,36 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
                 }
             }
 
+            let name_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].tablename();
+            let name_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].tablename();
+
+            let wins_a = next_queues_a.win_checkmate.len() + next_queues_a.win_capture.len() + next_queues_a.win_promotion.len();
+            let losses_a = next_queues_a.loss_checkmate.len() + next_queues_a.loss_capture.len() + next_queues_a.loss_promotion.len();
+            let wins_b = next_queues_b.win_checkmate.len() + next_queues_b.win_capture.len() + next_queues_b.win_promotion.len();
+            let losses_b = next_queues_b.loss_checkmate.len() + next_queues_b.loss_capture.len() + next_queues_b.loss_promotion.len();
+
+            if table_a == table_b {
+                if wins_a > 0 {
+                    println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
+                }
+                if losses_a > 0 {
+                    println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
+                }
+            } else {
+                if wins_a > 0 {
+                    println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
+                }
+                if losses_a > 0 {
+                    println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
+                }
+                if wins_b > 0 {
+                    println!("{}: Found {} winning positions at depth {}", name_b, wins_b, plies);
+                }
+                if losses_b > 0 {
+                    println!("{}: Found {} losing positions at depth {}", name_b, losses_b, plies);
+                }
+            }
+
             queues_a = next_queues_a;
             queues_b = next_queues_b;
             plies += 1;
@@ -593,8 +651,6 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             }
         }
     }
-
-    println!("Retrograde analysis complete!");
 
     let mut files = solver.files;
     let file_a = files.remove(0);

@@ -187,25 +187,22 @@ impl EgtGenerator {
     pub fn set_dtc_oneside(&mut self, val: bool) { self.save_dtc_oneside = val; }
 
     pub fn generate(&self, tablename: &str) {
+        let start_time = std::time::Instant::now();
         println!("Generating table {} at {:?}", tablename, self.path);
 
         // Create a temporary Arena (e.g., 4GB capacity)
         let mut arena = crate::egt_file::Arena::new(4 * 1024 * 1024 * 1024);
 
         // Run retrograde analysis
-        let (mut file_a, file_b) = crate::retrograde::retrograde_analysis(&self.path, tablename, &mut arena);
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.path, tablename, &mut arena);
 
         // Save to disk
         file_a.save_to_disk(&mut arena).expect("Failed to flush EgtFile A");
-        if let Some(mut fb) = file_b {
+        if let Some(ref mut fb) = file_b {
             fb.save_to_disk(&mut arena).expect("Failed to flush EgtFile B");
         }
-
-        println!(
-            "Successfully generated table {} with {} positions.",
-            tablename,
-            file_a.total_positions()
-        );
+        let duration = start_time.elapsed();
+        crate::egt_file::print_generation_stats_pair(&mut file_a, file_b.as_mut(), duration, &mut arena);
     }
 }
 

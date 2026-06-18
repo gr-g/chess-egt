@@ -7,7 +7,6 @@
 
 TODO:
 - Add verifier function for generated tablebases (https://en.wikipedia.org/wiki/Endgame_tablebase#Step_3:_Verification)
-- Add details during process. For instance "Initialized table {} in {}s ({} us/pos), with {} indexed positions corresponding to {} canonical positions: {} checkmate, {} stalemate, {} unknown.". "Generated table {} in {}s ({} us/pos): {} wins, {} draws, {} losses. Time used {hh:mm:ss} ({} us/pos). Compressed size: {}MB ({} bits/pos).". Maybe add info about memory usage.
 - Add tests with real statistics from other tablebases.
 - Profiling/benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
