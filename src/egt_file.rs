@@ -97,7 +97,7 @@ impl PawnKey {
 #[derive(Debug)]
 pub struct EgtFile {
     /// Path to the file on disk.
-    path: PathBuf,
+    pub path: PathBuf,
     /// The sub-tables (Egt objects) that compose this file.
     pub egts: Vec<Egt>,
     /// Map from PawnKey to its index in the `egts` vector.

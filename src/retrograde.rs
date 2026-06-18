@@ -1,8 +1,9 @@
-use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup};
+use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup, Move};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{MaybeDtcOutcome, ConversionType, DtcOutcome};
 use crate::egt_file::{EgtFile, Arena, PawnKey};
 use crate::piece_set::{EgtPiece, EgtSide};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RetrogradeTable {
@@ -153,10 +154,85 @@ fn symmetry_adjusted_move_counter(
     counter
 }
 
+fn get_top_level_tablename(setup: &Setup) -> String {
+    let stm_color = setup.turn;
+    let sntm_color = !stm_color;
+
+    let mut stm_parts = Vec::new();
+    let mut sntm_parts = Vec::new();
+
+    // We always have exactly 1 King for each side
+    stm_parts.push("K".to_string());
+    sntm_parts.push("K".to_string());
+
+    // Count other pieces
+    let board = &setup.board;
+
+    // Order of pieces in tablename: Q, R, B, N, P
+    for &role in &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn] {
+        let char_str = match role {
+            Role::Queen => "Q",
+            Role::Rook => "R",
+            Role::Bishop => "B",
+            Role::Knight => "N",
+            Role::Pawn => "P",
+            _ => unreachable!(),
+        };
+
+        let stm_count = (board.by_role(role) & board.by_color(stm_color)).into_iter().count();
+        for _ in 0..stm_count {
+            stm_parts.push(char_str.to_string());
+        }
+
+        let sntm_count = (board.by_role(role) & board.by_color(sntm_color)).into_iter().count();
+        for _ in 0..sntm_count {
+            sntm_parts.push(char_str.to_string());
+        }
+    }
+
+    format!("{}_{}", stm_parts.concat(), sntm_parts.concat())
+}
+
+pub struct DependencyCache {
+    pub cache: HashMap<String, EgtFile>,
+    pub base_path: std::path::PathBuf,
+}
+
+impl DependencyCache {
+    pub fn new(base_path: &std::path::Path) -> Self {
+        Self {
+            cache: HashMap::new(),
+            base_path: base_path.to_path_buf(),
+        }
+    }
+
+    pub fn get_or_load(&mut self, tablename: &str, arena: &mut Arena) -> &mut EgtFile {
+        if !self.cache.contains_key(tablename) {
+            let path = self.base_path.join(format!("{}.egt", tablename));
+            let file = if path.exists() {
+                EgtFile::new(path, tablename, false).unwrap()
+            } else {
+                println!("Dependency table {} not found. Generating on the fly...", tablename);
+                let (mut file_a, file_b) = retrograde_analysis(&self.base_path, tablename, arena);
+                file_a.save_to_disk(arena).unwrap();
+                if let Some(mut fb) = file_b {
+                    fb.save_to_disk(arena).unwrap();
+                    let twin_name = fb.path.file_stem().unwrap().to_str().unwrap().to_string();
+                    self.cache.insert(twin_name, fb);
+                }
+                file_a
+            };
+            self.cache.insert(tablename.to_string(), file);
+        }
+        self.cache.get_mut(tablename).unwrap()
+    }
+}
+
 fn initialize_table(
     solver: &mut RetrogradeSolver,
     table: RetrogradeTable,
     twin: RetrogradeTable,
+    dep_cache: &mut DependencyCache,
     arena: &mut Arena,
 ) {
     let (size, pawnless) = {
@@ -200,6 +276,67 @@ fn initialize_table(
             let current_outcome = read_outcome(solver, table, idx, arena);
             if current_outcome.is_invalid() {
                 let counter = symmetry_adjusted_move_counter(&chess, pawnless);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
+            }
+        }
+    }
+
+    // Dependency Probing
+    for idx in 0..size {
+        let current_outcome = read_outcome(solver, table, idx, arena);
+        if current_outcome.is_unknown() {
+            let setup = {
+                let file = &mut solver.files[table.file_idx];
+                file.egts[table.egt_idx].board_from_index(idx, Color::White).unwrap()
+            };
+            let chess = Chess::from_setup(setup, CastlingMode::Standard).unwrap();
+            let current_on_diagonal = both_kings_on_diagonal(&chess);
+
+            let mut counter = current_outcome.get_unknown_counter();
+            let mut is_win = false;
+            let mut win_ct = None;
+            let mut last_loss_ct = None;
+
+            for m in chess.legal_moves() {
+                let is_capture = m.capture().is_some() || matches!(m, Move::EnPassant { .. });
+                let is_promotion = m.promotion().is_some();
+
+                if is_capture || is_promotion {
+                    let successor_chess = chess.clone().play(m).unwrap();
+                    let successor_setup = successor_chess.to_setup(EnPassantMode::Legal);
+                    let dep_tablename = get_top_level_tablename(&successor_setup);
+
+                    // Probe the dependency table
+                    let dep_outcome_opt = dep_cache.get_or_load(&dep_tablename, arena).probe(&successor_setup, arena);
+                    if let Some(dep_outcome) = dep_outcome_opt {
+                        let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
+                        if dep_outcome.is_loss() {
+                            is_win = true;
+                            win_ct = Some(ct);
+                            break;
+                        } else if dep_outcome.is_win() {
+                            let contribution = if pawnless && !current_on_diagonal && both_kings_on_diagonal(&successor_chess) {
+                                2
+                            } else {
+                                1
+                            };
+                            if counter >= contribution {
+                                counter -= contribution;
+                            } else {
+                                counter = 0;
+                            }
+                            last_loss_ct = Some(ct);
+                        }
+                    }
+                }
+            }
+
+            if is_win {
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_win(win_ct.unwrap(), 1), arena);
+            } else if counter == 0 {
+                let ct = last_loss_ct.unwrap_or(ConversionType::Capture);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ct, 1), arena);
+            } else if counter != current_outcome.get_unknown_counter() {
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
             }
         }
@@ -327,10 +464,11 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
     }
 
     // Initialization Phase
+    let mut dep_cache = DependencyCache::new(base_path);
     for &(table_a, table_b) in &table_pairs {
-        initialize_table(&mut solver, table_a, table_b, arena);
+        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, arena);
         if !solver.is_symmetric {
-            initialize_table(&mut solver, table_b, table_a, arena);
+            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, arena);
         }
     }
 
