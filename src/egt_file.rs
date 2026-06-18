@@ -99,15 +99,15 @@ pub struct EgtFile {
     /// Path to the file on disk.
     path: PathBuf,
     /// The sub-tables (Egt objects) that compose this file.
-    egts: Vec<Egt>,
+    pub egts: Vec<Egt>,
     /// Map from PawnKey to its index in the `egts` vector.
-    egt_map: HashMap<PawnKey, usize>,
+    pub egt_map: HashMap<PawnKey, usize>,
     /// The frames of the file.
     frames: Vec<FrameState>,
     /// Number of positions per frame (e.g., 16384).
     frame_size: usize,
     /// Total number of positions across all Egts in this file.
-    total_positions: usize,
+    pub total_positions: usize,
 }
 
 impl EgtFile {
@@ -308,9 +308,47 @@ impl EgtFile {
     }
 
     /// Computes the global index in the file given an Egt index and local index.
-    fn get_global_index(&self, egt_idx: usize, local_index: usize) -> usize {
+    pub fn get_global_index(&self, egt_idx: usize, local_index: usize) -> usize {
         let offset: usize = self.egts[0..egt_idx].iter().map(|egt| egt.index_range()).sum();
         offset + local_index
+    }
+
+    /// Reads an outcome directly by its global index.
+    pub fn read_by_global_index(&mut self, global_index: usize, arena: &mut Arena) -> Option<MaybeDtcOutcome> {
+        if global_index >= self.total_positions {
+            return None;
+        }
+
+        let frame_idx = global_index / self.frame_size;
+        let offset = global_index % self.frame_size;
+
+        self.ensure_uncompressed(frame_idx, arena);
+
+        if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
+            Some(uncompressed[offset])
+        } else {
+            None
+        }
+    }
+
+    /// Writes an outcome directly by its global index.
+    pub fn write_by_global_index(&mut self, global_index: usize, outcome: MaybeDtcOutcome, arena: &mut Arena) -> Result<(), ()> {
+        if global_index >= self.total_positions {
+            return Err(());
+        }
+
+        let frame_idx = global_index / self.frame_size;
+        let offset = global_index % self.frame_size;
+
+        self.ensure_uncompressed(frame_idx, arena);
+
+        if let FrameState::Uncompressed { uncompressed, dirty, .. } = &mut self.frames[frame_idx] {
+            uncompressed[offset] = outcome;
+            *dirty = true;
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     /// Returns the total number of positions across all Egts in this file.

@@ -108,6 +108,11 @@ that are updated during retrograde analysis and that will eventually become a `D
 
 During the retrograde propagation, each unresolved position must track a decremental move counter of its remaining legal moves after excluding those that are certainly losing. To achieve zero memory overhead, this counter is stored directly in the 13 unused bits of the 'invalid/unknown' state: an 'unknown' position with $C$ remaining moves is represented as `0b000 | (C << 3)`.
 
+The move counter is generally initialized as the number of legal moves in a position. But note that there are interactions between the move counter initialization and the use of symmetries to canonicalize pawnless positions: there is the possibility that different legal moves result in positions that map to the same index, and similarly the retrograde analsys can find different reverse moves that map to the same index. For reference see section 4.6 [here](https://issuu.com/jespertk/docs/master_thesis).
+
+A formal approach is the following. Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent positions and `#p=4` if it represents 4 equivalent positions (with our choice of canonicalization, `#p=4` positions are positions with both kings on the a1-h8 diagonal). When initializing the counters, if there is a legal move `p -> p'` with `#p=8` and `#p'=4`, then there is a move (the symmetric along the diagonal) which goes from a non canonical position (the reflection of `p` along the diagonal) to a canonical position (the reflection of `p'` along the diagonal), which will be explored during backward propagation. To account for this, moves `p -> p'` with `#p=8` and `#p'=4` should increment the counter by 2 during initialization.
+Similarly, when retrograde propagation from `p'` finds a reverse move `p <- p'` with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the counter for the reflection of `p` along the diagonal should also be decremented (since the symmetric move contributed to the counter for the reflection of `p` but led to a non-canonical position).
+
 ### 6.3 Initialization Phase
 Before starting the main retrograde loop, both tables in the pair are initialized:
 1. **Invalid Positions:** Scan all indices and mark invalid positions as 'invalid'.
@@ -118,7 +123,20 @@ Before starting the main retrograde loop, both tables in the pair are initialize
 5. **Dependency Probing (Conversions):** For each table, probe the fully generated dependency tables (which have fewer pieces or fewer pawns) to resolve capture and promotion moves:
    * Scan the losing positions in the dependency tables and perform the corresponding unmoves (`capture_unmoves`, `promotion_unmoves`, `promotion_capture_unmoves`). Mark the resulting predecessor positions as 'win (capture-in-1)' or 'win(promotion-in-1)' if they are not already marked.
    * Scan the winning positions in the dependency tables and perform the corresponding unmoves (`capture_unmoves`, `promotion_unmoves`, `promotion_capture_unmoves`). If a predecessor position is 'unknown', decrement the counter. If the counter reaches zero, mark the predecessor as 'loss (capture-in-1)' or 'loss (promotion-in-1)'.
-
+   * Here are some examples of dependency generation:
+     - the table K_K has no dependencies.
+     - the table K_KQ has one dependency: K_K (when the Q is captured)
+     - the table KQ_KPa has one dependency: K_KQ (when the P is captured)
+     - the table KPa_KQ has 9 dependencies:
+       - K_KPa (when the Q is captured)
+       - KQ_KQ (when the P promotes to Q)
+       - KQ_KR (when the P promotes to R)
+       - KQ_KB (when the P promotes to B)
+       - KQ_KB (when the P promotes to N)
+       - K_KQ (when the P promotes to Q capturing the Q)
+       - K_KR (when the P promotes to R capturing the Q)
+       - K_KB (when the P promotes to B capturing the Q)
+       - K_KB (when the P promotes to N capturing the Q)
 ### 6.4 The Propagation Loop
 The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**

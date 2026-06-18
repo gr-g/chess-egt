@@ -28,23 +28,55 @@ const fn initialize_nchoosek() -> [[usize; 65]; MAX_PIECES+1] {
 
 static N_CHOOSE_K: [[usize; 65]; MAX_PIECES+1] = initialize_nchoosek();
 
-// Initialize map to encode the possible 462 kings positions, considering symmetries.
+fn kings_adjacent_or_same(a: usize, b: usize) -> bool {
+    let ar = a / 8;
+    let af = a % 8;
+    let br = b / 8;
+    let bf = b % 8;
+    (ar as isize - br as isize).abs() <= 1 && (af as isize - bf as isize).abs() <= 1
+}
+
+fn reduce_king_pair(wk: usize, bk: usize) -> (usize, usize) {
+    let mut pos = [(wk / 8, wk % 8), (bk / 8, bk % 8)];
+
+    if pos[0].0 > 3 {
+        for (r, _) in pos.iter_mut() { *r = 7 - *r; }
+    }
+    if pos[0].1 > 3 {
+        for (_, f) in pos.iter_mut() { *f = 7 - *f; }
+    }
+    if pos[0].0 > pos[0].1 ||
+        (pos[0].0 == pos[0].1 && pos[1].0 > pos[1].1) {
+        for p in pos.iter_mut() { *p = (p.1, p.0); }
+    }
+
+    (pos[0].0 * 8 + pos[0].1, pos[1].0 * 8 + pos[1].1)
+}
+
+// Initialize map to encode the possible king positions under pawnless symmetries.
+// The second king breaks diagonal symmetry when the first king is on the diagonal,
+// but positions where both kings are on the a1-h8 diagonal are intentionally not
+// canonicalized using other pieces.
 fn initialize_kings_map() -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
-    let mut m = vec![(0,0); 462]; // from index to kings positions
-    let mut r = vec![vec![999; 64]; 28]; // from kings positions to index
-    let mut i = 0;
-    let mut wk;
-    wk = 0; for bk in (1..7).chain(9..15).chain(17..23).chain(26..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 1; for bk in (2..7).chain(10..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 2; for bk in (0..1).chain(3..8).chain(11..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 3; for bk in (0..2).chain(4..9).chain(12..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 9; for bk in (3..8).chain(10..15).chain(18..23).chain(26..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 10; for bk in (0..1).chain(4..9).chain(11..16).chain(19..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 11; for bk in (0..2).chain(5..10).chain(12..17).chain(20..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 18; for bk in (0..8).chain(12..16).chain(19..23).chain(27..31).chain(35..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 19; for bk in (0..10).chain(13..18).chain(20..25).chain(28..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    wk = 27; for bk in (0..8).chain(9..16).chain(21..24).chain(28..31).chain(36..39).chain(44..47).chain(53..55).chain(62..63) { m[i] = (wk, bk); r[wk][bk] = i; i += 1; }
-    assert_eq!(i, 462);
+    let mut m = Vec::new();
+    let mut r = vec![vec![999; 64]; 64];
+    let mut unique_pairs = std::collections::BTreeSet::new();
+
+    for wk in 0..64 {
+        for bk in 0..64 {
+            if !kings_adjacent_or_same(wk, bk) {
+                unique_pairs.insert(reduce_king_pair(wk, bk));
+            }
+        }
+    }
+
+    for (i, &(wk, bk)) in unique_pairs.iter().enumerate() {
+        let bk_compacted = if wk <= bk { bk - 1 } else { bk };
+        m.push((wk, bk_compacted));
+        r[wk][bk_compacted] = i;
+    }
+
+    assert_eq!(m.len(), 462);
     (m, r)
 }
 
@@ -222,7 +254,7 @@ impl Indexer {
         if pawnless {
             assert_eq!(piece_set[0].multiplicity, 1); // white king
             assert_eq!(piece_set[1].multiplicity, 1); // black king
-            // Encode the position of both kings using a single index in 0..462.
+            // Encode the position of both kings using a single canonical index.
             piece_set[0].n_squares = 462;
             piece_set[0].combinations = 462;
             piece_set[1].n_squares = 1;
@@ -558,20 +590,10 @@ impl Indexer {
         if self.buffer_pos[0].0 > self.buffer_pos[0].1 ||
             (self.buffer_pos[0].0 == self.buffer_pos[0].1 &&
             self.buffer_pos[1].0 > self.buffer_pos[1].1) {
-            // flip diagonally
+            // flip diagonally. If both kings are on the diagonal, we intentionally do not
+            // diagonal-reflect based on the remaining pieces.
             for p in self.buffer_pos.iter_mut() { *p = (p.1, p.0); };
         }
-
-        // Note that when the kings are both on the diagonal, there are
-        // pairs of positions that are symmetrical but are encoded using
-        // different indexes. This is a small inefficiency but resolving
-        // it adds a bit of complexity which we avoid. To properly resolve
-        // the symmetry taking into account piece multiplicity, the
-        // correct proedure would be to:
-        // - Take the diagonal reflection of the position
-        // - Re-sort the repeated pieces into a standard order
-        // - Compare with the initial position and select one of the two
-        //   (e.g. the lowest) as the canonical position.
     }
 
     // Sort coordinates for repeated pieces from highest to lowest.
@@ -731,17 +753,19 @@ mod tests {
         assert_eq!(egt.indexer.cpidx_to_index(), egt.indexer.index_range - 1);
     }
 
+    fn assert_round_trip(egt: &mut Egt, i: usize, side_to_move: Color) {
+        if let Some(board) = egt.indexer.board_from_index(i, side_to_move) {
+            assert_eq!(i, egt.indexer.board_to_index(&board));
+        }
+    }
+
     #[test]
     fn decode_encode_kpa_k() {
         let mut egt = Egt::from_tablename("KPa_K").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -750,12 +774,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KB_K").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -764,12 +784,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KQ_KR").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -778,12 +794,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KQQQ_K").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -792,12 +804,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KPdPe_KPePePe").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -806,12 +814,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KPdPePf_KPePe").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 
@@ -820,12 +824,8 @@ mod tests {
         let mut egt = Egt::from_tablename("KPePe_KPdPf").unwrap();
 
         for i in 0..egt.index_range() {
-            if let Some(board) = egt.indexer.board_from_index(i, Color::White) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
-            if let Some(board) = egt.indexer.board_from_index(i, Color::Black) {
-                assert_eq!(i, egt.indexer.board_to_index(&board));
-            }
+            assert_round_trip(&mut egt, i, Color::White);
+            assert_round_trip(&mut egt, i, Color::Black);
         }
     }
 }

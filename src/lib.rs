@@ -2,6 +2,7 @@ mod indexer;
 pub mod piece_set;
 pub mod egt;
 pub mod egt_file;
+pub mod retrograde;
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -81,7 +82,6 @@ pub struct MaybeDtcOutcome(pub u16);
 impl MaybeDtcOutcome {
     pub const INVALID: Self = Self(0b000);
     pub const DRAW: Self = Self(0b001);
-    pub const UNKNOWN: Self = Self(0b1111111111111000);
 
     pub fn from_u16(value: u16) -> Self {
         Self(value)
@@ -97,6 +97,18 @@ impl MaybeDtcOutcome {
 
     pub fn is_unknown(&self) -> bool {
         (self.0 & 0b111) == 0b000 && (self.0 >> 3) != 0
+    }
+
+    pub fn get_unknown_counter(&self) -> u16 {
+        self.0 >> 3
+    }
+
+    pub fn get_win_loss_distance(&self) -> Option<u16> {
+        if self.is_win() || self.is_loss() {
+            Some(self.0 >> 3)
+        } else {
+            None
+        }
     }
 
     pub fn is_draw(&self) -> bool {
@@ -178,26 +190,22 @@ impl EgtGenerator {
     pub fn generate(&self, tablename: &str) {
         println!("Generating table {} at {:?}", tablename, self.path);
 
-        // Derive the file path from the folder path and tablename
-        let file_path = self.path.join(format!("{}.egt", tablename));
-
-        // Create an EgtFile from scratch
-        let mut egt_file = crate::egt_file::EgtFile::new(file_path, tablename, true)
-            .expect("Failed to create EgtFile");
-
         // Create a temporary Arena (e.g., 4GB capacity)
         let mut arena = crate::egt_file::Arena::new(4 * 1024 * 1024 * 1024);
 
-        // Generate random outcomes
-        egt_file.generate_random_outcomes(&mut arena);
+        // Run retrograde analysis
+        let (mut file_a, file_b) = crate::retrograde::retrograde_analysis(&self.path, tablename, &mut arena);
 
         // Save to disk
-        egt_file.save_to_disk(&mut arena).expect("Failed to flush EgtFile");
+        file_a.save_to_disk(&mut arena).expect("Failed to flush EgtFile A");
+        if let Some(mut fb) = file_b {
+            fb.save_to_disk(&mut arena).expect("Failed to flush EgtFile B");
+        }
 
         println!(
             "Successfully generated table {} with {} positions.",
             tablename,
-            egt_file.total_positions()
+            file_a.total_positions()
         );
     }
 }
