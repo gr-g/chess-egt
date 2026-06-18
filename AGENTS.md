@@ -166,13 +166,9 @@ The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 4. Increment $n$.
 5. At the end of the process mark all 'unknown' positions as draws.
 
-### 6.5 Symmetry Handling for Pawnless-to-Pawned Transitions
-When performing retrograde unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry):
-1. Reconstruct the **4 rotations** of the canonical pawnless board.
-2. Call the retrograde unmove function (`capture_unmoves`, `promotion_unmoves`, or `promotion_capture_unmoves`) on each of the 4 rotations.
-3. For each resulting predecessor board, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.
+### 6.5 Use of reverse move generation for transitions from a different endgame
+The current approach relies only on `quiet_unmoves()`: a function that lists reverse moves without considering captures or promotions. This is enough during initialization, when we can scan all indexes and list the legal moves and consider transitions to simpler endgames. During this phase, for each capture/promotion move, we compute the index in the dependency and lookup the tablebase result, then use it for populating the queue of indexes to update.
 
-### 6.6 Strict Generation Order
-To guarantee that all dependency tables are fully generated and available on disk, tables must be generated in a strict topological order:
-1. **Primary Key:** Total number of pieces (fewer pieces first).
-2. **Secondary Key:** Number of pawns (fewer pawns first, i.e., pawnless tables before 1-pawn tables).
+In principle another approach is possible, which consists in scanning all indexes of simpler endgames, generating reverse capture/promotion moves from there (with unmove functions such as `capture_unmoves()`, `promotion_unmoves()`, or `promotion_capture_unmoves()`) and using these for populating the queue of indexes to update.
+
+If this approach was used, note that special care should be given to unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry). The process would be to reconstruct the 4 rotations of the canonical pawnless board, then call the retrograde unmove function on each of the 4 rotations. For each resulting predecessor board, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.

@@ -1,4 +1,4 @@
-use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup, Move};
+use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{MaybeDtcOutcome, ConversionType, DtcOutcome};
 use crate::egt_file::{EgtFile, Arena, PawnKey, reflect_files, is_canonical, mirror_setup_horizontally};
@@ -319,6 +319,11 @@ fn initialize_table(
             let file = &mut solver.files[table.file_idx];
             file.egts[table.egt_idx].board_from_index(idx, Color::White)
         };
+
+        if (idx+1) % 10000000 == 0 {
+            println!("Scanned {}/{} indexes...", idx+1, size);
+        }
+
         if setup_opt.is_none() {
             write_outcome(solver, table, idx, MaybeDtcOutcome::INVALID, arena);
             invalid_count += 1;
@@ -410,15 +415,11 @@ fn initialize_table(
             }
             unknown_count += 1;
         }
-
-        if (idx+1) % 10000000 == 0 {
-            println!("Scanned {}/{} indexes...", idx, size);
-        }
     }
 
     let tablename = solver.files[table.file_idx].egts[table.egt_idx].tablename();
     println!(
-        "Initialized table {} with {} indexed positions corresponding to {} canonical positions: {} checkmate, {} stalemate, {} unknown.",
+        "Initialized table {} with {} indexed positions corresponding to {} unique positions: {} checkmate, {} stalemate, {} unknown.",
         tablename,
         size,
         size - invalid_count,

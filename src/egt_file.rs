@@ -263,7 +263,7 @@ impl EgtFile {
         let tablename = self.path.file_stem().unwrap().to_str().unwrap();
 
         println!(
-            "Generated table {} with {} positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MB ({:.2} bits/pos).",
+            "Generated table {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MB ({:.2} bits/pos).",
             tablename,
             canonical_positions,
             wins,
@@ -793,7 +793,7 @@ pub fn print_generation_stats_pair(
     let format_dur = format!("{:02}h:{:02}m:{:02}s", hours, minutes, seconds);
 
     println!(
-        "Time used {} ({:.2} μs/pos). Memory usage: {:.0}MB.",
+        "Time used {} ({:.2} μs/pos). Memory used: {:.0}MB.",
         format_dur,
         us_per_pos,
         arena.used() as f64 / (1024.0 * 1024.0)
