@@ -138,20 +138,22 @@ fn reflect_setup_diagonally(setup: &Setup) -> Setup {
     reflected
 }
 
-pub fn quiet_unmoves(
+pub fn quiet_unmoves<F>(
     solver: &mut RetrogradeSolver,
     table: RetrogradeTable,
     twin: RetrogradeTable,
     local_index: usize,
-) -> Vec<usize> {
-    let mut predecessors = Vec::new();
+    mut f: F,
+) where
+    F: FnMut(&mut RetrogradeSolver, usize),
+{
     let setup = {
         let file = &mut solver.files[table.file_idx];
         file.egts[table.egt_idx].board_from_index(local_index, Color::White)
     };
     let setup = match setup {
         Some(s) => s,
-        None => return predecessors,
+        _ => return,
     };
 
     let pawnless = {
@@ -174,20 +176,23 @@ pub fn quiet_unmoves(
                     pred_setup = mirror_setup_horizontally(&pred_setup);
                 }
 
-                let twin_file = &mut solver.files[twin.file_idx];
-                let pred_idx = twin_file.egts[twin.egt_idx].board_to_index(&pred_setup);
-                predecessors.push(pred_idx);
+                let pred_idx = {
+                    let twin_file = &mut solver.files[twin.file_idx];
+                    twin_file.egts[twin.egt_idx].board_to_index(&pred_setup)
+                };
+                f(solver, pred_idx);
 
                 if pawnless && !current_on_diagonal && both_kings_on_diagonal(&pred_chess) {
                     // #p=4 and #p'=8: push the diagonal reflection of the predecessor
                     let reflected_setup = reflect_setup_diagonally(&pred_setup);
-                    let reflected_idx = twin_file.egts[twin.egt_idx].board_to_index(&reflected_setup);
-                    predecessors.push(reflected_idx);
+                    let reflected_idx = {
+                        let twin_file = &mut solver.files[twin.file_idx];
+                        twin_file.egts[twin.egt_idx].board_to_index(&reflected_setup)
+                    };
+                    f(solver, reflected_idx);
                 }
             });
     }
-
-    predecessors
 }
 
 fn symmetry_adjusted_move_counter(
@@ -320,6 +325,13 @@ fn initialize_table(
             continue;
         }
 
+        let current_outcome = read_outcome(solver, table, idx, arena);
+        if !current_outcome.is_invalid() {
+            // This position was already initialized/marked (e.g., as win-in-1 by checkmate propagation from the twin table)
+            unknown_count += 1;
+            continue;
+        }
+
         let setup = setup_opt.unwrap();
         let chess = Chess::from_setup(setup, CastlingMode::Standard).unwrap();
         let legals = chess.legal_moves();
@@ -330,51 +342,30 @@ fn initialize_table(
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0), arena);
                 checkmate_count += 1;
                 // Propagate to twin as win in 1 ply
-                let predecessors = quiet_unmoves(solver, table, twin, idx);
-                for pred_idx in predecessors {
+                quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
                     let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
                     if pred_outcome.is_invalid() || pred_outcome.is_unknown() || pred_outcome == MaybeDtcOutcome::INVALID {
                         write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1), arena);
                         twin_queues.push_win(pred_idx, ConversionType::Checkmate);
                     }
-                }
+                });
             } else {
                 // Stalemate!
                 write_outcome(solver, table, idx, MaybeDtcOutcome::DRAW, arena);
                 stalemate_count += 1;
             }
         } else {
-            // Unknown position, initialize move counter if not already marked as win
-            let current_outcome = read_outcome(solver, table, idx, arena);
-            if current_outcome.is_invalid() {
-                let counter = symmetry_adjusted_move_counter(&chess, pawnless);
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
-                unknown_count += 1;
-            } else {
-                unknown_count += 1;
-            }
-        }
-    }
-
-    // Dependency Probing
-    for idx in 0..size {
-        let current_outcome = read_outcome(solver, table, idx, arena);
-        if current_outcome.is_unknown() {
-            let setup = {
-                let file = &mut solver.files[table.file_idx];
-                file.egts[table.egt_idx].board_from_index(idx, Color::White).unwrap()
-            };
-            let chess = Chess::from_setup(setup, CastlingMode::Standard).unwrap();
+            // Unknown position, initialize move counter and probe dependencies
+            let mut counter = symmetry_adjusted_move_counter(&chess, pawnless);
             let current_on_diagonal = both_kings_on_diagonal(&chess);
 
-            let mut counter = current_outcome.get_unknown_counter();
             let mut is_win = false;
             let mut win_ct = None;
             let mut last_loss_ct = None;
 
-            for m in chess.legal_moves() {
-                let is_capture = m.capture().is_some() || matches!(m, Move::EnPassant { .. });
-                let is_promotion = m.promotion().is_some();
+            for m in legals {
+                let is_capture = m.is_capture();
+                let is_promotion = m.is_promotion();
 
                 if is_capture || is_promotion {
                     let successor_chess = chess.clone().play(m).unwrap();
@@ -414,9 +405,14 @@ fn initialize_table(
                 let ct = last_loss_ct.unwrap_or(ConversionType::Capture);
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ct, 1), arena);
                 table_queues.push_loss(idx, ct);
-            } else if counter != current_outcome.get_unknown_counter() {
+            } else {
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
             }
+            unknown_count += 1;
+        }
+
+        if (idx+1) % 10000000 == 0 {
+            println!("Scanned {}/{} indexes...", idx, size);
         }
     }
 
@@ -447,14 +443,13 @@ fn propagate_loss_to_wins_queue(
         _ => unreachable!(),
     };
 
-    let predecessors = quiet_unmoves(solver, table, twin, idx);
-    for pred_idx in predecessors {
+    quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
         let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
         if pred_outcome.is_unknown() {
             write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
             twin_next_queues.push_win(pred_idx, ct);
         }
-    }
+    });
 }
 
 fn propagate_win_to_losses_queue(
@@ -472,8 +467,7 @@ fn propagate_win_to_losses_queue(
         _ => unreachable!(),
     };
 
-    let predecessors = quiet_unmoves(solver, table, twin, idx);
-    for pred_idx in predecessors {
+    quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
         let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
         if pred_outcome.is_unknown() {
             let counter = pred_outcome.get_unknown_counter();
@@ -485,7 +479,7 @@ fn propagate_win_to_losses_queue(
                 write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
             }
         }
-    }
+    });
 }
 
 pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: &mut Arena) -> (EgtFile, Option<EgtFile>) {
