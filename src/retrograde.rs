@@ -5,10 +5,58 @@ use crate::egt_file::{EgtFile, Arena, PawnKey};
 use crate::piece_set::{EgtPiece, EgtSide};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetrogradeTable {
     pub file_idx: usize,
     pub egt_idx: usize,
+}
+
+struct DepthQueues {
+    win_checkmate: Vec<usize>,
+    win_capture: Vec<usize>,
+    win_promotion: Vec<usize>,
+
+    loss_checkmate: Vec<usize>,
+    loss_capture: Vec<usize>,
+    loss_promotion: Vec<usize>,
+}
+
+impl DepthQueues {
+    fn new() -> Self {
+        Self {
+            win_checkmate: Vec::new(),
+            win_capture: Vec::new(),
+            win_promotion: Vec::new(),
+            loss_checkmate: Vec::new(),
+            loss_capture: Vec::new(),
+            loss_promotion: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.win_checkmate.is_empty()
+            && self.win_capture.is_empty()
+            && self.win_promotion.is_empty()
+            && self.loss_checkmate.is_empty()
+            && self.loss_capture.is_empty()
+            && self.loss_promotion.is_empty()
+    }
+
+    fn push_win(&mut self, idx: usize, ct: ConversionType) {
+        match ct {
+            ConversionType::Checkmate => self.win_checkmate.push(idx),
+            ConversionType::Capture => self.win_capture.push(idx),
+            ConversionType::Promotion => self.win_promotion.push(idx),
+        }
+    }
+
+    fn push_loss(&mut self, idx: usize, ct: ConversionType) {
+        match ct {
+            ConversionType::Checkmate => self.loss_checkmate.push(idx),
+            ConversionType::Capture => self.loss_capture.push(idx),
+            ConversionType::Promotion => self.loss_promotion.push(idx),
+        }
+    }
 }
 
 pub struct RetrogradeSolver {
@@ -233,6 +281,8 @@ fn initialize_table(
     table: RetrogradeTable,
     twin: RetrogradeTable,
     dep_cache: &mut DependencyCache,
+    table_queues: &mut DepthQueues,
+    twin_queues: &mut DepthQueues,
     arena: &mut Arena,
 ) {
     let (size, pawnless) = {
@@ -265,6 +315,7 @@ fn initialize_table(
                     let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
                     if pred_outcome.is_invalid() || pred_outcome.is_unknown() || pred_outcome == MaybeDtcOutcome::INVALID {
                         write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1), arena);
+                        twin_queues.push_win(pred_idx, ConversionType::Checkmate);
                     }
                 }
             } else {
@@ -332,10 +383,13 @@ fn initialize_table(
             }
 
             if is_win {
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_win(win_ct.unwrap(), 1), arena);
+                let ct = win_ct.unwrap();
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_win(ct, 1), arena);
+                table_queues.push_win(idx, ct);
             } else if counter == 0 {
                 let ct = last_loss_ct.unwrap_or(ConversionType::Capture);
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ct, 1), arena);
+                table_queues.push_loss(idx, ct);
             } else if counter != current_outcome.get_unknown_counter() {
                 write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
             }
@@ -343,80 +397,60 @@ fn initialize_table(
     }
 }
 
-fn propagate_wins_to_losses(
+fn propagate_loss_to_wins_queue(
     solver: &mut RetrogradeSolver,
     table: RetrogradeTable,
     twin: RetrogradeTable,
+    idx: usize,
     plies: u16,
+    twin_next_queues: &mut DepthQueues,
     arena: &mut Arena,
-) -> bool {
-    let mut marked_any = false;
-    let size = solver.files[table.file_idx].egts[table.egt_idx].index_range();
+) {
+    let outcome = read_outcome(solver, table, idx, arena);
+    let ct = match outcome.unwrap() {
+        DtcOutcome::Loss(ct, _) => ct,
+        _ => unreachable!(),
+    };
 
-    for idx in 0..size {
-        let outcome = read_outcome(solver, table, idx, arena);
-        if outcome.is_win() && outcome.get_win_loss_distance() == Some(plies) {
-            // Get conversion type
-            let ct = match outcome.unwrap() {
-                DtcOutcome::Win(ct, _) => ct,
-                _ => unreachable!(),
-            };
-
-            // Find quiet predecessors in twin
-            let predecessors = quiet_unmoves(solver, table, twin, idx);
-            for pred_idx in predecessors {
-                let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
-                if pred_outcome.is_unknown() {
-                    let counter = pred_outcome.get_unknown_counter();
-                    assert!(counter > 0);
-                    if counter == 1 {
-                        // Counter reaches 0! Mark as loss in plies + 1
-                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1), arena);
-                        marked_any = true;
-                    } else {
-                        // Decrement counter
-                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
-                    }
-                }
-            }
+    let predecessors = quiet_unmoves(solver, table, twin, idx);
+    for pred_idx in predecessors {
+        let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
+        if pred_outcome.is_unknown() {
+            write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
+            twin_next_queues.push_win(pred_idx, ct);
         }
     }
-
-    marked_any
 }
 
-fn propagate_losses_to_wins(
+fn propagate_win_to_losses_queue(
     solver: &mut RetrogradeSolver,
     table: RetrogradeTable,
     twin: RetrogradeTable,
+    idx: usize,
     plies: u16,
+    twin_next_queues: &mut DepthQueues,
     arena: &mut Arena,
-) -> bool {
-    let mut marked_any = false;
-    let size = solver.files[table.file_idx].egts[table.egt_idx].index_range();
+) {
+    let outcome = read_outcome(solver, table, idx, arena);
+    let ct = match outcome.unwrap() {
+        DtcOutcome::Win(ct, _) => ct,
+        _ => unreachable!(),
+    };
 
-    for idx in 0..size {
-        let outcome = read_outcome(solver, table, idx, arena);
-        if outcome.is_loss() && outcome.get_win_loss_distance() == Some(plies) {
-            // Get conversion type
-            let ct = match outcome.unwrap() {
-                DtcOutcome::Loss(ct, _) => ct,
-                _ => unreachable!(),
-            };
-
-            // Find quiet predecessors in twin
-            let predecessors = quiet_unmoves(solver, table, twin, idx);
-            for pred_idx in predecessors {
-                let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
-                if pred_outcome.is_unknown() {
-                    write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
-                    marked_any = true;
-                }
+    let predecessors = quiet_unmoves(solver, table, twin, idx);
+    for pred_idx in predecessors {
+        let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
+        if pred_outcome.is_unknown() {
+            let counter = pred_outcome.get_unknown_counter();
+            assert!(counter > 0);
+            if counter == 1 {
+                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1), arena);
+                twin_next_queues.push_loss(pred_idx, ct);
+            } else {
+                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
             }
         }
     }
-
-    marked_any
 }
 
 pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: &mut Arena) -> (EgtFile, Option<EgtFile>) {
@@ -450,6 +484,10 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             *solver.files[1].egt_map.get(&twin_key).unwrap()
         };
 
+        if solver.is_symmetric && egt_idx_a > egt_idx_b {
+            continue;
+        }
+
         let table_a = RetrogradeTable {
             file_idx: 0,
             egt_idx: egt_idx_a,
@@ -463,41 +501,76 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
         table_pairs.push((table_a, table_b));
     }
 
-    // Initialization Phase
+    // Initialization & Propagation Phase for each independent pair
     let mut dep_cache = DependencyCache::new(base_path);
     for &(table_a, table_b) in &table_pairs {
-        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, arena);
-        if !solver.is_symmetric {
-            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, arena);
+        let mut queues_a = DepthQueues::new();
+        let mut queues_b = DepthQueues::new();
+
+        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b, arena);
+        if table_a != table_b {
+            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a, arena);
         }
-    }
 
-    // Propagation Loop
-    let mut plies = 1;
-    loop {
-        let mut marked_any = false;
+        let mut plies = 1;
+        while !queues_a.is_empty() || !queues_b.is_empty() {
+            let mut next_queues_a = DepthQueues::new();
+            let mut next_queues_b = DepthQueues::new();
 
-        for &(table_a, table_b) in &table_pairs {
-            if plies % 2 == 1 {
-                // Odd plies: propagate wins of distance `plies` to losses of distance `plies + 1`
-                marked_any |= propagate_wins_to_losses(&mut solver, table_a, table_b, plies, arena);
-                if !solver.is_symmetric {
-                    marked_any |= propagate_wins_to_losses(&mut solver, table_b, table_a, plies, arena);
+            // 1. Propagate Losses to Wins (Forward Priority: Checkmate -> Capture -> Promotion)
+            // Table A losses propagate to Table B wins
+            for &idx in &queues_a.loss_checkmate {
+                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
+            for &idx in &queues_a.loss_capture {
+                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
+            for &idx in &queues_a.loss_promotion {
+                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
+
+            // Table B losses propagate to Table A wins (if different)
+            if table_a != table_b {
+                for &idx in &queues_b.loss_checkmate {
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
                 }
-            } else {
-                // Even plies: propagate losses of distance `plies` to wins of distance `plies + 1`
-                marked_any |= propagate_losses_to_wins(&mut solver, table_a, table_b, plies, arena);
-                if !solver.is_symmetric {
-                    marked_any |= propagate_losses_to_wins(&mut solver, table_b, table_a, plies, arena);
+                for &idx in &queues_b.loss_capture {
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                }
+                for &idx in &queues_b.loss_promotion {
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
                 }
             }
-        }
 
-        if !marked_any {
-            break;
-        }
+            // 2. Propagate Wins to Losses (Reverse Priority: Promotion -> Capture -> Checkmate)
+            // Table A wins propagate to Table B losses
+            for &idx in &queues_a.win_promotion {
+                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
+            for &idx in &queues_a.win_capture {
+                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
+            for &idx in &queues_a.win_checkmate {
+                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
+            }
 
-        plies += 1;
+            // Table B wins propagate to Table A losses (if different)
+            if table_a != table_b {
+                for &idx in &queues_b.win_promotion {
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                }
+                for &idx in &queues_b.win_capture {
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                }
+                for &idx in &queues_b.win_checkmate {
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                }
+            }
+
+            queues_a = next_queues_a;
+            queues_b = next_queues_b;
+            plies += 1;
+        }
     }
 
     // Mark all remaining 'unknown' positions as draws
@@ -510,7 +583,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             }
         }
 
-        if !solver.is_symmetric {
+        if table_a != table_b {
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
                 let outcome = read_outcome(&mut solver, table_b, idx, arena);
@@ -521,7 +594,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
         }
     }
 
-    println!("Retrograde analysis complete! Max plies: {}", plies - 1);
+    println!("Retrograde analysis complete!");
 
     let mut files = solver.files;
     let file_a = files.remove(0);

@@ -2,12 +2,10 @@
 
 - The goal of the project is to produce chess endgame tablebases (EGTs).
 - A high-level overview is in README.md, read it to get information.
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile` class, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is the start of memory management (LRU-eviction of frames from memory). The generation of tablebase outcomes through retrograde analysis of chess position is implemented, it still needs to be properly tested.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile` class, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is the start of memory management (LRU-eviction of frames from memory). The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`), it still needs to be properly tested.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Do not do a full scan of all indexes at each depth. Instead use a list (or better a deque) to store the indexes to be updated on the next round, terminating when the deque is empty.
-- Related: ensure marking of winning/losing positions is made in a consistent order for each depth n: first mate-in-n (for positions where mate can be forced in n plys without captures/promotions), then capture-in-n (for positions where a capture can be forced in n plys without promotion), then promotion-in-n. This might require the deque solution (otherwise there would be 3 full scans per depth level instead of 1).
 - Add verifier function for generated tablebases (https://en.wikipedia.org/wiki/Endgame_tablebase#Step_3:_Verification)
 - Add details during process. For instance "Initialized table {} in {}s ({} us/pos), with {} indexed positions corresponding to {} canonical positions: {} checkmate, {} stalemate, {} unknown.". "Generated table {} in {}s ({} us/pos): {} wins, {} draws, {} losses. Time used {hh:mm:ss} ({} us/pos). Compressed size: {}MB ({} bits/pos).". Maybe add info about memory usage.
 - Add tests with real statistics from other tablebases.
