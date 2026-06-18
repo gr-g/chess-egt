@@ -706,14 +706,14 @@ fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
 }
 
 /// Reflects a list of files horizontally (file f becomes 7 - f).
-fn reflect_files(files: &[File]) -> Vec<File> {
+pub fn reflect_files(files: &[File]) -> Vec<File> {
     let mut reflected: Vec<File> = files.iter().map(|f| File::new(7 - f.to_usize() as u32)).collect();
     reflected.sort_by_key(|f| f.to_usize());
     reflected
 }
 
 /// Checks if a pawn configuration is canonical (lexicographically lower than or equal to its horizontal reflection).
-fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
+pub fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
     let stm_ref = reflect_files(stm_files);
     let sntm_ref = reflect_files(sntm_files);
 
@@ -760,7 +760,7 @@ fn build_pieces(
 }
 
 /// Mirrors a chess board horizontally.
-fn mirror_setup_horizontally(setup: &Setup) -> Setup {
+pub fn mirror_setup_horizontally(setup: &Setup) -> Setup {
     let mut mirrored = setup.clone();
     mirrored.board.flip_horizontal();
     mirrored.ep_square = mirrored.ep_square.map(|sq| sq.flip_horizontal());

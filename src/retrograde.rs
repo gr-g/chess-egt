@@ -1,7 +1,7 @@
 use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup, Move};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{MaybeDtcOutcome, ConversionType, DtcOutcome};
-use crate::egt_file::{EgtFile, Arena, PawnKey};
+use crate::egt_file::{EgtFile, Arena, PawnKey, reflect_files, is_canonical, mirror_setup_horizontally};
 use crate::piece_set::{EgtPiece, EgtSide};
 use std::collections::HashMap;
 
@@ -159,13 +159,20 @@ pub fn quiet_unmoves(
         twin_file.egts[twin.egt_idx].is_pawnless()
     };
 
+    let (stm_files_a, sntm_files_a) = get_pawn_files(solver.files[table.file_idx].egts[table.egt_idx].pieces());
+    let (stm_files_b, sntm_files_b) = get_pawn_files(solver.files[twin.file_idx].egts[twin.egt_idx].pieces());
+    let mirrored = stm_files_b != sntm_files_a || sntm_files_b != stm_files_a;
+
     if let Ok(chess) = Chess::from_setup(setup, CastlingMode::Standard) {
         let current_on_diagonal = both_kings_on_diagonal(&chess);
 
         RetrogradeAnalysis::new(&chess)
             .with_castling_mode(CastlingRetrogradeMode::NoCastling)
             .quiet_unmoves(|pred_chess, _m| {
-                let pred_setup = pred_chess.to_setup(EnPassantMode::Legal);
+                let mut pred_setup = pred_chess.to_setup(EnPassantMode::Legal);
+                if mirrored {
+                    pred_setup = mirror_setup_horizontally(&pred_setup);
+                }
 
                 let twin_file = &mut solver.files[twin.file_idx];
                 let pred_idx = twin_file.egts[twin.egt_idx].board_to_index(&pred_setup);
@@ -504,7 +511,12 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
 
     for (egt_idx_a, egt_a) in solver.files[0].egts.iter().enumerate() {
         let (stm_files, sntm_files) = get_pawn_files(egt_a.pieces());
-        let twin_key = PawnKey::new(&sntm_files, &stm_files);
+        let (twin_stm, twin_sntm) = if is_canonical(&sntm_files, &stm_files) {
+            (sntm_files, stm_files)
+        } else {
+            (reflect_files(&sntm_files), reflect_files(&stm_files))
+        };
+        let twin_key = PawnKey::new(&twin_stm, &twin_sntm);
 
         let egt_idx_b = if solver.is_symmetric {
             *solver.files[0].egt_map.get(&twin_key).unwrap()
@@ -603,26 +615,17 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             let wins_b = next_queues_b.win_checkmate.len() + next_queues_b.win_capture.len() + next_queues_b.win_promotion.len();
             let losses_b = next_queues_b.loss_checkmate.len() + next_queues_b.loss_capture.len() + next_queues_b.loss_promotion.len();
 
-            if table_a == table_b {
-                if wins_a > 0 {
-                    println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
-                }
-                if losses_a > 0 {
-                    println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
-                }
-            } else {
-                if wins_a > 0 {
-                    println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
-                }
-                if losses_a > 0 {
-                    println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
-                }
-                if wins_b > 0 {
-                    println!("{}: Found {} winning positions at depth {}", name_b, wins_b, plies);
-                }
-                if losses_b > 0 {
-                    println!("{}: Found {} losing positions at depth {}", name_b, losses_b, plies);
-                }
+            if wins_a > 0 {
+                println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
+            }
+            if losses_a > 0 {
+                println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
+            }
+            if wins_b > 0 {
+                println!("{}: Found {} winning positions at depth {}", name_b, wins_b, plies);
+            }
+            if losses_b > 0 {
+                println!("{}: Found {} losing positions at depth {}", name_b, losses_b, plies);
             }
 
             queues_a = next_queues_a;
