@@ -147,15 +147,10 @@ pub struct IndexerScratch {
 #[derive(Clone, Debug)]
 pub struct Indexer {
     // The set of pieces appearing in this endgame table.
-    piece_set: Vec<PieceSetElement>,
+    pub piece_set: Vec<PieceSetElement>,
 
     // The number of pieces in the endgame.
     pub n_pieces: usize,
-
-    // The number of unique pieces in the endgame.
-    // Non-pawn pieces of the same color and type count as one unique piece.
-    // Pawns of the same color on the same file count as one unique piece.
-    pub n_unique_pieces: usize,
 
     // The number of pawns in the endgame.
     pub n_pawns: usize,
@@ -194,7 +189,6 @@ impl Indexer {
             return Err(());
         }
 
-        let n_unique_pieces = piece_set.len();
         let n_pawns = piece_set.iter().filter(|p| p.piece.is_pawn()).map(|p| p.multiplicity).sum();
         let n_unique_pawns = piece_set.iter().filter(|p| p.piece.is_pawn()).count();
 
@@ -216,7 +210,6 @@ impl Indexer {
         Ok(Indexer {
             piece_set,
             n_pieces,
-            n_unique_pieces,
             n_pawns,
             n_unique_pawns,
             index_range,
@@ -730,110 +723,5 @@ impl Indexer {
             }
         }
         assert_eq!(v, 0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::egt::Egt;
-    use super::*;
-
-    #[test]
-    fn index_to_cpidx_min() {
-        // If all pieces occupy the first available square, the index is 0.
-        let egt = Egt::from_tablename("KQR_KQQQ").unwrap();
-        let mut scratch = egt.indexer.create_scratch();
-        scratch.buffer_pidx = vec![0, 0, 0, 2, 1, 0, 0];
-        println!("buffer_pidx: {:?}", scratch.buffer_pidx);
-        assert_eq!(egt.indexer.cpidx_to_index(&scratch), 0);
-    }
-
-    #[test]
-    fn index_to_cpidx_max() {
-        // If all pieces occupy the last available square, the index is index_range-1.
-        let egt = Egt::from_tablename("KQR_KQQQ").unwrap();
-        let mut scratch = egt.indexer.create_scratch();
-        scratch.buffer_pidx = egt.indexer.piece_set.iter()
-            .flat_map(|p| (1..=p.multiplicity).map(|k| p.n_squares - k))
-            .collect();
-        println!("buffer_pidx: {:?}", scratch.buffer_pidx);
-        assert_eq!(egt.indexer.cpidx_to_index(&scratch), egt.indexer.index_range - 1);
-    }
-
-    fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
-        let mut scratch = egt.indexer.create_scratch();
-        if let Some(board) = egt.indexer.board_from_index(&mut scratch, i, side_to_move) {
-            assert_eq!(i, egt.indexer.board_to_index(&mut scratch, &board));
-        }
-    }
-
-    #[test]
-    fn decode_encode_kpa_k() {
-        let egt = Egt::from_tablename("KPa_K").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kb_k() {
-        let egt = Egt::from_tablename("KB_K").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kqr_kqr() {
-        let egt = Egt::from_tablename("KQ_KR").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kqqq_k() {
-        let egt = Egt::from_tablename("KQQQ_K").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kpdpe_kpepepe() {
-        let egt = Egt::from_tablename("KPdPe_KPePePe").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kpdpepf_kpepe() {
-        let egt = Egt::from_tablename("KPdPePf_KPePe").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kpepe_kpdpf() {
-        let egt = Egt::from_tablename("KPePe_KPdPf").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
     }
 }

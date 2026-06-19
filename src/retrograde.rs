@@ -1,7 +1,7 @@
 use shakmaty::{Color, CastlingMode, Chess, FromSetup, Position, EnPassantMode, Role, Setup};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
-use crate::{MaybeDtcOutcome, ConversionType, DtcOutcome};
-use crate::egt_file::{EgtFile, Arena, PawnKey, reflect_files, is_canonical, mirror_setup_horizontally};
+use crate::ConversionType;
+use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_setup_horizontally};
 use crate::piece_set::{EgtPiece, EgtSide};
 use std::collections::HashMap;
 
@@ -57,6 +57,15 @@ impl DepthQueues {
             ConversionType::Promotion => self.loss_promotion.push(idx),
         }
     }
+
+    fn merge(&mut self, other: &mut Self) {
+        self.win_checkmate.append(&mut other.win_checkmate);
+        self.win_capture.append(&mut other.win_capture);
+        self.win_promotion.append(&mut other.win_promotion);
+        self.loss_checkmate.append(&mut other.loss_checkmate);
+        self.loss_capture.append(&mut other.loss_capture);
+        self.loss_promotion.append(&mut other.loss_promotion);
+    }
 }
 
 pub struct RetrogradeSolver {
@@ -77,16 +86,16 @@ impl RetrogradeSolver {
         }
     }
 
-    pub fn read_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize, arena: &mut Arena) -> MaybeDtcOutcome {
+    pub fn read_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize) -> MaybeDtcOutcome {
         let file = &mut self.files[file_idx];
         let global_index = file.get_global_index(egt_idx, local_index);
-        file.read_by_global_index(global_index, arena).unwrap()
+        file.read_from_index(global_index).unwrap()
     }
 
-    pub fn write_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize, outcome: MaybeDtcOutcome, arena: &mut Arena) {
+    pub fn write_outcome(&mut self, file_idx: usize, egt_idx: usize, local_index: usize, outcome: MaybeDtcOutcome) {
         let file = &mut self.files[file_idx];
         let global_index = file.get_global_index(egt_idx, local_index);
-        file.write_by_global_index(global_index, outcome, arena).unwrap();
+        file.write_to_index(global_index, outcome).unwrap();
     }
 }
 
@@ -112,9 +121,8 @@ fn read_outcome(
     solver: &mut RetrogradeSolver,
     table: RetrogradeTable,
     local_index: usize,
-    arena: &mut Arena,
 ) -> MaybeDtcOutcome {
-    solver.read_outcome(table.file_idx, table.egt_idx, local_index, arena)
+    solver.read_outcome(table.file_idx, table.egt_idx, local_index)
 }
 
 fn write_outcome(
@@ -122,9 +130,8 @@ fn write_outcome(
     table: RetrogradeTable,
     local_index: usize,
     outcome: MaybeDtcOutcome,
-    arena: &mut Arena,
 ) {
-    solver.write_outcome(table.file_idx, table.egt_idx, local_index, outcome, arena);
+    solver.write_outcome(table.file_idx, table.egt_idx, local_index, outcome);
 }
 
 fn both_kings_on_diagonal(chess: &Chess) -> bool {
@@ -195,62 +202,20 @@ pub fn quiet_unmoves<F>(
     }
 }
 
-fn symmetry_adjusted_move_counter(
-    chess: &Chess,
-    pawnless: bool,
-) -> u16 {
+fn symmetry_adjusted_move_counter(chess: &Chess) -> u16 {
     let current_on_diagonal = both_kings_on_diagonal(chess);
 
     let mut counter = 0;
     for m in chess.legal_moves() {
         let successor = chess.clone().play(m).unwrap();
 
-        if pawnless && !current_on_diagonal && both_kings_on_diagonal(&successor) {
+        if !current_on_diagonal && both_kings_on_diagonal(&successor) {
             counter += 2;
         } else {
             counter += 1;
         }
     }
     counter
-}
-
-fn get_top_level_tablename(setup: &Setup) -> String {
-    let stm_color = setup.turn;
-    let sntm_color = !stm_color;
-
-    let mut stm_parts = Vec::new();
-    let mut sntm_parts = Vec::new();
-
-    // We always have exactly 1 King for each side
-    stm_parts.push("K".to_string());
-    sntm_parts.push("K".to_string());
-
-    // Count other pieces
-    let board = &setup.board;
-
-    // Order of pieces in tablename: Q, R, B, N, P
-    for &role in &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn] {
-        let char_str = match role {
-            Role::Queen => "Q",
-            Role::Rook => "R",
-            Role::Bishop => "B",
-            Role::Knight => "N",
-            Role::Pawn => "P",
-            _ => unreachable!(),
-        };
-
-        let stm_count = (board.by_role(role) & board.by_color(stm_color)).into_iter().count();
-        for _ in 0..stm_count {
-            stm_parts.push(char_str.to_string());
-        }
-
-        let sntm_count = (board.by_role(role) & board.by_color(sntm_color)).into_iter().count();
-        for _ in 0..sntm_count {
-            sntm_parts.push(char_str.to_string());
-        }
-    }
-
-    format!("{}_{}", stm_parts.concat(), sntm_parts.concat())
 }
 
 pub struct DependencyCache {
@@ -266,24 +231,21 @@ impl DependencyCache {
         }
     }
 
-    pub fn get_or_load(&mut self, tablename: &str, arena: &mut Arena) -> &mut EgtFile {
+    pub fn get_or_load(&mut self, tablename: &str) -> &mut EgtFile {
         if !self.cache.contains_key(tablename) {
-            let path = self.base_path.join(format!("{}.egt", tablename));
-            let file = if path.exists() {
-                EgtFile::new(path, tablename, false).unwrap()
+            let file_from_disk = EgtFile::new_from_file(&self.base_path, tablename);
+            let file = if file_from_disk.is_ok() {
+                file_from_disk.unwrap()
             } else {
                 println!("Dependency table {} not found. Generating on the fly...", tablename);
-                let start_time = std::time::Instant::now();
-                let (mut file_a, mut file_b) = retrograde_analysis(&self.base_path, tablename, arena);
-                file_a.save_to_disk(arena).unwrap();
+                let (mut file_a, mut file_b) = retrograde_analysis(&self.base_path, tablename);
+                file_a.save_to_file().unwrap();
                 if let Some(ref mut fb) = file_b {
-                    fb.save_to_disk(arena).unwrap();
+                    fb.save_to_file().unwrap();
                 }
-                let duration = start_time.elapsed();
-                crate::egt_file::print_generation_stats_pair(&mut file_a, file_b.as_mut(), duration, arena);
 
                 if let Some(fb) = file_b {
-                    let twin_name = fb.path.file_stem().unwrap().to_str().unwrap().to_string();
+                    let twin_name = fb.tablename.clone();
                     self.cache.insert(twin_name, fb);
                 }
                 file_a
@@ -301,7 +263,6 @@ fn initialize_table(
     dep_cache: &mut DependencyCache,
     table_queues: &mut DepthQueues,
     twin_queues: &mut DepthQueues,
-    arena: &mut Arena,
 ) {
     let (size, pawnless) = {
         let egt = &solver.files[table.file_idx].egts[table.egt_idx];
@@ -325,12 +286,12 @@ fn initialize_table(
         }
 
         if setup_opt.is_none() {
-            write_outcome(solver, table, idx, MaybeDtcOutcome::INVALID, arena);
+            write_outcome(solver, table, idx, MaybeDtcOutcome::INVALID);
             invalid_count += 1;
             continue;
         }
 
-        let current_outcome = read_outcome(solver, table, idx, arena);
+        let current_outcome = read_outcome(solver, table, idx);
         if !current_outcome.is_invalid() {
             // This position was already initialized/marked (e.g., as win-in-1 by checkmate propagation from the twin table)
             unknown_count += 1;
@@ -344,24 +305,28 @@ fn initialize_table(
         if legals.is_empty() {
             if chess.is_check() {
                 // Checkmate!
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0));
                 checkmate_count += 1;
                 // Propagate to twin as win in 1 ply
                 quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-                    let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
+                    let pred_outcome = read_outcome(solver, twin, pred_idx);
                     if pred_outcome.is_invalid() || pred_outcome.is_unknown() || pred_outcome == MaybeDtcOutcome::INVALID {
-                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1), arena);
+                        write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1));
                         twin_queues.push_win(pred_idx, ConversionType::Checkmate);
                     }
                 });
             } else {
                 // Stalemate!
-                write_outcome(solver, table, idx, MaybeDtcOutcome::DRAW, arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::DRAW);
                 stalemate_count += 1;
             }
         } else {
             // Unknown position, initialize move counter and probe dependencies
-            let mut counter = symmetry_adjusted_move_counter(&chess, pawnless);
+            let mut counter = if pawnless {
+                symmetry_adjusted_move_counter(&chess)
+            } else {
+                legals.len() as u16
+            };
             let current_on_diagonal = both_kings_on_diagonal(&chess);
 
             let mut is_win = false;
@@ -375,27 +340,28 @@ fn initialize_table(
                 if is_capture || is_promotion {
                     let successor_chess = chess.clone().play(m).unwrap();
                     let successor_setup = successor_chess.to_setup(EnPassantMode::Legal);
-                    let dep_tablename = get_top_level_tablename(&successor_setup);
+                    let dep_tablename = crate::get_tablename(&successor_setup);
 
                     // Probe the dependency table
-                    let dep_outcome_opt = dep_cache.get_or_load(&dep_tablename, arena).probe(&successor_setup, arena);
-                    if let Some(dep_outcome) = dep_outcome_opt {
-                        let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
-                        if dep_outcome.is_loss() {
-                            is_win = true;
-                            win_ct = Some(ct);
-                            break;
-                        } else if dep_outcome.is_win() {
-                            let contribution = if pawnless && !current_on_diagonal && both_kings_on_diagonal(&successor_chess) {
-                                2
-                            } else {
-                                1
-                            };
-                            if counter >= contribution {
-                                counter -= contribution;
-                            } else {
-                                counter = 0;
-                            }
+                    let dep_outcome = dep_cache.get_or_load(&dep_tablename).probe(&successor_setup).unwrap();
+
+                    let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
+                    if dep_outcome.is_loss() {
+                        is_win = true;
+                        win_ct = Some(ct);
+                        break;
+                    } else if dep_outcome.is_win() {
+                        let contribution = if pawnless && !current_on_diagonal && both_kings_on_diagonal(&successor_chess) {
+                            2
+                        } else {
+                            1
+                        };
+                        if counter >= contribution {
+                            counter -= contribution;
+                        } else {
+                            counter = 0;
+                        }
+                        if last_loss_ct.is_none() || ct == ConversionType::Promotion {
                             last_loss_ct = Some(ct);
                         }
                     }
@@ -404,14 +370,14 @@ fn initialize_table(
 
             if is_win {
                 let ct = win_ct.unwrap();
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_win(ct, 1), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_win(ct, 1));
                 table_queues.push_win(idx, ct);
             } else if counter == 0 {
                 let ct = last_loss_ct.unwrap_or(ConversionType::Capture);
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ct, 1), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_loss(ct, 1));
                 table_queues.push_loss(idx, ct);
             } else {
-                write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter), arena);
+                write_outcome(solver, table, idx, MaybeDtcOutcome::new_unknown(counter));
             }
             unknown_count += 1;
         }
@@ -436,18 +402,14 @@ fn propagate_loss_to_wins_queue(
     idx: usize,
     plies: u16,
     twin_next_queues: &mut DepthQueues,
-    arena: &mut Arena,
 ) {
-    let outcome = read_outcome(solver, table, idx, arena);
-    let ct = match outcome.unwrap() {
-        DtcOutcome::Loss(ct, _) => ct,
-        _ => unreachable!(),
-    };
+    let outcome = read_outcome(solver, table, idx);
+    let ct = outcome.conversion_type();
 
     quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-        let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
+        let pred_outcome = read_outcome(solver, twin, pred_idx);
         if pred_outcome.is_unknown() {
-            write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1), arena);
+            write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1));
             twin_next_queues.push_win(pred_idx, ct);
         }
     });
@@ -460,44 +422,44 @@ fn propagate_win_to_losses_queue(
     idx: usize,
     plies: u16,
     twin_next_queues: &mut DepthQueues,
-    arena: &mut Arena,
 ) {
-    let outcome = read_outcome(solver, table, idx, arena);
-    let ct = match outcome.unwrap() {
-        DtcOutcome::Win(ct, _) => ct,
-        _ => unreachable!(),
-    };
+    let outcome = read_outcome(solver, table, idx);
+    let ct = outcome.conversion_type();
 
     quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-        let pred_outcome = read_outcome(solver, twin, pred_idx, arena);
+        let pred_outcome = read_outcome(solver, twin, pred_idx);
         if pred_outcome.is_unknown() {
             let counter = pred_outcome.get_unknown_counter();
             assert!(counter > 0);
             if counter == 1 {
-                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1), arena);
+                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1));
                 twin_next_queues.push_loss(pred_idx, ct);
             } else {
-                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1), arena);
+                write_outcome(solver, twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1));
             }
         }
     });
 }
 
-pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: &mut Arena) -> (EgtFile, Option<EgtFile>) {
+pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (EgtFile, Option<EgtFile>) {
     let parts: Vec<&str> = tablename.split('_').collect();
     assert_eq!(parts.len(), 2);
     let twin_tablename = format!("{}_{}", parts[1], parts[0]);
 
     let is_symmetric = tablename == twin_tablename;
 
-    let file_a = EgtFile::new(base_path.join(format!("{}.egt", tablename)), tablename, true).unwrap();
+    let file_a = EgtFile::new(&base_path.to_path_buf(), tablename).unwrap();
     let file_b = if is_symmetric {
         None
     } else {
-        Some(EgtFile::new(base_path.join(format!("{}.egt", twin_tablename)), &twin_tablename, true).unwrap())
+        Some(EgtFile::new(&base_path.to_path_buf(), &twin_tablename).unwrap())
     };
 
-    println!("Initializing retrograde analysis for {} and {}...", tablename, twin_tablename);
+    if is_symmetric {
+        println!("Initializing retrograde analysis for {}...", tablename);
+    } else {
+        println!("Initializing retrograde analysis for {} and {}...", tablename, twin_tablename);
+    }
 
     let mut solver = RetrogradeSolver::new(file_a, file_b);
 
@@ -542,9 +504,11 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
         let mut queues_a = DepthQueues::new();
         let mut queues_b = DepthQueues::new();
 
-        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b, arena);
+        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b);
         if table_a != table_b {
-            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a, arena);
+            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a);
+        } else {
+            queues_a.merge(&mut queues_b);
         }
 
         let mut plies = 1;
@@ -553,52 +517,72 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             let mut next_queues_b = DepthQueues::new();
 
             // 1. Propagate Losses to Wins (Forward Priority: Checkmate -> Capture -> Promotion)
-            // Table A losses propagate to Table B wins
-            for &idx in &queues_a.loss_checkmate {
-                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
-            for &idx in &queues_a.loss_capture {
-                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
-            for &idx in &queues_a.loss_promotion {
-                propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
+            if table_a == table_b {
+                for &idx in &queues_a.loss_checkmate {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+                for &idx in &queues_a.loss_capture {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+                for &idx in &queues_a.loss_promotion {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+            } else {
+                // Table A losses propagate to Table B wins
+                for &idx in &queues_a.loss_checkmate {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
+                for &idx in &queues_a.loss_capture {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
+                for &idx in &queues_a.loss_promotion {
+                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
 
-            // Table B losses propagate to Table A wins (if different)
-            if table_a != table_b {
+                // Table B losses propagate to Table A wins
                 for &idx in &queues_b.loss_checkmate {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
                 for &idx in &queues_b.loss_capture {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
                 for &idx in &queues_b.loss_promotion {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
             }
 
             // 2. Propagate Wins to Losses (Reverse Priority: Promotion -> Capture -> Checkmate)
-            // Table A wins propagate to Table B losses
-            for &idx in &queues_a.win_promotion {
-                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
-            for &idx in &queues_a.win_capture {
-                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
-            for &idx in &queues_a.win_checkmate {
-                propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b, arena);
-            }
+            if table_a == table_b {
+                for &idx in &queues_a.win_promotion {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+                for &idx in &queues_a.win_capture {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+                for &idx in &queues_a.win_checkmate {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                }
+            } else {
+                // Table A wins propagate to Table B losses
+                for &idx in &queues_a.win_promotion {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
+                for &idx in &queues_a.win_capture {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
+                for &idx in &queues_a.win_checkmate {
+                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                }
 
-            // Table B wins propagate to Table A losses (if different)
-            if table_a != table_b {
+                // Table B wins propagate to Table A losses
                 for &idx in &queues_b.win_promotion {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
                 for &idx in &queues_b.win_capture {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
                 for &idx in &queues_b.win_checkmate {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a, arena);
+                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
                 }
             }
 
@@ -627,24 +611,26 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str, arena: 
             queues_b = next_queues_b;
             plies += 1;
         }
-    }
 
-    // Mark all remaining 'unknown' positions as draws
-    for &(table_a, table_b) in &table_pairs {
+        // Mark all remaining 'unknown' positions as draws
+        let name_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].tablename();
+        println!("{}: marking remaining positions as draws...", name_a);
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
-            let outcome = read_outcome(&mut solver, table_a, idx, arena);
+            let outcome = read_outcome(&mut solver, table_a, idx);
             if outcome.is_unknown() {
-                write_outcome(&mut solver, table_a, idx, MaybeDtcOutcome::DRAW, arena);
+                write_outcome(&mut solver, table_a, idx, MaybeDtcOutcome::DRAW);
             }
         }
 
         if table_a != table_b {
+            let name_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].tablename();
+            println!("{}: marking remaining positions as draws...", name_b);
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
-                let outcome = read_outcome(&mut solver, table_b, idx, arena);
+                let outcome = read_outcome(&mut solver, table_b, idx);
                 if outcome.is_unknown() {
-                    write_outcome(&mut solver, table_b, idx, MaybeDtcOutcome::DRAW, arena);
+                    write_outcome(&mut solver, table_b, idx, MaybeDtcOutcome::DRAW);
                 }
             }
         }
@@ -663,8 +649,7 @@ mod tests {
 
     #[test]
     fn test_k_k_table_generation() {
-        let mut arena = Arena::new(16 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "K_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "K_K");
 
         assert!(file_b.is_none());
         assert_eq!(file_a.total_positions, 462);
@@ -675,7 +660,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -701,8 +686,7 @@ mod tests {
 
     #[test]
     fn test_kq_k_table_generation() {
-        let mut arena = Arena::new(64 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KQ_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KQ_K");
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -716,7 +700,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -744,7 +728,7 @@ mod tests {
         let mut invalid_count_b = 0;
 
         for idx in 0..file_b.total_positions() {
-            let outcome = file_b.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_b.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count_b += 1;
             } else if outcome.is_win() {
@@ -769,8 +753,7 @@ mod tests {
 
     #[test]
     fn test_kr_k_table_generation() {
-        let mut arena = Arena::new(64 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KR_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KR_K");
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -781,7 +764,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -809,7 +792,7 @@ mod tests {
         let mut invalid_count_b = 0;
 
         for idx in 0..file_b.total_positions() {
-            let outcome = file_b.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_b.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count_b += 1;
             } else if outcome.is_win() {
@@ -834,8 +817,7 @@ mod tests {
 
     #[test]
     fn test_kb_k_table_generation() {
-        let mut arena = Arena::new(64 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KB_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KB_K");
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -846,7 +828,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -874,7 +856,7 @@ mod tests {
         let mut invalid_count_b = 0;
 
         for idx in 0..file_b.total_positions() {
-            let outcome = file_b.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_b.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count_b += 1;
             } else if outcome.is_win() {
@@ -899,8 +881,7 @@ mod tests {
 
     #[test]
     fn test_kn_k_table_generation() {
-        let mut arena = Arena::new(64 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KN_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KN_K");
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -911,7 +892,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -939,7 +920,7 @@ mod tests {
         let mut invalid_count_b = 0;
 
         for idx in 0..file_b.total_positions() {
-            let outcome = file_b.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_b.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count_b += 1;
             } else if outcome.is_win() {
@@ -964,8 +945,7 @@ mod tests {
 
     #[test]
     fn test_kp_k_table_generation() {
-        let mut arena = Arena::new(64 * 1024 * 1024);
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KP_K", &mut arena);
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KP_K");
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -976,7 +956,7 @@ mod tests {
         let mut invalid_count = 0;
 
         for idx in 0..file_a.total_positions() {
-            let outcome = file_a.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_a.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count += 1;
             } else if outcome.is_win() {
@@ -1002,7 +982,7 @@ mod tests {
         let mut invalid_count_b = 0;
 
         for idx in 0..file_b.total_positions() {
-            let outcome = file_b.read_by_global_index(idx, &mut arena).unwrap();
+            let outcome = file_b.read_from_index(idx).unwrap();
             if outcome.is_draw() {
                 draw_count_b += 1;
             } else if outcome.is_win() {

@@ -1,8 +1,10 @@
 pub mod piece_set;
-pub mod egt;
-pub mod egt_file;
-pub mod retrograde;
+mod egt;
+mod egt_file;
+mod retrograde;
 
+use egt_file::EgtFile;
+use shakmaty::{Setup, Role};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -11,33 +13,6 @@ pub enum ConversionType {
     Promotion,
     Capture,
     Checkmate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WdlOutcome {
-    Loss(ConversionType),
-    Draw,
-    Win(ConversionType),
-}
-
-impl Ord for WdlOutcome {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (WdlOutcome::Win(_), WdlOutcome::Draw) => Ordering::Greater,
-            (WdlOutcome::Draw, WdlOutcome::Win(_)) => Ordering::Less,
-            (WdlOutcome::Win(_), WdlOutcome::Loss(_)) => Ordering::Greater,
-            (WdlOutcome::Loss(_), WdlOutcome::Win(_)) => Ordering::Less,
-            (WdlOutcome::Draw, WdlOutcome::Loss(_)) => Ordering::Greater,
-            (WdlOutcome::Loss(_), WdlOutcome::Draw) => Ordering::Less,
-            _ => Ordering::Equal,
-        }
-    }
-}
-
-impl PartialOrd for WdlOutcome {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,160 +44,166 @@ impl PartialOrd for DtcOutcome {
     }
 }
 
-impl DtcOutcome {
-    pub fn from_u16(value: u16) -> Self {
-        MaybeDtcOutcome::from_u16(value).unwrap()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MaybeDtcOutcome(pub u16);
-
-impl MaybeDtcOutcome {
-    pub const INVALID: Self = Self(0b000);
-    pub const DRAW: Self = Self(0b001);
-
-    pub fn from_u16(value: u16) -> Self {
-        Self(value)
-    }
-
-    pub fn to_u16(&self) -> u16 {
-        self.0
-    }
-
-    pub fn is_invalid(&self) -> bool {
-        self.0 == 0b000
-    }
-
-    pub fn is_unknown(&self) -> bool {
-        (self.0 & 0b111) == 0b000 && (self.0 >> 3) != 0
-    }
-
-    pub fn get_unknown_counter(&self) -> u16 {
-        self.0 >> 3
-    }
-
-    pub fn get_win_loss_distance(&self) -> Option<u16> {
-        if self.is_win() || self.is_loss() {
-            Some(self.0 >> 3)
-        } else {
-            None
-        }
-    }
-
-    pub fn is_draw(&self) -> bool {
-        self.0 == 0b001
-    }
-
-    pub fn is_win(&self) -> bool {
-        match self.0 & 0b111 {
-            0b010 | 0b100 | 0b110 => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_loss(&self) -> bool {
-        match self.0 & 0b111 {
-            0b011 | 0b101 | 0b111 => true,
-            _ => false,
-        }
-    }
-
-    pub fn new_win(ct: ConversionType, distance: u16) -> Self {
-        let bits = match ct {
-            ConversionType::Checkmate => 0b010,
-            ConversionType::Capture => 0b100,
-            ConversionType::Promotion => 0b110,
-        };
-        Self(bits | (distance << 3))
-    }
-
-    pub fn new_loss(ct: ConversionType, distance: u16) -> Self {
-        let bits = match ct {
-            ConversionType::Checkmate => 0b011,
-            ConversionType::Capture => 0b101,
-            ConversionType::Promotion => 0b111,
-        };
-        Self(bits | (distance << 3))
-    }
-
-    pub fn new_unknown(moves_counter: u16) -> Self {
-        Self(moves_counter << 3)
-    }
-
-    pub fn unwrap(self) -> DtcOutcome {
-        let n = self.0 >> 3;
-        match self.0 & 0b111 {
-            0b000 if n == 0 => panic!("invalid value used to create DtcOutcome"),
-            0b000 if n != 0 => panic!("unknown value used to create DtcOutcome"),
-            0b001 => DtcOutcome::Draw,
-            0b010 => DtcOutcome::Win(ConversionType::Checkmate, n),
-            0b100 => DtcOutcome::Win(ConversionType::Capture, n),
-            0b110 => DtcOutcome::Win(ConversionType::Promotion, n),
-            0b011 => DtcOutcome::Loss(ConversionType::Checkmate, n),
-            0b101 => DtcOutcome::Loss(ConversionType::Capture, n),
-            0b111 => DtcOutcome::Loss(ConversionType::Promotion, n),
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[allow(dead_code)]
 pub struct EgtGenerator {
-    path: PathBuf,
-    save_wdl_oneside: bool,
-    save_dtc_oneside: bool,
+    base_path: PathBuf,
+    assigned_memory: Option<usize>,
 }
 
 impl EgtGenerator {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
-            save_wdl_oneside: false,
-            save_dtc_oneside: false,
+            base_path: path.into(),
+            assigned_memory: None,
         }
     }
 
-    pub fn set_wdl_oneside(&mut self, val: bool) { self.save_wdl_oneside = val; }
-    pub fn set_dtc_oneside(&mut self, val: bool) { self.save_dtc_oneside = val; }
+    pub fn with_assigned_memory(&mut self, n: usize) {
+        self.assigned_memory = Some(n);
+    }
 
     pub fn generate(&self, tablename: &str) {
         let start_time = std::time::Instant::now();
-        println!("Generating table {} at {:?}", tablename, self.path);
+        println!("Generating table {} at {:?}", tablename, self.base_path);
 
-        // Create a temporary Arena (e.g., 4GB capacity)
-        let mut arena = crate::egt_file::Arena::new(4 * 1024 * 1024 * 1024);
+        // TODO: Preallocate memory
+        //if let Some(n) = self.assigned_memory {
+        //    ...
+        //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.path, tablename, &mut arena);
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, tablename);
 
-        // Save to disk
-        file_a.save_to_disk(&mut arena).expect("Failed to flush EgtFile A");
+        // Save to file
+        let bytes_a = file_a.save_to_file().expect("Failed to flush EgtFile A");
+        let mut bytes_b = None;
         if let Some(ref mut fb) = file_b {
-            fb.save_to_disk(&mut arena).expect("Failed to flush EgtFile B");
+            bytes_b = Some(fb.save_to_file().expect("Failed to flush EgtFile B"));
         }
         let duration = start_time.elapsed();
-        crate::egt_file::print_generation_stats_pair(&mut file_a, file_b.as_mut(), duration, &mut arena);
+        print_pair_stats(&mut file_a, file_b.as_mut(), bytes_a, bytes_b, duration);
+
+        // Check internal consistency
+        let prober = EgtProber::new(&self.base_path);
+        prober.verify_internal_consistency(tablename).expect("Failed internal consistency check!")
     }
 }
 
-#[allow(dead_code)]
 pub struct EgtProber {
-    path: PathBuf,
+    base_path: PathBuf,
+    assigned_memory: Option<usize>,
 }
 
 impl EgtProber {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            base_path: path.into(),
+            assigned_memory: None,
+        }
     }
 
-    //pub fn probe_wdl(&self, board: &shakmaty::Setup) -> WdlOutcome {
-        // Implementation goes here
-    //    WdlOutcome::Draw
-    //}
+    pub fn with_assigned_memory(&mut self, n: usize) {
+        self.assigned_memory = Some(n);
+    }
 
-    //pub fn probe_dtc(&self, board: &shakmaty::Setup) -> DtcOutcome {
-        // Implementation goes here
-    //    DtcOutcome::Draw
-    //}
+    pub fn probe(&self, position: &Setup) -> Result<DtcOutcome, ()> {
+        let tablename = get_tablename(position);
+        let mut file = EgtFile::new_from_file(&self.base_path, &tablename)?;
+
+        file.probe(position)?.to_outcome()
+    }
+
+    pub fn verify_internal_consistency(&self, tablename: &str) -> Result<(), ()> {
+        let file = EgtFile::new_from_file(&self.base_path, tablename)?;
+        for _idx in 0..file.total_positions() {
+            // TODO
+        }
+        Ok(())
+    }
+}
+
+pub fn get_tablename(position: &Setup) -> String {
+    let stm_color = position.turn;
+    let sntm_color = !stm_color;
+
+    let mut stm = String::new();
+    let mut sntm = String::new();
+
+    // We always have exactly 1 King for each side
+    stm.push('K');
+    sntm.push('K');
+
+    // Count other pieces in order: Q, R, B, N, P
+    let board = &position.board;
+    for &role in &[Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::Pawn] {
+        let stm_count = (board.by_role(role) & board.by_color(stm_color)).into_iter().count();
+        for _ in 0..stm_count {
+            stm.push(role.upper_char());
+        }
+
+        let sntm_count = (board.by_role(role) & board.by_color(sntm_color)).into_iter().count();
+        for _ in 0..sntm_count {
+            sntm.push(role.upper_char());
+        }
+    }
+
+    format!("{}_{}", stm, sntm)
+}
+
+/// Prints table-specific statistics (wins, draws, losses, compression).
+pub fn print_table_stats(tablename: &str, wins: usize, draws: usize, losses: usize, bytes: u64) {
+    let unique_positions = wins + draws + losses;
+    let compressed_size_mb = bytes as f64 / (1024.0 * 1024.0);
+    let bits_per_pos = if unique_positions > 0 {
+        (bytes as f64 * 8.0) / unique_positions as f64
+    } else {
+        0.0
+    };
+
+    println!(
+        "Generated table {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MB ({:.2} bits/pos).",
+        tablename,
+        unique_positions,
+        wins,
+        draws,
+        losses,
+        compressed_size_mb,
+        bits_per_pos
+    );
+}
+
+/// Prints detailed statistics about a pair of generated tables (or a single table if symmetric).
+pub fn print_pair_stats(
+    file_a: &mut EgtFile,
+    file_b: Option<&mut EgtFile>,
+    bytes_a: u64,
+    bytes_b: Option<u64>,
+    duration: std::time::Duration,
+) {
+    let (wins_a, draws_a, losses_a, _) = file_a.count_outcomes();
+    let mut unique_positions = wins_a + draws_a + losses_a;
+    print_table_stats(&file_a.tablename, wins_a, draws_a, losses_a, bytes_a);
+
+    if let Some(fb) = file_b {
+        let (wins_b, draws_b, losses_b, _) = fb.count_outcomes();
+        unique_positions += wins_b + draws_b + losses_b;
+        print_table_stats(&fb.tablename, wins_b, draws_b, losses_b, bytes_b.unwrap());
+    }
+
+    let us_per_pos = if unique_positions > 0 {
+        duration.as_micros() as f64 / unique_positions as f64
+    } else {
+        0.0
+    };
+
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    let format_dur = format!("{:02}h:{:02}m:{:02}s", hours, minutes, seconds);
+
+    println!(
+        "Time used {} ({:.2} μs/pos).",
+        format_dur,
+        us_per_pos,
+    );
 }

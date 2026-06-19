@@ -1,19 +1,21 @@
 # AGENTS.md
 
 - The goal of the project is to produce chess endgame tablebases (EGTs).
-- A high-level overview is in README.md, read it to get information.
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile` class, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is the start of memory management (LRU-eviction of frames from memory). The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`), it still needs to be properly tested.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is only a stub of memory management (LRU-eviction of frames from memory), not implemented yet. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`), it still needs to be properly tested. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
 - Add verifier function for generated tablebases (https://en.wikipedia.org/wiki/Endgame_tablebase#Step_3:_Verification)
 - Add tests with real statistics from other tablebases.
+- Proper memory management and LRU-eviction.
 - Profiling/benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
 - Experiment with different frame sizes, compression parameters, ...
 - Error management.
 - Visibility and public interface.
+- Marking redundant positions, that are generated but are eventually not saved and excluded from statistics. This would make statistics aligned with Syzygy?
+- Refactor retrograde generation tests using a common function
 
 # Design Specifications
 

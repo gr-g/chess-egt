@@ -1,5 +1,5 @@
 use clap::Parser;
-use chess_egt::{EgtGenerator, EgtProber};
+use chess_egt::{DtcOutcome, ConversionType, EgtGenerator, EgtProber};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -22,12 +22,6 @@ struct Cli {
     #[arg(long)]
     generate_all_5: bool,
 
-    #[arg(long)]
-    save_wdl_oneside: bool,
-
-    #[arg(long)]
-    save_dtc_oneside: bool,
-
     position: Option<String>,
 }
 
@@ -35,17 +29,43 @@ fn main() {
     let cli = Cli::parse();
 
     if let Some(table) = cli.generate {
-        let mut g = EgtGenerator::new(&cli.path);
-        g.set_wdl_oneside(cli.save_wdl_oneside);
-        g.set_dtc_oneside(cli.save_dtc_oneside);
+        let g = EgtGenerator::new(&cli.path);
         g.generate(&table);
     } else if cli.generate_all_3 {
         println!("Generating all 3-men tables...");
     } else if let Some(fen) = cli.position {
         let fen_obj = shakmaty::fen::Fen::from_str(&fen).expect("Invalid FEN");
-        let setup: shakmaty::Setup = fen_obj.into();
-        let _prober = EgtProber::new(&cli.path);
-        println!("Probing position: {:?}", setup);
+        let position: shakmaty::Setup = fen_obj.into();
+        let prober = EgtProber::new(&cli.path);
+        let outcome = prober.probe(&position).expect("Failed to query position");
+
+        let message = match outcome {
+            DtcOutcome::Win(ct, n) => {
+                let conversion_str = match (ct, n % 2) {
+                    (ConversionType::Checkmate, _) => "Checkmate",
+                    (ConversionType::Capture, 1) => "A capture converting to a winning position can be forced",
+                    (ConversionType::Promotion, 1) => "A promotion converting to a winning position ",
+                    (ConversionType::Capture, _) => "A capture of your own piece converting to a winning position can be forced",
+                    (ConversionType::Promotion, _) => "A promotion of an opponent's pawn converting to a winning position can be forced",
+                };
+                format!("Win - {} in {} moves", conversion_str, n / 2)
+            },
+            DtcOutcome::Draw => {
+                format!("Draw")
+            },
+            DtcOutcome::Loss(ct, n) => {
+                let conversion_str = match (ct, n % 2) {
+                    (ConversionType::Checkmate, _) => "Checkmate cannot be avoided",
+                    (ConversionType::Capture, 0) => "A capture converting to a losing position cannot be avoided",
+                    (ConversionType::Promotion, 0) => "A promotion converting to a losing position cannot be avoided",
+                    (ConversionType::Capture, _) => "A forced capture of an opponent's piece converting to a losing position cannot be avoided",
+                    (ConversionType::Promotion, _) => "A forced promotion of your pawn converting to a winning position cannot be avoided",
+                };
+                format!("Loss - {} in {} moves", conversion_str, n / 2)
+
+            }
+        };
+        println!("{}", message);
     } else {
         println!("No action specified. Use --help for options.");
     }
