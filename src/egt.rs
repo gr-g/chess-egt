@@ -1,12 +1,12 @@
-use shakmaty::{Color, File, Setup};
+use shakmaty::{Color, File, Chess};
 mod indexer;
-use crate::piece_set::{EgtPiece, EgtSide};
+use crate::piece_set::{EgtRole, EgtSide};
 use indexer::{Indexer, IndexerScratch};
 
 #[derive(Clone, Debug)]
 pub struct Egt {
     // The pieces appearing in this endgame table with their multiplicity.
-    pub pieces: Vec<(EgtPiece, EgtSide, usize)>,
+    pub pieces: Vec<(EgtRole, EgtSide, usize)>,
 
     // The helper object storing the piece set and the information required
     // to convert positions to tablebase indexes.
@@ -21,7 +21,7 @@ pub struct Egt {
 
 impl Egt {
     // The set of pieces appearing in this endgame table.
-    pub fn pieces(&self) -> &[(EgtPiece, EgtSide, usize)] {
+    pub fn pieces(&self) -> &[(EgtRole, EgtSide, usize)] {
         &self.pieces
     }
 
@@ -32,7 +32,7 @@ impl Egt {
 
     // Whether this a pawnless endgame.
     pub fn is_pawnless(&self) -> bool {
-        self.n_pawns() == 0
+        self.indexer.n_pawns == 0
     }
 
     // The total number of positions indexed in this endgame table.
@@ -46,7 +46,7 @@ impl Egt {
     }
 
     // Setup an endgame table from a set of pieces.
-    pub fn from_pieces(mut pieces: Vec<(EgtPiece, EgtSide, usize)>) -> Result<Self, ()> {
+    pub fn from_pieces(mut pieces: Vec<(EgtRole, EgtSide, usize)>) -> Result<Self, ()> {
         // Sort: first the pawns, then the kings, then all other pieces.
         pieces.sort();
 
@@ -61,17 +61,17 @@ impl Egt {
         })
     }
 
-    pub fn board_to_index(&mut self, board: &Setup) -> usize {
-        self.indexer.board_to_index(&mut self.scratch, board)
+    pub fn position_to_index(&mut self, position: &Chess) -> usize {
+        self.indexer.position_to_index(&mut self.scratch, position)
     }
 
-    pub fn board_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Setup> {
+    pub fn position_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Chess> {
         self.indexer
-            .board_from_index(&mut self.scratch, index, side_to_move)
+            .position_from_index(&mut self.scratch, index, side_to_move)
     }
 }
 
-fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
+fn compute_tablename(pieces: &[(EgtRole, EgtSide, usize)]) -> String {
     let mut stm_parts = Vec::new();
     let mut sntm_parts = Vec::new();
 
@@ -91,7 +91,7 @@ fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
         // First, check for Queen
         for &(piece, p_side, mult) in pieces {
             if p_side == *side {
-                if let EgtPiece::Queen = piece {
+                if let EgtRole::Queen = piece {
                     for _ in 0..mult {
                         parts.push("Q".to_string());
                     }
@@ -101,7 +101,7 @@ fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
         // Rook
         for &(piece, p_side, mult) in pieces {
             if p_side == *side {
-                if let EgtPiece::Rook = piece {
+                if let EgtRole::Rook = piece {
                     for _ in 0..mult {
                         parts.push("R".to_string());
                     }
@@ -111,7 +111,7 @@ fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
         // Bishop
         for &(piece, p_side, mult) in pieces {
             if p_side == *side {
-                if let EgtPiece::Bishop = piece {
+                if let EgtRole::Bishop = piece {
                     for _ in 0..mult {
                         parts.push("B".to_string());
                     }
@@ -121,7 +121,7 @@ fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
         // Knight
         for &(piece, p_side, mult) in pieces {
             if p_side == *side {
-                if let EgtPiece::Knight = piece {
+                if let EgtRole::Knight = piece {
                     for _ in 0..mult {
                         parts.push("N".to_string());
                     }
@@ -132,7 +132,7 @@ fn compute_tablename(pieces: &[(EgtPiece, EgtSide, usize)]) -> String {
         let mut pawns = Vec::new();
         for &(piece, p_side, mult) in pieces {
             if p_side == *side {
-                if let EgtPiece::Pawn(file) = piece {
+                if let EgtRole::Pawn(file) = piece {
                     pawns.push((file, mult));
                 }
             }
@@ -169,29 +169,29 @@ mod tests {
         let mut pieces = vec![];
 
         for (s, side) in [(stm, EgtSide::SideToMove), (sntm, EgtSide::SideNotToMove)] {
-            let mut count = [0; crate::piece_set::ALL_EGT_PIECES.len()];
+            let mut count = [0; crate::piece_set::ALL_EGT_ROLES.len()];
             let mut it = s.chars();
             while let Some(c) = it.next() {
                 let piece = match c {
                     'P' => match it.next() {
-                        Some('a') => EgtPiece::Pawn(File::A),
-                        Some('b') => EgtPiece::Pawn(File::B),
-                        Some('c') => EgtPiece::Pawn(File::C),
-                        Some('d') => EgtPiece::Pawn(File::D),
-                        Some('e') => EgtPiece::Pawn(File::E),
-                        Some('f') => EgtPiece::Pawn(File::F),
-                        Some('g') => EgtPiece::Pawn(File::G),
-                        Some('h') => EgtPiece::Pawn(File::H),
+                        Some('a') => EgtRole::Pawn(File::A),
+                        Some('b') => EgtRole::Pawn(File::B),
+                        Some('c') => EgtRole::Pawn(File::C),
+                        Some('d') => EgtRole::Pawn(File::D),
+                        Some('e') => EgtRole::Pawn(File::E),
+                        Some('f') => EgtRole::Pawn(File::F),
+                        Some('g') => EgtRole::Pawn(File::G),
+                        Some('h') => EgtRole::Pawn(File::H),
                         _ => {
                             println!("invalid tablename");
                             return Err(());
                         }
                     },
-                    'K' => EgtPiece::King,
-                    'Q' => EgtPiece::Queen,
-                    'R' => EgtPiece::Rook,
-                    'B' => EgtPiece::Bishop,
-                    'N' => EgtPiece::Knight,
+                    'K' => EgtRole::King,
+                    'Q' => EgtRole::Queen,
+                    'R' => EgtRole::Rook,
+                    'B' => EgtRole::Bishop,
+                    'N' => EgtRole::Knight,
                     _ => {
                         println!("invalid tablename");
                         return Err(());
@@ -200,12 +200,12 @@ mod tests {
                 count[piece.to_index()] += 1;
             }
 
-            if count[EgtPiece::King.to_index()] != 1 {
+            if count[EgtRole::King.to_index()] != 1 {
                 println!("missing king");
                 return Err(());
             }
 
-            for piece in crate::piece_set::ALL_EGT_PIECES {
+            for piece in crate::piece_set::ALL_EGT_ROLES {
                 let multiplicity = count[piece.to_index()];
 
                 if multiplicity > 0 {
@@ -219,8 +219,8 @@ mod tests {
 
     fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
         let mut scratch = egt.indexer.create_scratch();
-        if let Some(board) = egt.indexer.board_from_index(&mut scratch, i, side_to_move) {
-            assert_eq!(i, egt.indexer.board_to_index(&mut scratch, &board));
+        if let Some(position) = egt.indexer.position_from_index(&mut scratch, i, side_to_move) {
+            assert_eq!(i, egt.indexer.position_to_index(&mut scratch, &position));
         }
     }
 
@@ -289,6 +289,11 @@ mod tests {
         let egt = from_tablename("KPePe_KPdPf").unwrap();
 
         for i in 0..egt.index_range() {
+            if i == 1911601 {
+                let mut scratch = egt.indexer.create_scratch();
+                println!("{:?}", egt.indexer.position_from_index(&mut scratch, i, Color::White));
+                println!("{:?}", egt.indexer.position_from_index(&mut scratch, i, Color::Black));
+            }
             assert_round_trip(&egt, i, Color::White);
             assert_round_trip(&egt, i, Color::Black);
         }

@@ -1,24 +1,24 @@
 use shakmaty::{File, Role};
 use std::cmp::Ordering;
 
-pub static ALL_EGT_PIECES: [EgtPiece; 13] = [
-    EgtPiece::Pawn(File::A),
-    EgtPiece::Pawn(File::B),
-    EgtPiece::Pawn(File::C),
-    EgtPiece::Pawn(File::D),
-    EgtPiece::Pawn(File::E),
-    EgtPiece::Pawn(File::F),
-    EgtPiece::Pawn(File::G),
-    EgtPiece::Pawn(File::H),
-    EgtPiece::King,
-    EgtPiece::Queen,
-    EgtPiece::Rook,
-    EgtPiece::Bishop,
-    EgtPiece::Knight,
+pub static ALL_EGT_ROLES: [EgtRole; 13] = [
+    EgtRole::Pawn(File::A),
+    EgtRole::Pawn(File::B),
+    EgtRole::Pawn(File::C),
+    EgtRole::Pawn(File::D),
+    EgtRole::Pawn(File::E),
+    EgtRole::Pawn(File::F),
+    EgtRole::Pawn(File::G),
+    EgtRole::Pawn(File::H),
+    EgtRole::King,
+    EgtRole::Queen,
+    EgtRole::Rook,
+    EgtRole::Bishop,
+    EgtRole::Knight,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
-pub enum EgtPiece {
+pub enum EgtRole {
     Pawn(File),
     King,
     Queen,
@@ -27,45 +27,45 @@ pub enum EgtPiece {
     Knight,
 }
 
-impl EgtPiece {
+impl EgtRole {
     pub fn is_pawn(&self) -> bool {
         match self {
-            EgtPiece::Pawn(_) => true,
+            EgtRole::Pawn(_) => true,
             _ => false,
         }
     }
 
     pub fn to_role(&self) -> Role {
         match self {
-            EgtPiece::Pawn(_) => Role::Pawn,
-            EgtPiece::King => Role::King,
-            EgtPiece::Queen => Role::Queen,
-            EgtPiece::Rook => Role::Rook,
-            EgtPiece::Bishop => Role::Bishop,
-            EgtPiece::Knight => Role::Knight,
+            EgtRole::Pawn(_) => Role::Pawn,
+            EgtRole::King => Role::King,
+            EgtRole::Queen => Role::Queen,
+            EgtRole::Rook => Role::Rook,
+            EgtRole::Bishop => Role::Bishop,
+            EgtRole::Knight => Role::Knight,
         }
     }
 
     pub fn to_index(&self) -> usize {
         match self {
-            EgtPiece::Pawn(File::A) => 0,
-            EgtPiece::Pawn(File::B) => 1,
-            EgtPiece::Pawn(File::C) => 2,
-            EgtPiece::Pawn(File::D) => 3,
-            EgtPiece::Pawn(File::E) => 4,
-            EgtPiece::Pawn(File::F) => 5,
-            EgtPiece::Pawn(File::G) => 6,
-            EgtPiece::Pawn(File::H) => 7,
-            EgtPiece::King => 8,
-            EgtPiece::Queen => 9,
-            EgtPiece::Rook => 10,
-            EgtPiece::Bishop => 11,
-            EgtPiece::Knight => 12,
+            EgtRole::Pawn(File::A) => 0,
+            EgtRole::Pawn(File::B) => 1,
+            EgtRole::Pawn(File::C) => 2,
+            EgtRole::Pawn(File::D) => 3,
+            EgtRole::Pawn(File::E) => 4,
+            EgtRole::Pawn(File::F) => 5,
+            EgtRole::Pawn(File::G) => 6,
+            EgtRole::Pawn(File::H) => 7,
+            EgtRole::King => 8,
+            EgtRole::Queen => 9,
+            EgtRole::Rook => 10,
+            EgtRole::Bishop => 11,
+            EgtRole::Knight => 12,
         }
     }
 }
 
-impl Ord for EgtPiece {
+impl Ord for EgtRole {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cmp(&other).unwrap()
     }

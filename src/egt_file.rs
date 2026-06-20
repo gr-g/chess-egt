@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use shakmaty::{File, Setup};
+use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
-use crate::piece_set::{EgtPiece, EgtSide};
+use crate::piece_set::{EgtRole, EgtSide};
 
 // 16k positions per frame, corresponding to 32k bytes per frame.
 const DEFAULT_FRAME_SIZE: usize = 16384;
@@ -22,6 +22,10 @@ impl MaybeDtcOutcome {
 
     pub fn to_u16(&self) -> u16 {
         self.0
+    }
+
+    pub fn is_assigned(&self) -> bool {
+        (self.0 & 0b111) != 0b000
     }
 
     pub fn is_invalid(&self) -> bool {
@@ -190,20 +194,26 @@ impl PawnKey {
 /// Represents a file with endgame tablebases for a specific configuration of chess pieces.
 #[derive(Debug)]
 pub struct EgtFile {
-    /// Identifier of the EgtFile (e.g. "KP_K").
+    /// The name of this endgame file (e.g. "KQ_KP").
     pub tablename: String,
+
     /// Path to the file.
     pub path: PathBuf,
+
     /// The sub-tables (Egt objects) that compose this file.
     pub egts: Vec<Egt>,
+
     /// Map from PawnKey to its index in the `egts` vector.
     pub egt_map: HashMap<PawnKey, usize>,
+
     /// The frames of the file.
     frames: Vec<FrameState>,
+
     /// Number of positions per frame.
     frame_size: usize,
-    /// Total number of positions across all Egts in this file.
-    pub total_positions: usize,
+
+    /// Total number of indexed locations across all Egts in this file.
+    pub index_range: usize,
 }
 
 impl EgtFile {
@@ -242,9 +252,9 @@ impl EgtFile {
             egts.push(egt);
         }
 
-        let total_positions: usize = egts.iter().map(|egt| egt.index_range()).sum();
+        let index_range: usize = egts.iter().map(|egt| egt.index_range()).sum();
         let frame_size = DEFAULT_FRAME_SIZE;
-        let num_frames = (total_positions + frame_size - 1) / frame_size;
+        let num_frames = (index_range + frame_size - 1) / frame_size;
 
         let mut frames = Vec::with_capacity(num_frames);
         for _ in 0..num_frames {
@@ -258,7 +268,7 @@ impl EgtFile {
             egt_map,
             frames,
             frame_size,
-            total_positions,
+            index_range,
         })
     }
 
@@ -279,9 +289,9 @@ impl EgtFile {
         Ok(egt_file)
     }
 
-    /// Probes the outcome of a specific board position.
-    pub fn probe(&mut self, board: &Setup) -> Result<MaybeDtcOutcome, ()> {
-        let index = self.map_position_to_index(board)?;
+    /// Probes the outcome of a specific position.
+    pub fn probe(&mut self, position: &Chess) -> Result<MaybeDtcOutcome, ()> {
+        let index = self.map_position_to_index(position)?;
         self.read_from_index(index)
     }
 
@@ -359,13 +369,14 @@ impl EgtFile {
         }
     }
 
-    /// Maps a board position to the corresponding index.
-    pub fn map_position_to_index(&mut self, board: &Setup) -> Result<usize, ()> {
-        let stm_color = board.turn;
+    /// Maps a position to the corresponding index. This is used when probing
+    /// for a specific position.
+    pub fn map_position_to_index(&mut self, position: &Chess) -> Result<usize, ()> {
+        let stm_color = position.turn();
         let sntm_color = !stm_color;
 
-        let stm_pawns_bb = board.board.pawns() & board.board.by_color(stm_color);
-        let sntm_pawns_bb = board.board.pawns() & board.board.by_color(sntm_color);
+        let stm_pawns_bb = position.board().pawns() & position.board().by_color(stm_color);
+        let sntm_pawns_bb = position.board().pawns() & position.board().by_color(sntm_color);
 
         let mut stm_files: Vec<File> = stm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
         let mut sntm_files: Vec<File> = sntm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
@@ -375,21 +386,21 @@ impl EgtFile {
 
         let canonical = is_canonical(&stm_files, &sntm_files);
 
-        let (target_stm_files, target_sntm_files, target_board) = if canonical {
-            (stm_files, sntm_files, board.clone())
+        let (target_stm_files, target_sntm_files, target_position) = if canonical {
+            (stm_files, sntm_files, position.clone())
         } else {
             let stm_ref = reflect_files(&stm_files);
             let sntm_ref = reflect_files(&sntm_files);
-            let mirrored = mirror_setup_horizontally(board);
+            let mirrored = mirror_horizontally(position);
             (stm_ref, sntm_ref, mirrored)
         };
 
         let key = PawnKey::new(&target_stm_files, &target_sntm_files);
         let &egt_idx = self.egt_map.get(&key).ok_or(())?;
-        let local_index = self.egts[egt_idx].board_to_index(&target_board);
+        let local_index = self.egts[egt_idx].position_to_index(&target_position);
 
         let global_index = self.get_global_index(egt_idx, local_index);
-        if global_index >= self.total_positions {
+        if global_index >= self.index_range {
             return Err(());
         }
 
@@ -402,9 +413,30 @@ impl EgtFile {
         offset + local_index
     }
 
+    /// Converts a global index to a position.
+    pub fn index_to_position(&mut self, index: usize, side_to_move: Color) -> Option<Chess> {
+        if index >= self.index_range {
+            return None;
+        }
+
+        let mut remaining_idx = index;
+        let mut target_egt_idx = None;
+        for (egt_idx, egt) in self.egts.iter().enumerate() {
+            let range = egt.index_range();
+            if remaining_idx < range {
+                target_egt_idx = Some(egt_idx);
+                break;
+            }
+            remaining_idx -= range;
+        }
+
+        let egt_idx = target_egt_idx?;
+        self.egts[egt_idx].position_from_index(remaining_idx, side_to_move)
+    }
+
     /// Reads an outcome directly by its global index.
     pub fn read_from_index(&mut self, index: usize) -> Result<MaybeDtcOutcome, ()> {
-        if index >= self.total_positions {
+        if index >= self.index_range {
             return Err(());
         }
 
@@ -417,7 +449,7 @@ impl EgtFile {
 
     /// Writes an outcome directly by its global index.
     pub fn write_to_index(&mut self, index: usize, outcome: MaybeDtcOutcome) -> Result<(), ()> {
-        if index >= self.total_positions {
+        if index >= self.index_range {
             return Err(());
         }
 
@@ -433,11 +465,6 @@ impl EgtFile {
         } else {
             unreachable!();
         }
-    }
-
-    /// Returns the total number of positions across all Egts in this file.
-    pub fn total_positions(&self) -> usize {
-        self.total_positions
     }
 
     /// Ensures that the frame at `frame_idx` is in the `Uncompressed` state.
@@ -662,7 +689,7 @@ pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<MaybeDtcOu
 /// - Number of pawns for SideToMove
 /// - Number of pawns for SideNotToMove
 /// - List of non-pawn pieces
-fn parse_top_level_tablename(tablename: &str) -> Result<(usize, usize, Vec<(EgtPiece, EgtSide, usize)>), ()> {
+fn parse_top_level_tablename(tablename: &str) -> Result<(usize, usize, Vec<(EgtRole, EgtSide, usize)>), ()> {
     let (stm, sntm) = tablename.split_once('_').ok_or(())?;
     let mut stm_pawns = 0;
     let mut sntm_pawns = 0;
@@ -672,22 +699,22 @@ fn parse_top_level_tablename(tablename: &str) -> Result<(usize, usize, Vec<(EgtP
         (stm, EgtSide::SideToMove, &mut stm_pawns),
         (sntm, EgtSide::SideNotToMove, &mut sntm_pawns),
     ] {
-        let mut count = [0; crate::piece_set::ALL_EGT_PIECES.len()];
+        let mut count = [0; crate::piece_set::ALL_EGT_ROLES.len()];
         for c in s.chars() {
             match c {
                 'P' => *pawns += 1,
-                'K' => count[EgtPiece::King.to_index()] += 1,
-                'Q' => count[EgtPiece::Queen.to_index()] += 1,
-                'R' => count[EgtPiece::Rook.to_index()] += 1,
-                'B' => count[EgtPiece::Bishop.to_index()] += 1,
-                'N' => count[EgtPiece::Knight.to_index()] += 1,
+                'K' => count[EgtRole::King.to_index()] += 1,
+                'Q' => count[EgtRole::Queen.to_index()] += 1,
+                'R' => count[EgtRole::Rook.to_index()] += 1,
+                'B' => count[EgtRole::Bishop.to_index()] += 1,
+                'N' => count[EgtRole::Knight.to_index()] += 1,
                 _ => return Err(()),
             }
         }
-        if count[EgtPiece::King.to_index()] != 1 {
+        if count[EgtRole::King.to_index()] != 1 {
             return Err(());
         }
-        for piece in crate::piece_set::ALL_EGT_PIECES {
+        for piece in crate::piece_set::ALL_EGT_ROLES {
             if !piece.is_pawn() {
                 let multiplicity = count[piece.to_index()];
                 if multiplicity > 0 {
@@ -744,8 +771,8 @@ pub fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
 fn build_pieces(
     stm_files: &[File],
     sntm_files: &[File],
-    other_pieces: &[(EgtPiece, EgtSide, usize)],
-) -> Vec<(EgtPiece, EgtSide, usize)> {
+    other_pieces: &[(EgtRole, EgtSide, usize)],
+) -> Vec<(EgtRole, EgtSide, usize)> {
     let mut pieces = other_pieces.to_vec();
 
     // Count stm pawns by file
@@ -755,7 +782,7 @@ fn build_pieces(
     }
     for (idx, &count) in stm_pawn_counts.iter().enumerate() {
         if count > 0 {
-            pieces.push((EgtPiece::Pawn(File::new(idx as u32)), EgtSide::SideToMove, count));
+            pieces.push((EgtRole::Pawn(File::new(idx as u32)), EgtSide::SideToMove, count));
         }
     }
 
@@ -766,25 +793,24 @@ fn build_pieces(
     }
     for (idx, &count) in sntm_pawn_counts.iter().enumerate() {
         if count > 0 {
-            pieces.push((EgtPiece::Pawn(File::new(idx as u32)), EgtSide::SideNotToMove, count));
+            pieces.push((EgtRole::Pawn(File::new(idx as u32)), EgtSide::SideNotToMove, count));
         }
     }
 
     pieces
 }
 
-/// Mirrors a chess board horizontally.
-pub fn mirror_setup_horizontally(setup: &Setup) -> Setup {
-    let mut mirrored = setup.clone();
-    mirrored.board.flip_horizontal();
-    mirrored.ep_square = mirrored.ep_square.map(|sq| sq.flip_horizontal());
-    mirrored
+/// Mirrors a chess position horizontally.
+pub fn mirror_horizontally(position: &Chess) -> Chess {
+    let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
+    setup.board.flip_horizontal();
+    setup.ep_square = setup.ep_square.map(|sq| sq.flip_horizontal());
+    setup.position(CastlingMode::Standard).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
     use shakmaty::fen::Fen;
     use shakmaty::Color;
 
@@ -796,9 +822,9 @@ mod tests {
         assert_eq!(other_pieces.len(), 3); // King STM, King SNTM, Rook STM
         // Wait, other_pieces has King STM, Rook STM, King SNTM.
         // Let's check the exact pieces
-        assert!(other_pieces.contains(&(EgtPiece::King, EgtSide::SideToMove, 1)));
-        assert!(other_pieces.contains(&(EgtPiece::Rook, EgtSide::SideToMove, 1)));
-        assert!(other_pieces.contains(&(EgtPiece::King, EgtSide::SideNotToMove, 1)));
+        assert!(other_pieces.contains(&(EgtRole::King, EgtSide::SideToMove, 1)));
+        assert!(other_pieces.contains(&(EgtRole::Rook, EgtSide::SideToMove, 1)));
+        assert!(other_pieces.contains(&(EgtRole::King, EgtSide::SideNotToMove, 1)));
     }
 
     #[test]
@@ -840,19 +866,20 @@ mod tests {
 
         // A canonical position: White pawn on a2, White king on a1, Black king on h8
         // FEN: 8/8/8/8/8/8/P7/K6k w - - 0 1
-        let board = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
+        let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
+        let position = fen.into_position(CastlingMode::Standard).unwrap();
 
         // Probing should succeed (returns Invalid because the frame is initialized to 0/invalid)
-        let outcome = egt_file.probe(&board);
+        let outcome = egt_file.probe(&position);
         assert_eq!(outcome, Ok(MaybeDtcOutcome::INVALID));
 
         // Write an outcome
         let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
-        let idx = egt_file.map_position_to_index(&board).unwrap();
+        let idx = egt_file.map_position_to_index(&position).unwrap();
         egt_file.write_to_index(idx, expected_outcome).unwrap();
 
         // Probe again
-        let outcome = egt_file.probe(&board);
+        let outcome = egt_file.probe(&position);
         assert_eq!(outcome, Ok(expected_outcome));
     }
 
@@ -864,16 +891,18 @@ mod tests {
         // A mirrored (non-canonical) position: White pawn on h2, White king on h1, Black king on a1
         // This is the horizontal reflection of the canonical position above.
         // FEN: 8/8/8/8/8/8/7P/k6K w - - 0 1
-        let board_mirrored = Fen::from_str("8/8/8/8/8/8/7P/k6K w - - 0 1").map(Setup::from).unwrap();
-        let board_canonical = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
+        let fen_mirrored: Fen = "8/8/8/8/8/8/7P/k6K w - - 0 1".parse().unwrap();
+        let position_mirrored = fen_mirrored.into_position(CastlingMode::Standard).unwrap();
+        let fen_canonical: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
+        let position_canonical = fen_canonical.into_position(CastlingMode::Standard).unwrap();
 
         // Write to the canonical position
         let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
-        let idx_canonical = egt_file.map_position_to_index(&board_canonical).unwrap();
+        let idx_canonical = egt_file.map_position_to_index(&position_canonical).unwrap();
         egt_file.write_to_index(idx_canonical, expected_outcome).unwrap();
 
         // Probing the mirrored position should return the same outcome because it gets canonicalized/mirrored
-        let outcome = egt_file.probe(&board_mirrored);
+        let outcome = egt_file.probe(&position_mirrored);
         assert_eq!(outcome, Ok(expected_outcome));
     }
 
@@ -888,8 +917,8 @@ mod tests {
             let mut local_index = 0;
             while local_index < range {
                 let global_index = offset + local_index;
-                if let Some(board) = egt_file.egts[egt_idx].board_from_index(local_index, Color::White) {
-                    let mapped_global_index = egt_file.map_position_to_index(&board).unwrap();
+                if let Some(position) = egt_file.egts[egt_idx].position_from_index(local_index, Color::White) {
+                    let mapped_global_index = egt_file.map_position_to_index(&position).unwrap();
                     assert_eq!(global_index, mapped_global_index);
                 }
                 local_index += stride;
@@ -928,11 +957,12 @@ mod tests {
         let mut egt_file = EgtFile::new(&base_path, "KP_K").unwrap();
 
         // Sample a position
-        let board = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
+        let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
+        let position = fen.into_position(CastlingMode::Standard).unwrap();
         let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
-        let idx = egt_file.map_position_to_index(&board).unwrap();
+        let idx = egt_file.map_position_to_index(&position).unwrap();
         egt_file.write_to_index(idx, outcome).unwrap();
-        assert_eq!(egt_file.probe(&board), Ok(outcome));
+        assert_eq!(egt_file.probe(&position), Ok(outcome));
 
         // Save to file
         egt_file.save_to_file().unwrap();
@@ -945,7 +975,7 @@ mod tests {
 
         // Probe again (triggers on-demand decompression from file)
         let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();
-        let loaded_outcome = another_egt_file.probe(&board);
+        let loaded_outcome = another_egt_file.probe(&position);
         assert_eq!(loaded_outcome, Ok(outcome));
 
         // Clean up
@@ -958,11 +988,12 @@ mod tests {
         let mut egt_file = EgtFile::new(&path, "KP_K").unwrap();
 
         // Sample a position
-        let board = Fen::from_str("8/8/8/8/8/8/P7/K6k w - - 0 1").map(Setup::from).unwrap();
+        let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
+        let position = fen.into_position(CastlingMode::Standard).unwrap();
         let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
-        let idx = egt_file.map_position_to_index(&board).unwrap();
+        let idx = egt_file.map_position_to_index(&position).unwrap();
         egt_file.write_to_index(idx, outcome).unwrap();
-        assert_eq!(egt_file.probe(&board), Ok(outcome));
+        assert_eq!(egt_file.probe(&position), Ok(outcome));
 
         for f in 0..egt_file.frames.len() {
             egt_file.ensure_compressed(f).unwrap();
@@ -973,7 +1004,7 @@ mod tests {
         }
 
         // Probe again (triggers decompression from memory)
-        let loaded_outcome = egt_file.probe(&board);
+        let loaded_outcome = egt_file.probe(&position);
         assert_eq!(loaded_outcome, Ok(outcome));
 
         // Clean up

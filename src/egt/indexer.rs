@@ -1,5 +1,5 @@
-use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Chess, FromSetup};
-use crate::piece_set::{EgtPiece, EgtSide};
+use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
+use crate::piece_set::{EgtRole, EgtSide};
 use std::cmp::Reverse;
 
 // Supporting up to 8 pieces should be fine for some time :)
@@ -83,8 +83,8 @@ fn initialize_kings_map() -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
 // An element of the set of pieces appearing in an endgame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PieceSetElement {
-    // The piece appearing in the endgame configuration.
-    pub piece: EgtPiece,
+    // The piece role appearing in the endgame position.
+    pub role: EgtRole,
 
     // Whether the piece is for the side-to-move or the side-not-to-move.
     pub side: EgtSide,
@@ -138,12 +138,12 @@ pub struct EnpassantOption {
 pub struct IndexerScratch {
     pub piece_set: Vec<PieceSetElement>,
     pub current_ep_option: EnpassantOption,
-    pub buffer_pos: Vec<(usize, usize)>,
+    pub buffer_coord: Vec<(usize, usize)>,
     pub buffer_pidx: Vec<usize>,
 }
 
-// Helper object taking care of the efficient conversion from board
-// positions to compact indexes representing the positions, and viceversa.
+// Helper object taking care of the efficient conversion from positions to
+// compact indexes representing the positions, and viceversa.
 #[derive(Clone, Debug)]
 pub struct Indexer {
     // The set of pieces appearing in this endgame table.
@@ -172,10 +172,10 @@ pub struct Indexer {
 
 impl Indexer {
     // Initialize the indexer with the given set of pieces (type, side, multiplicity).
-    pub fn from_pieces(pieces: &[(EgtPiece, EgtSide, usize)]) -> Result<Self, ()> {
+    pub fn from_pieces(pieces: &[(EgtRole, EgtSide, usize)]) -> Result<Self, ()> {
         // Setup the piece set elements.
         let mut piece_set: Vec<_> = pieces.iter().map(|p| PieceSetElement{
-            piece: p.0,
+            role: p.0,
             side: p.1,
             multiplicity: p.2,
             n_squares: 0, // filled in later
@@ -189,8 +189,8 @@ impl Indexer {
             return Err(());
         }
 
-        let n_pawns = piece_set.iter().filter(|p| p.piece.is_pawn()).map(|p| p.multiplicity).sum();
-        let n_unique_pawns = piece_set.iter().filter(|p| p.piece.is_pawn()).count();
+        let n_pawns = piece_set.iter().filter(|p| p.role.is_pawn()).map(|p| p.multiplicity).sum();
+        let n_unique_pawns = piece_set.iter().filter(|p| p.role.is_pawn()).count();
 
         // Compute n_squares, combinations, span.
         Self::compute_piece_squares(&mut piece_set);
@@ -223,7 +223,7 @@ impl Indexer {
         IndexerScratch {
             piece_set: self.piece_set.clone(),
             current_ep_option: self.ep_options[0],
-            buffer_pos: vec![(0, 0); self.n_pieces],
+            buffer_coord: vec![(0, 0); self.n_pieces],
             buffer_pidx: vec![0; self.n_pieces],
         }
     }
@@ -235,11 +235,11 @@ impl Indexer {
         let mut span_end = 0;
         for p in piece_set.iter_mut() {
             let k = p.multiplicity;
-            if p.piece.is_pawn() {
+            if p.role.is_pawn() {
                 pawnless = false;
-                p.n_squares = available_pawn_squares[p.piece.to_index()];
+                p.n_squares = available_pawn_squares[p.role.to_index()];
                 assert!(p.n_squares >= k);
-                available_pawn_squares[p.piece.to_index()] -= k;
+                available_pawn_squares[p.role.to_index()] -= k;
             } else {
                 p.n_squares = available_squares;
             }
@@ -276,13 +276,13 @@ impl Indexer {
             if pawns[i].side == EgtSide::SideNotToMove {
                 for j in 0..pawns.len() {
                     if pawns[j].side == EgtSide::SideToMove {
-                        let i_file = pawns[i].piece.to_index();
-                        let j_file = pawns[j].piece.to_index();
+                        let i_file = pawns[i].role.to_index();
+                        let j_file = pawns[j].role.to_index();
                         if i_file == j_file + 1 || i_file + 1 == j_file {
                             // There are positions where a pawn on i_file can be captured en passant.
                             // Let's allocate an index range to encode them.
 
-                            let istm = if i > 0 && pawns[i-1].piece == pawns[i].piece {
+                            let istm = if i > 0 && pawns[i-1].role == pawns[i].role {
                                 // There are also pawns of the side-to-move on the same
                                 // file where en passant capture is possible.
                                 Some(i-1)
@@ -330,32 +330,31 @@ impl Indexer {
         ep_options
     }
 
-    // Encodes the status of a board into an index, which represents the positions
-    // of the pieces (up to symmetries).
-    pub fn board_to_index(&self, scratch: &mut IndexerScratch, board: &Setup) -> usize {
-        //println!("board_to_index: {}", board);
-        //println!("en passant: {:?}", board.en_passant());
-        let ep_pawn_square = board.ep_square.map(|sq| Square::from_coords(sq.file(), Rank::Fifth));
-        let index_offset = self.adjust_ep_from_board(scratch, ep_pawn_square);
-        // Now `current_ep_option` reflects the en passant status of the board.
+    // Encodes the position into an index, which represents the position up to symmetries.
+    pub fn position_to_index(&self, scratch: &mut IndexerScratch, position: &Chess) -> usize {
+        //println!("position_to_index: {}", position);
+        //println!("en passant: {:?}", position.en_passant());
+        let ep_pawn_square = position.legal_ep_square().map(|sq| Square::from_coords(sq.file(), Rank::Fifth));
+        let index_offset = self.adjust_ep_from_position(scratch, ep_pawn_square);
+        // Now `current_ep_option` reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
 
-        self.board_to_pos(scratch, board);
-        // Now `buffer_pos` has the coordinates (rank, file) of the pieces.
-        //println!("buffer_pos: {:?}", scratch.buffer_pos);
+        self.position_to_coord(scratch, position);
+        // Now `buffer_coord` has the coordinates (rank, file) of the pieces.
+        //println!("buffer_coord: {:?}", scratch.buffer_coord);
 
         if self.n_pawns == 0 {
             self.reduce_symmetries(scratch);
-            // Now the first item in `buffer_pos` has coordinates restricted to 10 squares.
-            //println!("buffer_pos: {:?}", scratch.buffer_pos);
+            // Now the first item in `buffer_coord` has coordinates restricted to 10 squares.
+            //println!("buffer_coord: {:?}", scratch.buffer_coord);
         }
 
-        self.sort_pos_repeated_pieces(scratch);
-        // Now `buffer_pos` has the sorted coordinates for repeated pieces.
-        //println!("buffer_pos: {:?}", scratch.buffer_pos);
+        self.sort_coord_repeated_pieces(scratch);
+        // Now `buffer_coord` has the sorted coordinates for repeated pieces.
+        //println!("buffer_coord: {:?}", scratch.buffer_coord);
 
-        self.pos_to_pidx(scratch);
+        self.coord_to_pidx(scratch);
         // Now `buffer_pidx` has the position indexes, with
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
         //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
@@ -366,7 +365,7 @@ impl Indexer {
         //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
 
         if self.n_pawns > 0 {
-            self.pawn_pos_to_cpidx(scratch);
+            self.pawn_pidx_to_cpidx(scratch);
             // Now the first `n_pawns` elements of `buffer_pidx` have
             // the pawn positions encoded in 0..6 (or 0..3), so the value
             // ranges look like [0..6, 0..6, 0..62, 0..61, ...].
@@ -374,7 +373,7 @@ impl Indexer {
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
 
             for i in 1..self.n_unique_pawns {
-                if scratch.piece_set[i-1].piece == scratch.piece_set[i].piece {
+                if scratch.piece_set[i-1].role == scratch.piece_set[i].role {
                     let span = (scratch.piece_set[i-1].span.0, scratch.piece_set[i].span.1);
                     Self::compact_pidx(&mut scratch.buffer_pidx[span.0..span.1]);
                 }
@@ -394,11 +393,10 @@ impl Indexer {
         index_offset + self.cpidx_to_index(scratch)
     }
 
-    // Decodes an index and recreates a board with the corresponding positions of the
-    // pieces in this endgame (up to symmetries). If the index represents an invalid
-    // position, returns None.
-    pub fn board_from_index(&self, scratch: &mut IndexerScratch, index: usize, side_to_move: Color) -> Option<Setup> {
-        //println!("board_from_index: {}", index);
+    // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
+    // If the index represents an invalid position, returns None.
+    pub fn position_from_index(&self, scratch: &mut IndexerScratch, index: usize, side_to_move: Color) -> Option<Chess> {
+        //println!("position_from_index: {}", index);
         assert!(index < self.index_range);
         let index_offset = self.adjust_ep_from_index(scratch, index);
         // Now `current_ep_option` reflects the en passant status as encoded in the index.
@@ -411,7 +409,7 @@ impl Indexer {
             // `buffer_pidx` has value ranges that look like [0..6, 0..5, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
             for i in 1..self.n_unique_pawns {
-                if scratch.piece_set[i-1].piece == scratch.piece_set[i].piece {
+                if scratch.piece_set[i-1].role == scratch.piece_set[i].role {
                     let span = (scratch.piece_set[i-1].span.0, scratch.piece_set[i].span.1);
                     Self::uncompact_cpidx(&mut scratch.buffer_pidx[span.0..span.1]);
                 }
@@ -420,9 +418,9 @@ impl Indexer {
             // the value ranges look like [0..6, 0..6, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
 
-            self.pawn_cpidx_to_pos(scratch);
+            self.pawn_cpidx_to_pidx(scratch);
             Self::compact_pidx(&mut scratch.buffer_pidx[0..self.n_pawns]);
-            // Now the first `n_pawns` elements of buffer_pos are correct, and `buffer_pidx`
+            // Now the first `n_pawns` elements of buffer_coord are correct, and `buffer_pidx`
             // has values in [0..64, 0..63, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
         } else {
@@ -438,17 +436,17 @@ impl Indexer {
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
         //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
 
-        self.nonpawn_pidx_to_pos(scratch);
-        // Now the non-pawn part of `buffer_pos` is correct.
-        //println!("buffer_pos: {:?}", scratch.buffer_pos);
+        self.nonpawn_pidx_to_coord(scratch);
+        // Now the non-pawn part of `buffer_coord` is correct.
+        //println!("buffer_coord: {:?}", scratch.buffer_coord);
 
-        // All positions are in `buffer_pos`, we can place the pieces on a new board.
-        self.pos_to_board(scratch, side_to_move)
+        // All coordinates are in `buffer_coord`, we can place the pieces to create a new position.
+        self.coord_to_position(scratch, side_to_move)
     }
 
     // Checks whether the position allows en passant and adjusts the internal
     // setup to encode it. Returns the index offset to apply to the encoded value.
-    fn adjust_ep_from_board(&self, scratch: &mut IndexerScratch, ep_square: Option<Square>) -> usize {
+    fn adjust_ep_from_position(&self, scratch: &mut IndexerScratch, ep_square: Option<Square>) -> usize {
         if scratch.current_ep_option.square != ep_square {
             self.unapply_ep_option(scratch);
             scratch.current_ep_option = *self.ep_options.iter().find(|opt| opt.square == ep_square).unwrap();
@@ -502,73 +500,79 @@ impl Indexer {
         }
     }
 
-    // Extracts the coordinates of the pieces from the board and stores them in `buffer_pos`.
-    fn board_to_pos(&self, scratch: &mut IndexerScratch, board: &Setup) {
-        assert_eq!(board.board.occupied().count(), self.n_pieces, "board_to_pos() called with a board that does not match the piece set");
+    // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
+    fn position_to_coord(&self, scratch: &mut IndexerScratch, position: &Chess) {
+        assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
         for p in &scratch.piece_set {
-            let mut bb = match p.piece {
-                EgtPiece::Pawn(f) => board.board.by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
-                EgtPiece::King => board.board.by_role(Role::King),
-                EgtPiece::Queen => board.board.by_role(Role::Queen),
-                EgtPiece::Rook => board.board.by_role(Role::Rook),
-                EgtPiece::Bishop => board.board.by_role(Role::Bishop),
-                EgtPiece::Knight => board.board.by_role(Role::Knight),
+            let mut bb = match p.role {
+                EgtRole::Pawn(f) => position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
+                EgtRole::King => position.board().by_role(Role::King),
+                EgtRole::Queen => position.board().by_role(Role::Queen),
+                EgtRole::Rook => position.board().by_role(Role::Rook),
+                EgtRole::Bishop => position.board().by_role(Role::Bishop),
+                EgtRole::Knight => position.board().by_role(Role::Knight),
             };
             bb &= match p.side {
-                EgtSide::SideToMove => board.board.by_color(board.turn),
-                EgtSide::SideNotToMove => board.board.by_color(!board.turn),
+                EgtSide::SideToMove => position.board().by_color(position.turn()),
+                EgtSide::SideNotToMove => position.board().by_color(!position.turn()),
             };
-            assert_eq!(bb.count(), p.span.1 - p.span.0, "board_to_pos() called with a board that does not match the piece set");
+            assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
             for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
-                scratch.buffer_pos[i] = (square.rank().to_usize(), square.file().to_usize());
+                scratch.buffer_coord[i] = (square.rank().to_usize(), square.file().to_usize());
             }
         }
 
-        if self.n_pawns > 0 && board.turn == Color::Black {
+        if self.n_pawns > 0 && position.turn() == Color::Black {
             // Switch the perspective so that the ranks are encoded from the
             // point of view of the side to move.
             for i in 0..self.n_pieces {
-                scratch.buffer_pos[i].0 = 7 - scratch.buffer_pos[i].0;
+                scratch.buffer_coord[i].0 = 7 - scratch.buffer_coord[i].0;
             }
         }
     }
 
-    // Builds a board using the coordinates stored in `buffer_pos`.
-    fn pos_to_board(&self, scratch: &mut IndexerScratch, side_to_move: Color) -> Option<Setup> {
+    // Builds a position using the coordinates stored in `buffer_coord`.
+    fn coord_to_position(&self, scratch: &mut IndexerScratch, side_to_move: Color) -> Option<Chess> {
         if self.n_pawns > 0 && side_to_move == Color::Black {
             // The ranks are encoded from the point of view of the side to move. Switch them up.
             for i in 0..self.n_pieces {
-                scratch.buffer_pos[i].0 = 7 - scratch.buffer_pos[i].0;
+                scratch.buffer_coord[i].0 = 7 - scratch.buffer_coord[i].0;
             }
         }
 
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
         for p in &scratch.piece_set {
-            let role = p.piece.to_role();
+            let role = p.role.to_role();
             let color = match p.side {
                 EgtSide::SideToMove => side_to_move,
                 EgtSide::SideNotToMove => !side_to_move,
             };
             let piece = Piece { color, role };
             for i in p.span.0..p.span.1 {
-                let (r, f) = scratch.buffer_pos[i];
+                let (r, f) = scratch.buffer_coord[i];
                 let square = Square::from_coords(File::new(f as u32), Rank::new(r as u32));
                 setup.board.set_piece_at(square, piece);
             }
         }
 
-        if let Some(square) = scratch.current_ep_option.square {
+        let ep_square = if let Some(square) = scratch.current_ep_option.square {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
             };
-            let target_square = Square::from_coords(square.file(), target_rank);
-            setup.ep_square = Some(target_square);
-        }
+            Some(Square::from_coords(square.file(), target_rank))
+        } else {
+            None
+        };
+        setup.ep_square = ep_square;
 
-        if Chess::from_setup(setup.clone(), CastlingMode::Standard).is_ok() {
-            Some(setup)
+        if let Ok(position) = setup.position::<Chess>(CastlingMode::Standard) {
+            if position.legal_ep_square() == ep_square {
+                Some(position)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -577,43 +581,43 @@ impl Indexer {
     // For pawnless positions, this function applies symmetrical
     // transformations of the coordinates that keep the position unchanged.
     fn reduce_symmetries(&self, scratch: &mut IndexerScratch) {
-        if scratch.buffer_pos[0].0 > 3 {
+        if scratch.buffer_coord[0].0 > 3 {
             // flip around horizontal axis
-            for (r, _) in scratch.buffer_pos.iter_mut() { *r = 7 - *r; };
+            for (r, _) in scratch.buffer_coord.iter_mut() { *r = 7 - *r; };
         }
-        if scratch.buffer_pos[0].1 > 3 {
+        if scratch.buffer_coord[0].1 > 3 {
             // flip around vertical axis
-            for (_, f) in scratch.buffer_pos.iter_mut() { *f = 7 - *f; };
+            for (_, f) in scratch.buffer_coord.iter_mut() { *f = 7 - *f; };
         }
-        if scratch.buffer_pos[0].0 > scratch.buffer_pos[0].1 ||
-            (scratch.buffer_pos[0].0 == scratch.buffer_pos[0].1 &&
-            scratch.buffer_pos[1].0 > scratch.buffer_pos[1].1) {
+        if scratch.buffer_coord[0].0 > scratch.buffer_coord[0].1 ||
+            (scratch.buffer_coord[0].0 == scratch.buffer_coord[0].1 &&
+            scratch.buffer_coord[1].0 > scratch.buffer_coord[1].1) {
             // flip diagonally. If both kings are on the diagonal, we intentionally do not
             // diagonal-reflect based on the remaining pieces.
-            for p in scratch.buffer_pos.iter_mut() { *p = (p.1, p.0); };
+            for p in scratch.buffer_coord.iter_mut() { *p = (p.1, p.0); };
         }
     }
 
     // Sort coordinates for repeated pieces from highest to lowest.
-    fn sort_pos_repeated_pieces(&self, scratch: &mut IndexerScratch) {
+    fn sort_coord_repeated_pieces(&self, scratch: &mut IndexerScratch) {
         for p in &scratch.piece_set {
             if p.span.1 - p.span.0 > 1 {
-                scratch.buffer_pos[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
+                scratch.buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
             }
         }
     }
 
     // Converts the piece coordinates to indexes in 0..64.
-    fn pos_to_pidx(&self, scratch: &mut IndexerScratch) {
+    fn coord_to_pidx(&self, scratch: &mut IndexerScratch) {
         for i in 0..self.n_pieces {
-            scratch.buffer_pidx[i] = scratch.buffer_pos[i].0 * 8 + scratch.buffer_pos[i].1;
+            scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 * 8 + scratch.buffer_coord[i].1;
         }
     }
 
     // Converts indexes in 0..64 to piece coordinates for non-pawns.
-    fn nonpawn_pidx_to_pos(&self, scratch: &mut IndexerScratch) {
+    fn nonpawn_pidx_to_coord(&self, scratch: &mut IndexerScratch) {
         for i in self.n_pawns..self.n_pieces {
-            scratch.buffer_pos[i] = (scratch.buffer_pidx[i] / 8, scratch.buffer_pidx[i] % 8);
+            scratch.buffer_coord[i] = (scratch.buffer_pidx[i] / 8, scratch.buffer_pidx[i] % 8);
         }
     }
 
@@ -640,24 +644,24 @@ impl Indexer {
         }
     }
 
-    // Converts pawn positions to compact position indexes (cpidx) in 0..6,
+    // Converts pawn indexes (pidx) to compact position indexes (cpidx) in 0..6,
     // where 0 indicates that the pawn is on the 2nd rank, 5 indicates that
     // the pawn is on the 7th rank.
-    fn pawn_pos_to_cpidx(&self, scratch: &mut IndexerScratch) {
+    fn pawn_pidx_to_cpidx(&self, scratch: &mut IndexerScratch) {
         for p in &scratch.piece_set[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
-                scratch.buffer_pidx[i] = scratch.buffer_pos[i].0 - 1;
+                scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 - 1;
             }
         }
     }
 
     // Converts compact position indexes (cpidx) for pawns (in 0..6) to indexes
     // in 0..64, and converts these indexes to piece coordinates.
-    fn pawn_cpidx_to_pos(&self, scratch: &mut IndexerScratch) {
+    fn pawn_cpidx_to_pidx(&self, scratch: &mut IndexerScratch) {
         for p in &scratch.piece_set[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
-                scratch.buffer_pos[i] = (scratch.buffer_pidx[i] + 1, p.piece.to_index());
-                scratch.buffer_pidx[i] = scratch.buffer_pos[i].0 * 8 + scratch.buffer_pos[i].1;
+                scratch.buffer_coord[i] = (scratch.buffer_pidx[i] + 1, p.role.to_index());
+                scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 * 8 + scratch.buffer_coord[i].1;
             }
         }
     }

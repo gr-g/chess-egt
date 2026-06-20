@@ -5,7 +5,6 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Add verifier function for generated tablebases (https://en.wikipedia.org/wiki/Endgame_tablebase#Step_3:_Verification)
 - Add tests with real statistics from other tablebases.
 - Proper memory management and LRU-eviction.
 - Profiling/benchmarking.
@@ -16,6 +15,9 @@ TODO:
 - Visibility and public interface.
 - Marking redundant positions, that are generated but are eventually not saved and excluded from statistics. This would make statistics aligned with Syzygy?
 - Refactor retrograde generation tests using a common function
+- Align ep_square with shakmaty
+- Verify index_ranges table-by-table
+- Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 
 # Design Specifications
 
