@@ -5,8 +5,9 @@ use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canon
 use crate::piece_set::{EgtRole, EgtSide};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EgtHandle {
+    pub name: String,
     pub file_idx: usize,
     pub egt_idx: usize,
 }
@@ -86,13 +87,13 @@ impl RetrogradeSolver {
         }
     }
 
-    pub fn read_outcome(&mut self, handle: EgtHandle, local_index: usize) -> MaybeDtcOutcome {
+    pub fn read_outcome(&mut self, handle: &EgtHandle, local_index: usize) -> MaybeDtcOutcome {
         let file = &mut self.files[handle.file_idx];
         let global_index = file.get_global_index(handle.egt_idx, local_index);
         file.read_from_index(global_index).unwrap()
     }
 
-    pub fn write_outcome(&mut self, handle: EgtHandle, local_index: usize, outcome: MaybeDtcOutcome) {
+    pub fn write_outcome(&mut self, handle: &EgtHandle, local_index: usize, outcome: MaybeDtcOutcome) {
         let file = &mut self.files[handle.file_idx];
         let global_index = file.get_global_index(handle.egt_idx, local_index);
         file.write_to_index(global_index, outcome).unwrap();
@@ -129,8 +130,8 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
 
 pub fn quiet_unmoves<F>(
     solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
+    table: &EgtHandle,
+    twin: &EgtHandle,
     local_index: usize,
     mut f: F,
 ) where
@@ -164,6 +165,14 @@ pub fn quiet_unmoves<F>(
             };
             f(solver, pred_idx);
 
+            // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
+            // positions and `#p=4` if it represents 4 equivalent positions (with our choice
+            // of canonicalization, `#p=4` positions are positions with both kings on the
+            // a1-h8 diagonal). When retrograde propagation from `p'` finds move `p -> p'`
+            // with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the
+            // counter for the reflection of `p` along the diagonal should also be decremented
+            // (since the symmetric move contributed to the counter for the reflection of `p`
+            // but led to a non-canonical position).
             if !current_on_diagonal {
                 let maybe_reflected_idx = {
                     let twin_file = &mut solver.files[twin.file_idx];
@@ -183,9 +192,26 @@ fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
 
     let mut counter = 0;
     for m in position.legal_moves() {
+        if m.is_promotion() || m.is_capture() {
+            // For positions in simpler tables we don't generate unmoves
+            // (we visit them only forward, once during initialization),
+            // so there is no adjustment of the counter.
+            counter += 1;
+            continue;
+        }
         let mut successor_position = position.clone();
         successor_position.play_unchecked(m);
 
+        // Let's say a canonical position `p` has `#p=8` if it represents 8
+        // equivalent positions and `#p=4` if it represents 4 equivalent positions
+        // (with our choice of canonicalization, `#p=4` positions are positions
+        // with both kings on the a1-h8 diagonal). When initializing the counters,
+        // if there is a legal move `p -> p'` with `#p=8` and `#p'=4`, then there
+        // is a move (the symmetric along the diagonal) which goes from a non canonical
+        // position (the reflection of `p` along the diagonal) to a canonical position
+        // (the reflection of `p'` along the diagonal), which will be explored during
+        // backward propagation. To account for this, moves `p -> p'` with `#p=8` and
+        // `#p'=4` should increment the counter by 2 during initialization.
         if !current_on_diagonal && both_kings_on_diagonal(&successor_position) {
             counter += 2;
         } else {
@@ -235,12 +261,12 @@ impl DependencyCache {
 
 fn initialize_table(
     solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
+    table: &EgtHandle,
+    twin: &EgtHandle,
     dep_cache: &mut DependencyCache,
     table_queues: &mut DepthQueues,
     twin_queues: &mut DepthQueues,
-) {
+) -> (usize, usize, usize) {
     let (size, pawnless) = {
         let egt = &solver.files[table.file_idx].egts[table.egt_idx];
         (egt.index_range(), egt.is_pawnless())
@@ -249,7 +275,6 @@ fn initialize_table(
     let mut checkmate_count = 0;
     let mut stalemate_count = 0;
     let mut unknown_count = 0;
-    let mut invalid_count = 0;
 
     for idx in 0..size {
         // Decode position using Color::White as side-to-move
@@ -264,14 +289,6 @@ fn initialize_table(
 
         if position_opt.is_none() {
             solver.write_outcome(table, idx, MaybeDtcOutcome::INVALID);
-            invalid_count += 1;
-            continue;
-        }
-
-        let current_outcome = solver.read_outcome(table, idx);
-        if current_outcome.is_assigned() {
-            // This position was already initialized/marked (e.g., as win-in-1 by checkmate propagation from the twin table)
-            unknown_count += 1;
             continue;
         }
 
@@ -283,17 +300,9 @@ fn initialize_table(
                 // Checkmate!
                 solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0));
                 checkmate_count += 1;
-                // Set twin as win in 1 ply. This is unconditional, in case
-                // this outcome was already set to capture-in-1/promotion-in-1 when
-                // scanning the other table. But if it was already set, we don't propagate it again.
-                quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-                    //if pred_idx == 494 {
-                    //    println!("idx {} loss-in-0, propagating mate-in-1 to {}", idx, pred_idx);
-                    //}
-                    solver.write_outcome(twin, pred_idx, MaybeDtcOutcome::new_win(ConversionType::Checkmate, 1));
+                // Add predecessors to twin's loss-to-win queue (depth 1)
+                quiet_unmoves(solver, table, twin, idx, |_solver, pred_idx| {
                     twin_queues.push_win(pred_idx, ConversionType::Checkmate);
-                    twin_queues.win_capture.retain(|i| *i != pred_idx);
-                    twin_queues.win_promotion.retain(|i| *i != pred_idx);
                 });
             } else {
                 // Stalemate!
@@ -302,19 +311,14 @@ fn initialize_table(
             }
         } else {
             // Unknown position, initialize move counter and probe dependencies
-            let mut counter = if pawnless {
+            let counter = if pawnless {
                 symmetry_adjusted_move_counter(&position)
             } else {
                 legals.len() as u16
             };
-            //if idx == 494 {
-            //    println!("idx {}, counter {}", idx, counter);
-            //}
-            let current_on_diagonal = both_kings_on_diagonal(&position);
 
-            let mut is_win = false;
-            let mut win_ct = None;
-            let mut last_loss_ct = None;
+            solver.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter));
+            unknown_count += 1;
 
             for m in legals {
                 let is_capture = m.is_capture();
@@ -330,108 +334,69 @@ fn initialize_table(
 
                     let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
                     if dep_outcome.is_loss() {
-                        is_win = true;
-                        win_ct = Some(ct);
-                        break;
+                        // Successor is a loss, so this is a win-in-1.
+                        // Add to loss-to-win queue (depth 1)
+                        table_queues.push_win(idx, ct);
                     } else if dep_outcome.is_win() {
-                        let contribution = if pawnless && !current_on_diagonal && both_kings_on_diagonal(&successor_position) {
-                            2
-                        } else {
-                            1
-                        };
-                        if counter >= contribution {
-                            counter -= contribution;
-                        } else {
-                            counter = 0;
-                        }
-                        if last_loss_ct.is_none() || ct == ConversionType::Promotion {
-                            last_loss_ct = Some(ct);
-                        }
+                        // Successor is a win, so we must decrement the counter.
+                        // Add to win-to-loss queue (depth 1)
+                        table_queues.push_loss(idx, ct);
                     }
                 }
             }
-            //if idx == 494 {
-            //    println!("idx {}, counter after captures/promotions {}", idx, counter);
-            //}
-
-            if is_win {
-                let ct = win_ct.unwrap();
-                solver.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, 1));
-                table_queues.push_win(idx, ct);
-            } else if counter == 0 {
-                let ct = last_loss_ct.unwrap_or(ConversionType::Capture);
-                solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, 1));
-                table_queues.push_loss(idx, ct);
-            } else {
-                solver.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter))
-            }
-            unknown_count += 1;
         }
     }
 
-    let tablename = solver.files[table.file_idx].egts[table.egt_idx].tablename();
-    println!(
-        "Initialized table {} with {} indexed positions corresponding to {} unique positions: {} checkmate, {} stalemate, {} unknown.",
-        tablename,
-        size,
-        size - invalid_count,
-        checkmate_count,
-        stalemate_count,
-        unknown_count
-    );
+    (checkmate_count, stalemate_count, unknown_count)
 }
 
-fn propagate_loss_to_wins_queue(
+fn propagate_loss_to_win(
     solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
+    table: &EgtHandle,
+    twin: &EgtHandle,
     idx: usize,
     plies: u16,
+    ct: ConversionType,
     twin_next_queues: &mut DepthQueues,
-) {
+) -> bool {
     let outcome = solver.read_outcome(table, idx);
-    let ct = outcome.conversion_type();
-
-    //if idx == 494 {
-    //    println!("idx {}, plies {}: (bits={}, n={})", idx, plies, outcome.to_u16()&0b111, outcome.to_u16()>>3);
-    //}
-
-    quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-        let pred_outcome = solver.read_outcome(twin, pred_idx);
-        if pred_outcome.is_unknown() {
-            solver.write_outcome(twin, pred_idx, MaybeDtcOutcome::new_win(ct, plies + 1));
-            twin_next_queues.push_win(pred_idx, ct);
-        }
-    });
+    if outcome.is_unknown() {
+        solver.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
+        quiet_unmoves(solver, table, twin, idx, |_solver, pred_idx| {
+            twin_next_queues.push_loss(pred_idx, ct);
+        });
+        true
+    } else {
+        false
+    }
 }
 
-fn propagate_win_to_losses_queue(
+fn propagate_win_to_loss(
     solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
+    table: &EgtHandle,
+    twin: &EgtHandle,
     idx: usize,
     plies: u16,
+    ct: ConversionType,
     twin_next_queues: &mut DepthQueues,
-) {
+) -> bool {
     let outcome = solver.read_outcome(table, idx);
-    let ct = outcome.conversion_type();
-
-    quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
-        let pred_outcome = solver.read_outcome(twin, pred_idx);
-        //if pred_idx == 494 {
-        //    println!("idx {}, plies {} to {} ({:?}): (bits={}, n={})", idx, plies, pred_idx, ct, pred_outcome.to_u16()&0b111, pred_outcome.to_u16()>>3);
-        //}
-        if pred_outcome.is_unknown() {
-            let counter = pred_outcome.get_unknown_counter();
-            assert!(counter > 0);
-            if counter == 1 {
-                solver.write_outcome(twin, pred_idx, MaybeDtcOutcome::new_loss(ct, plies + 1));
-                twin_next_queues.push_loss(pred_idx, ct);
-            } else {
-                solver.write_outcome(twin, pred_idx, MaybeDtcOutcome::new_unknown(counter - 1));
-            }
+    if outcome.is_unknown() {
+        let counter = outcome.get_unknown_counter();
+        assert!(counter > 0);
+        if counter == 1 {
+            solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, plies));
+            quiet_unmoves(solver, table, twin, idx, |_solver, pred_idx| {
+                twin_next_queues.push_win(pred_idx, ct);
+            });
+            true
+        } else {
+            solver.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter - 1));
+            false
         }
-    });
+    } else {
+        false
+    }
 }
 
 pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (EgtFile, Option<EgtFile>) {
@@ -448,12 +413,6 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
         Some(EgtFile::new(&base_path.to_path_buf(), &twin_tablename).unwrap())
     };
 
-    if is_symmetric {
-        println!("Initializing retrograde analysis for {}...", tablename);
-    } else {
-        println!("Initializing retrograde analysis for {} and {}...", tablename, twin_tablename);
-    }
-
     let mut solver = RetrogradeSolver::new(file_a, file_b);
 
     // Match Egt sub-tables into pairs
@@ -468,10 +427,12 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
         };
         let twin_key = PawnKey::new(&twin_stm, &twin_sntm);
 
-        let egt_idx_b = if solver.is_symmetric {
-            *solver.files[0].egt_map.get(&twin_key).unwrap()
+        let (file_idx_b, egt_idx_b, name_b) = if solver.is_symmetric {
+            let egt_idx_b = *solver.files[0].egt_map.get(&twin_key).unwrap();
+            (0, egt_idx_b, solver.files[0].egts[egt_idx_b].tablename().to_string())
         } else {
-            *solver.files[1].egt_map.get(&twin_key).unwrap()
+            let egt_idx_b = *solver.files[1].egt_map.get(&twin_key).unwrap();
+            (1, egt_idx_b, solver.files[1].egts[egt_idx_b].tablename().to_string())
         };
 
         if solver.is_symmetric && egt_idx_a > egt_idx_b {
@@ -479,12 +440,14 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
         }
 
         let table_a = EgtHandle {
+            name: egt_a.tablename().to_string(),
             file_idx: 0,
             egt_idx: egt_idx_a,
         };
 
         let table_b = EgtHandle {
-            file_idx: if solver.is_symmetric { 0 } else { 1 },
+            name: name_b,
+            file_idx: file_idx_b,
             egt_idx: egt_idx_b,
         };
 
@@ -493,13 +456,18 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
 
     // Initialization & Propagation Phase for each independent pair
     let mut dep_cache = DependencyCache::new(base_path);
-    for &(table_a, table_b) in &table_pairs {
+    for (table_a, table_b) in &table_pairs {
         let mut queues_a = DepthQueues::new();
         let mut queues_b = DepthQueues::new();
 
-        initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b);
+        let (checkmates, stalemates, _) =
+            initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b);
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_a.name, checkmates, stalemates);
+
         if table_a != table_b {
-            initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a);
+            let (checkmates, stalemates, _) =
+                initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a);
+                println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
         } else {
             queues_a.merge(&mut queues_b);
         }
@@ -509,97 +477,128 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
             let mut next_queues_a = DepthQueues::new();
             let mut next_queues_b = DepthQueues::new();
 
-            // 1. Propagate Losses to Wins (Forward Priority: Checkmate -> Capture -> Promotion)
-            if table_a == table_b {
-                for &idx in &queues_a.loss_checkmate {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
-                }
-                for &idx in &queues_a.loss_capture {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
-                }
-                for &idx in &queues_a.loss_promotion {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
-                }
-            } else {
-                // Table A losses propagate to Table B wins
-                for &idx in &queues_a.loss_checkmate {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
-                }
-                for &idx in &queues_a.loss_capture {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
-                }
-                for &idx in &queues_a.loss_promotion {
-                    propagate_loss_to_wins_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
-                }
+            let mut wins_found_a = 0;
+            let mut losses_found_a = 0;
+            let mut wins_found_b = 0;
+            let mut losses_found_b = 0;
 
-                // Table B losses propagate to Table A wins
-                for &idx in &queues_b.loss_checkmate {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
-                }
-                for &idx in &queues_b.loss_capture {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
-                }
-                for &idx in &queues_b.loss_promotion {
-                    propagate_loss_to_wins_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
-                }
-            }
-
-            // 2. Propagate Wins to Losses (Reverse Priority: Promotion -> Capture -> Checkmate),
-            //    but the trigger for propagation is the conversion type of the _last_ successor,
-            //    so again we put checkmate first.
+            // 1. Process loss-to-win queues (marking wins at depth `plies`)
             if table_a == table_b {
                 for &idx in &queues_a.win_checkmate {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_a, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
+                        wins_found_a += 1;
+                    }
                 }
                 for &idx in &queues_a.win_capture {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_a, table_a, idx, plies, ConversionType::Capture, &mut next_queues_a) {
+                        wins_found_a += 1;
+                    }
                 }
                 for &idx in &queues_a.win_promotion {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_a, table_a, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
+                        wins_found_a += 1;
+                    }
                 }
             } else {
                 // Table A wins propagate to Table B losses
                 for &idx in &queues_a.win_checkmate {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                    if propagate_loss_to_win(&mut solver, table_a, table_b, idx, plies, ConversionType::Checkmate, &mut next_queues_b) {
+                        wins_found_a += 1;
+                    }
                 }
                 for &idx in &queues_a.win_capture {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                    if propagate_loss_to_win(&mut solver, table_a, table_b, idx, plies, ConversionType::Capture, &mut next_queues_b) {
+                        wins_found_a += 1;
+                    }
                 }
                 for &idx in &queues_a.win_promotion {
-                    propagate_win_to_losses_queue(&mut solver, table_a, table_b, idx, plies, &mut next_queues_b);
+                    if propagate_loss_to_win(&mut solver, table_a, table_b, idx, plies, ConversionType::Promotion, &mut next_queues_b) {
+                        wins_found_a += 1;
+                    }
                 }
 
                 // Table B wins propagate to Table A losses
                 for &idx in &queues_b.win_checkmate {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_b, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
+                        wins_found_b += 1;
+                    }
                 }
                 for &idx in &queues_b.win_capture {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_b, table_a, idx, plies, ConversionType::Capture, &mut next_queues_a) {
+                        wins_found_b += 1;
+                    }
                 }
                 for &idx in &queues_b.win_promotion {
-                    propagate_win_to_losses_queue(&mut solver, table_b, table_a, idx, plies, &mut next_queues_a);
+                    if propagate_loss_to_win(&mut solver, table_b, table_a, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
+                        wins_found_b += 1;
+                    }
                 }
             }
 
-            let name_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].tablename();
-            let name_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].tablename();
+            // 2. Process win-to-loss queues (decrementing counters and marking losses at depth `plies`)
+            if table_a == table_b {
+                for &idx in &queues_a.loss_checkmate {
+                    if propagate_win_to_loss(&mut solver, table_a, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
+                        losses_found_a += 1;
+                    }
+                }
+                for &idx in &queues_a.loss_capture {
+                    if propagate_win_to_loss(&mut solver, table_a, table_a, idx, plies, ConversionType::Capture, &mut next_queues_a) {
+                        losses_found_a += 1;
+                    }
+                }
+                for &idx in &queues_a.loss_promotion {
+                    if propagate_win_to_loss(&mut solver, table_a, table_a, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
+                        losses_found_a += 1;
+                    }
+                }
+            } else {
+                // Table A losses propagate to Table B wins
+                for &idx in &queues_a.loss_checkmate {
+                    if propagate_win_to_loss(&mut solver, table_a, table_b, idx, plies, ConversionType::Checkmate, &mut next_queues_b) {
+                        losses_found_a += 1;
+                    }
+                }
+                for &idx in &queues_a.loss_capture {
+                    if propagate_win_to_loss(&mut solver, table_a, table_b, idx, plies, ConversionType::Capture, &mut next_queues_b) {
+                        losses_found_a += 1;
+                    }
+                }
+                for &idx in &queues_a.loss_promotion {
+                    if propagate_win_to_loss(&mut solver, table_a, table_b, idx, plies, ConversionType::Promotion, &mut next_queues_b) {
+                        losses_found_a += 1;
+                    }
+                }
 
-            let wins_a = next_queues_a.win_checkmate.len() + next_queues_a.win_capture.len() + next_queues_a.win_promotion.len();
-            let losses_a = next_queues_a.loss_checkmate.len() + next_queues_a.loss_capture.len() + next_queues_a.loss_promotion.len();
-            let wins_b = next_queues_b.win_checkmate.len() + next_queues_b.win_capture.len() + next_queues_b.win_promotion.len();
-            let losses_b = next_queues_b.loss_checkmate.len() + next_queues_b.loss_capture.len() + next_queues_b.loss_promotion.len();
+                // Table B losses propagate to Table A wins
+                for &idx in &queues_b.loss_checkmate {
+                    if propagate_win_to_loss(&mut solver, table_b, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
+                        losses_found_b += 1;
+                    }
+                }
+                for &idx in &queues_b.loss_capture {
+                    if propagate_win_to_loss(&mut solver, table_b, table_a, idx, plies, ConversionType::Capture, &mut next_queues_a) {
+                        losses_found_b += 1;
+                    }
+                }
+                for &idx in &queues_b.loss_promotion {
+                    if propagate_win_to_loss(&mut solver, table_b, table_a, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
+                        losses_found_b += 1;
+                    }
+                }
+            }
 
-            if wins_a > 0 {
-                println!("{}: Found {} winning positions at depth {}", name_a, wins_a, plies);
+            if wins_found_a > 0 {
+                println!("{}: Found {} winning positions at depth {}", table_a.name, wins_found_a, plies);
             }
-            if losses_a > 0 {
-                println!("{}: Found {} losing positions at depth {}", name_a, losses_a, plies);
+            if losses_found_a > 0 {
+                println!("{}: Found {} losing positions at depth {}", table_a.name, losses_found_a, plies);
             }
-            if wins_b > 0 {
-                println!("{}: Found {} winning positions at depth {}", name_b, wins_b, plies);
+            if wins_found_b > 0 {
+                println!("{}: Found {} winning positions at depth {}", table_b.name, wins_found_b, plies);
             }
-            if losses_b > 0 {
-                println!("{}: Found {} losing positions at depth {}", name_b, losses_b, plies);
+            if losses_found_b > 0 {
+                println!("{}: Found {} losing positions at depth {}", table_b.name, losses_found_b, plies);
             }
 
             queues_a = next_queues_a;
@@ -608,8 +607,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
         }
 
         // Mark all remaining 'unknown' positions as draws
-        let name_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].tablename();
-        println!("{}: marking remaining positions as draws...", name_a);
+        println!("{}: marking remaining positions as draws...", table_a.name);
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
             let outcome = solver.read_outcome(table_a, idx);
@@ -619,8 +617,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (Egt
         }
 
         if table_a != table_b {
-            let name_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].tablename();
-            println!("{}: marking remaining positions as draws...", name_b);
+            println!("{}: marking remaining positions as draws...", table_b.name);
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
                 let outcome = solver.read_outcome(table_b, idx);

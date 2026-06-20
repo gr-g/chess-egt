@@ -52,7 +52,7 @@ fn main() {
                 if n / 2 == 1 {
                     format!("Win - {} can be played on this move", conversion_str)
                 } else {
-                    format!("Win - {} can be forced in {} moves", conversion_str, n / 2)
+                    format!("Win - {} can be forced in {} moves ({} plies)", conversion_str, (n+1) / 2, n)
                 }
             },
             DtcOutcome::Draw => {
@@ -66,10 +66,10 @@ fn main() {
                     (ConversionType::Capture, _) => "A forced capture of an opponent's piece converting to a losing position cannot be avoided",
                     (ConversionType::Promotion, _) => "A forced promotion of your pawn converting to a winning position cannot be avoided",
                 };
-                if n / 2 == 1 {
+                if n / 2 == 0 {
                     format!("Loss - {} on this move", conversion_str)
                 } else {
-                    format!("Loss - {} in {} moves", conversion_str, n / 2)
+                    format!("Loss - {} in {} moves ({} plies)", conversion_str, n / 2, n)
                 }
             }
         };
