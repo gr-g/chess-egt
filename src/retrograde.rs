@@ -1,4 +1,4 @@
-use shakmaty::{Color, CastlingMode, Chess, Position, EnPassantMode, Role};
+use shakmaty::{Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_horizontally};
@@ -127,12 +127,6 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
         kings2.into_iter().all(|sq| sq.rank().to_usize() == sq.file().to_usize())
 }
 
-fn reflect_diagonally(position: &Chess) -> Chess {
-    let mut reflected = position.to_setup(EnPassantMode::Legal);
-    reflected.board.flip_diagonal();
-    reflected.position(CastlingMode::Standard).unwrap()
-}
-
 pub fn quiet_unmoves<F>(
     solver: &mut RetrogradeSolver,
     table: EgtHandle,
@@ -149,11 +143,6 @@ pub fn quiet_unmoves<F>(
     let position = match position {
         Some(s) => s,
         _ => return,
-    };
-
-    let pawnless = {
-        let twin_file = &solver.files[twin.file_idx];
-        twin_file.egts[twin.egt_idx].is_pawnless()
     };
 
     let (stm_files_a, sntm_files_a) = get_pawn_files(solver.files[table.file_idx].egts[table.egt_idx].pieces());
@@ -175,14 +164,16 @@ pub fn quiet_unmoves<F>(
             };
             f(solver, pred_idx);
 
-            if pawnless && !current_on_diagonal && both_kings_on_diagonal(&pred_position) {
-                // #p=4 and #p'=8: push the diagonal reflection of the predecessor
-                let reflected_position = reflect_diagonally(&pred_position);
-                let reflected_idx = {
+            if !current_on_diagonal {
+                let maybe_reflected_idx = {
                     let twin_file = &mut solver.files[twin.file_idx];
-                    twin_file.egts[twin.egt_idx].position_to_index(&reflected_position)
+                    twin_file.egts[twin.egt_idx].diagonal_symmetric(pred_idx)
                 };
-                f(solver, reflected_idx);
+                if let Some(reflected_idx) = maybe_reflected_idx {
+                    // The current index represents 8 positions, while the predecessor index
+                    // represents 4 positions. Push the diagonal reflection of the predecessor.
+                    f(solver, reflected_idx);
+                }
             }
         });
 }
@@ -427,9 +418,9 @@ fn propagate_win_to_losses_queue(
 
     quiet_unmoves(solver, table, twin, idx, |solver, pred_idx| {
         let pred_outcome = solver.read_outcome(twin, pred_idx);
-        if pred_idx == 494 {
-            println!("idx {}, plies {} to {} ({:?}): (bits={}, n={})", idx, plies, pred_idx, ct, pred_outcome.to_u16()&0b111, pred_outcome.to_u16()>>3);
-        }
+        //if pred_idx == 494 {
+        //    println!("idx {}, plies {} to {} ({:?}): (bits={}, n={})", idx, plies, pred_idx, ct, pred_outcome.to_u16()&0b111, pred_outcome.to_u16()>>3);
+        //}
         if pred_outcome.is_unknown() {
             let counter = pred_outcome.get_unknown_counter();
             assert!(counter > 0);

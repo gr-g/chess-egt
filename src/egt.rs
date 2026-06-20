@@ -61,13 +61,33 @@ impl Egt {
         })
     }
 
+    // Encodes the position into an index, which represents the position up to symmetries.
     pub fn position_to_index(&mut self, position: &Chess) -> usize {
         self.indexer.position_to_index(&mut self.scratch, position)
     }
 
+    // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
+    // If the index represents an invalid position, returns None.
     pub fn position_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Chess> {
-        self.indexer
-            .position_from_index(&mut self.scratch, index, side_to_move)
+        self.indexer.position_from_index(&mut self.scratch, index, side_to_move)
+    }
+
+    // Pawnless positions are reduced to a canonical form through rotations and reflections
+    // to take advantage of symmetries, so normally each index corresponds to 8 equivalent
+    // position. However, if both kings are on a long diagonal, the diagonal symmetry is not
+    // used and the correspoding index represents only 4 equivalent positions.
+    // In particular, positions with the kings on the diagonal and some other piece outside
+    // the diagonal have a symmetric that is in principle equivalent, but is assigned a
+    // separate index.
+    // `diagonal_symmetric(idx)` returns:
+    //  - `None` if the corresponding position does not have both kings on a long diagonal
+    //    (i.e. `idx` represents 8 equivalent positions)
+    //  - `Some(other_idx)` if the corresponding position has both kings on a long diagonal
+    //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
+    //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
+    //    for positions with all pieces on the diagonal.
+    pub fn diagonal_symmetric(&mut self, index: usize) -> Option<usize> {
+        self.indexer.diagonal_symmetric(&mut self.scratch, index)
     }
 }
 
@@ -222,6 +242,28 @@ mod tests {
         if let Some(position) = egt.indexer.position_from_index(&mut scratch, i, side_to_move) {
             assert_eq!(i, egt.indexer.position_to_index(&mut scratch, &position));
         }
+    }
+
+    #[test]
+    fn test_diagonal_symmetric() {
+        let mut egt = from_tablename("KR_K").unwrap();
+
+        for i in [10, 100, 2100] {
+            println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, i, Color::White));
+            assert_eq!(egt.diagonal_symmetric(i), None);
+        }
+
+        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 773, Color::White));
+        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 801, Color::White));
+        assert_eq!(egt.diagonal_symmetric(773), Some(801));
+        assert_eq!(egt.diagonal_symmetric(801), Some(773));
+
+        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 805, Color::White));
+        assert_eq!(egt.diagonal_symmetric(805), Some(805));
+
+        let mut egt_p = from_tablename("KPd_K").unwrap();
+        println!("{:?}", egt_p.indexer.position_from_index(&mut egt_p.scratch, 0, Color::White));
+        assert_eq!(egt_p.diagonal_symmetric(0), None);
     }
 
     #[test]

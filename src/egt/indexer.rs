@@ -467,6 +467,46 @@ impl Indexer {
         scratch.current_ep_option.range_start
     }
 
+    // Pawnless positions are reduced to a canonical form through rotations and reflections
+    // to take advantage of symmetries, so normally each index corresponds to 8 equivalent
+    // position. However, if both kings are on a long diagonal, the diagonal symmetry is not
+    // used and the correspoding index represents only 4 equivalent positions.
+    // In particular, positions with the kings on the diagonal and some other piece outside
+    // the diagonal have a symmetric that is in principle equivalent, but is assigned a
+    // separate index.
+    // `diagonal_symmetric(idx)` returns:
+    //  - `None` if the corresponding position does not have both kings on a long diagonal
+    //    (i.e. `idx` represents 8 equivalent positions)
+    //  - `Some(other_idx)` if the corresponding position has both kings on a long diagonal
+    //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
+    //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
+    //    for positions with all pieces on the diagonal.
+    pub fn diagonal_symmetric(&self, scratch: &mut IndexerScratch, index: usize) -> Option<usize> {
+        if self.n_pawns != 0 {
+            return None;
+        }
+
+        self.index_to_cpidx(scratch, index);
+        self.unmap_kings(scratch);
+        Self::uncompact_cpidx(&mut scratch.buffer_pidx);
+        self.nonpawn_pidx_to_coord(scratch);
+
+        let kings_on_diagonal = scratch.buffer_coord[0..2].iter().all(|(r, f)| *r == *f);
+        if kings_on_diagonal {
+            // Swap coordinates and recode
+            for p in scratch.buffer_coord.iter_mut() { *p = (p.1, p.0); };
+            self.sort_coord_repeated_pieces(scratch);
+            self.coord_to_pidx(scratch);
+            Self::compact_pidx(&mut scratch.buffer_pidx);
+            self.map_kings(scratch);
+            Some(self.cpidx_to_index(scratch))
+        } else {
+            None
+        }
+
+
+    }
+
     fn apply_ep_option(&self, scratch: &mut IndexerScratch) {
         if let Some(i) = scratch.current_ep_option.pawn_idx_sntm {
             // For pawns (side-not-to-move) on the file
