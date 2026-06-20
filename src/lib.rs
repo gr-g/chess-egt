@@ -240,7 +240,7 @@ impl EgtProber {
             }
         }
 
-        println!("Successfully verified internal consistency of table {} ({} indexes).", tablename, index_range);
+        println!("Successfully verified internal consistency of table {}.", tablename);
         Ok(())
     }
 }

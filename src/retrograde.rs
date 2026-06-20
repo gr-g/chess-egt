@@ -1,6 +1,6 @@
 use shakmaty::{Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
-use crate::ConversionType;
+use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_horizontally};
 use crate::piece_set::{EgtRole, EgtSide};
 use std::collections::HashMap;
@@ -241,17 +241,9 @@ impl DependencyCache {
                 file_from_disk.unwrap()
             } else {
                 println!("Dependency table {} not found. Generating on the fly...", tablename);
-                let (mut file_a, mut file_b) = retrograde_analysis(&self.base_path, tablename);
-                file_a.save_to_file().unwrap();
-                if let Some(ref mut fb) = file_b {
-                    fb.save_to_file().unwrap();
-                }
-
-                if let Some(fb) = file_b {
-                    let twin_name = fb.tablename.clone();
-                    self.cache.insert(twin_name, fb);
-                }
-                file_a
+                let g = EgtGenerator::new(&self.base_path);
+                g.generate(tablename);
+                EgtFile::new_from_file(&self.base_path, tablename).unwrap()
             };
             self.cache.insert(tablename.to_string(), file);
         }

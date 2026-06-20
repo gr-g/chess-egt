@@ -1,10 +1,11 @@
 # AGENTS.md
 
 - The goal of the project is to produce chess endgame tablebases (EGTs).
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is only a stub of memory management (LRU-eviction of frames from memory), not implemented yet. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`), it still needs to be properly tested. The exact library interface to expose and the command line interface are still to be defined.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is only a stub of memory management (LRU-eviction of frames from memory), not implemented yet. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
+- Cli argument to generate all 3-4-5.
 - Add tests with real statistics from other tablebases.
 - Proper memory management and LRU-eviction.
 - Profiling/benchmarking.
