@@ -601,10 +601,10 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_a.name, checkmates, stalemates);
 
-        if !solver.is_symmetric {
+        if table_a != table_b {
             let (checkmates, stalemates, _) =
                 initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a)?;
-                println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
+            println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
         } else {
             queues_a.merge(&mut queues_b);
         }
@@ -625,7 +625,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             let mut losses_found_b = 0;
 
             // 1. Process loss-to-win queues (marking wins at depth `plies`)
-            if solver.is_symmetric {
+            if table_a == table_b {
                 for &idx in &queues_a.win_checkmate {
                     if propagate_loss_to_win(&mut solver, table_a, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
                         wins_found_a += 1;
@@ -760,6 +760,9 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
         if let Some(ref mut builder_b) = stats_builder_b {
             builder_b.max_win_dtc = builder_b.max_win_dtc.max(current_max_win_dtc_b);
             builder_b.max_loss_dtc = builder_b.max_loss_dtc.max(current_max_loss_dtc_b);
+        } else {
+            stats_builder_a.max_win_dtc = stats_builder_a.max_win_dtc.max(current_max_win_dtc_b);
+            stats_builder_a.max_loss_dtc = stats_builder_a.max_loss_dtc.max(current_max_loss_dtc_b);
         }
 
         // Mark all remaining 'unknown' positions as draws
@@ -792,6 +795,15 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
                 }
                 if let Some(ref mut builder_b) = stats_builder_b {
                     builder_b.record_outcome(
+                        outcome,
+                        idx,
+                        table_b.egt_idx,
+                        &mut solver.files[table_b.file_idx],
+                        current_max_win_dtc_b,
+                        current_max_loss_dtc_b,
+                    );
+                } else {
+                    stats_builder_a.record_outcome(
                         outcome,
                         idx,
                         table_b.egt_idx,

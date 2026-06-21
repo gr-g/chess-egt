@@ -6,8 +6,7 @@
 
 TODO:
 - Error management.
-- Proper memory management and LRU-eviction.
-- Keep track of number of uncompressed frames in EgtFile.
+- Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungraun/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
@@ -18,8 +17,9 @@ TODO:
 - Verify index_ranges table-by-table. Print counter during verification.
 - Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder).
-- Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames. One single queue instead of 6?
+- Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames (somewhat linear instead of random). One single queue instead of 6?
 - Make solver read-only, remove name from EgtHandle.
+- Experiment with approach using capture/promotion unmoves for initialization.
 
 # Design Specifications
 
