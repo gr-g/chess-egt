@@ -822,359 +822,100 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
 mod tests {
     use super::*;
 
+    fn verify_table_generation(
+        endgame: &str,
+        expected_range_a: usize,
+        expected_wins_a: usize,
+        expected_draws_a: usize,
+        expected_losses_a: usize,
+        expected_invalid_a: usize,
+        expected_range_b: Option<usize>,
+        expected_wins_b: Option<usize>,
+        expected_draws_b: Option<usize>,
+        expected_losses_b: Option<usize>,
+        expected_invalid_b: Option<usize>,
+    ) {
+        let (file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), endgame).unwrap();
+
+        let stats_a = file_a.stats.as_ref().expect("file_a should have stats");
+        println!("{} stats:", file_a.endgame);
+        println!("  Draws: {}", stats_a.draw);
+        println!("  Wins: {}", stats_a.win);
+        println!("  Losses: {}", stats_a.loss);
+        println!("  Invalids: {}", stats_a.invalid_or_redundant);
+
+        assert_eq!(file_a.index_range, expected_range_a);
+        assert_eq!(stats_a.win, expected_wins_a);
+        assert_eq!(stats_a.draw, expected_draws_a);
+        assert_eq!(stats_a.loss, expected_losses_a);
+        assert_eq!(stats_a.invalid_or_redundant, expected_invalid_a);
+
+        if let Some(expected_range_b) = expected_range_b {
+            let file_b = file_b.expect("file_b should be present");
+            let stats_b = file_b.stats.as_ref().expect("file_b should have stats");
+            println!("{} stats:", file_b.endgame);
+            println!("  Draws: {}", stats_b.draw);
+            println!("  Wins: {}", stats_b.win);
+            println!("  Losses: {}", stats_b.loss);
+            println!("  Invalids: {}", stats_b.invalid_or_redundant);
+
+            assert_eq!(file_b.index_range, expected_range_b);
+            assert_eq!(stats_b.win, expected_wins_b.unwrap());
+            assert_eq!(stats_b.draw, expected_draws_b.unwrap());
+            assert_eq!(stats_b.loss, expected_losses_b.unwrap());
+            assert_eq!(stats_b.invalid_or_redundant, expected_invalid_b.unwrap());
+        } else {
+            assert!(file_b.is_none());
+        }
+    }
+
     #[test]
     fn test_k_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "K_K").unwrap();
-
-        assert!(file_b.is_none());
-        assert_eq!(file_a.index_range, 462);
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("K_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert_eq!(draw_count, 462);
-        assert_eq!(win_count, 0);
-        assert_eq!(loss_count, 0);
-        assert_eq!(invalid_count, 0);
+        verify_table_generation("K_K", 462, 0, 462, 0, 0, None, None, None, None, None);
     }
 
     #[test]
     fn test_kq_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KQ_K").unwrap();
-
-        assert!(file_b.is_some());
-        let mut file_b = file_b.unwrap();
-
-        println!("KQ_K indexed locations: {}", file_a.index_range);
-        println!("K_KQ indexed locations: {}", file_b.index_range);
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("KQ_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert_eq!(draw_count, 0);
-        assert_eq!(loss_count, 0);
-        assert!(win_count > 0);
-
-        let mut draw_count_b = 0;
-        let mut win_count_b = 0;
-        let mut loss_count_b = 0;
-        let mut invalid_count_b = 0;
-
-        for idx in 0..file_b.index_range {
-            let outcome = file_b.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count_b += 1;
-            } else if outcome.is_win() {
-                win_count_b += 1;
-            } else if outcome.is_loss() {
-                loss_count_b += 1;
-            } else if outcome.is_invalid() {
-                invalid_count_b += 1;
-            }
-        }
-
-        println!("K_KQ stats:");
-        println!("  Draws: {}", draw_count_b);
-        println!("  Wins: {}", win_count_b);
-        println!("  Losses: {}", loss_count_b);
-        println!("  Invalids: {}", invalid_count_b);
-
-        assert!(draw_count_b > 0);
-        assert_eq!(win_count_b, 0);
-        assert!(loss_count_b > 0);
+        verify_table_generation(
+            "KQ_K",
+            28644, 18081, 0, 0, 10563,
+            Some(28644), Some(0), Some(2896), Some(25160), Some(588)
+        );
     }
 
     #[test]
     fn test_kr_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KR_K").unwrap();
-
-        assert!(file_b.is_some());
-        let mut file_b = file_b.unwrap();
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("KR_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert_eq!(draw_count, 0);
-        assert_eq!(loss_count, 0);
-        assert!(win_count > 0);
-
-        let mut draw_count_b = 0;
-        let mut win_count_b = 0;
-        let mut loss_count_b = 0;
-        let mut invalid_count_b = 0;
-
-        for idx in 0..file_b.index_range {
-            let outcome = file_b.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count_b += 1;
-            } else if outcome.is_win() {
-                win_count_b += 1;
-            } else if outcome.is_loss() {
-                loss_count_b += 1;
-            } else if outcome.is_invalid() {
-                invalid_count_b += 1;
-            }
-        }
-
-        println!("K_KR stats:");
-        println!("  Draws: {}", draw_count_b);
-        println!("  Wins: {}", win_count_b);
-        println!("  Losses: {}", loss_count_b);
-        println!("  Invalids: {}", invalid_count_b);
-
-        assert!(draw_count_b > 0);
-        assert_eq!(win_count_b, 0);
-        assert!(loss_count_b > 0);
+        verify_table_generation(
+            "KR_K",
+            28644, 21959, 0, 0, 6685,
+            Some(28644), Some(0), Some(2796), Some(25260), Some(588)
+        );
     }
 
     #[test]
     fn test_kb_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KB_K").unwrap();
-
-        assert!(file_b.is_some());
-        let mut file_b = file_b.unwrap();
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("KB_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert_eq!(win_count, 0);
-        assert_eq!(loss_count, 0);
-        assert!(draw_count > 0);
-
-        let mut draw_count_b = 0;
-        let mut win_count_b = 0;
-        let mut loss_count_b = 0;
-        let mut invalid_count_b = 0;
-
-        for idx in 0..file_b.index_range {
-            let outcome = file_b.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count_b += 1;
-            } else if outcome.is_win() {
-                win_count_b += 1;
-            } else if outcome.is_loss() {
-                loss_count_b += 1;
-            } else if outcome.is_invalid() {
-                invalid_count_b += 1;
-            }
-        }
-
-        println!("K_KB stats:");
-        println!("  Draws: {}", draw_count_b);
-        println!("  Wins: {}", win_count_b);
-        println!("  Losses: {}", loss_count_b);
-        println!("  Invalids: {}", invalid_count_b);
-
-        assert_eq!(win_count_b, 0);
-        assert_eq!(loss_count_b, 0);
-        assert!(draw_count_b > 0);
+        verify_table_generation(
+            "KB_K",
+            28644, 0, 24178, 0, 4466,
+            Some(28644), Some(0), Some(28056), Some(0), Some(588)
+        );
     }
 
     #[test]
     fn test_kn_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KN_K").unwrap();
-
-        assert!(file_b.is_some());
-        let mut file_b = file_b.unwrap();
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("KN_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert_eq!(win_count, 0);
-        assert_eq!(loss_count, 0);
-        assert!(draw_count > 0);
-
-        let mut draw_count_b = 0;
-        let mut win_count_b = 0;
-        let mut loss_count_b = 0;
-        let mut invalid_count_b = 0;
-
-        for idx in 0..file_b.index_range {
-            let outcome = file_b.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count_b += 1;
-            } else if outcome.is_win() {
-                win_count_b += 1;
-            } else if outcome.is_loss() {
-                loss_count_b += 1;
-            } else if outcome.is_invalid() {
-                invalid_count_b += 1;
-            }
-        }
-
-        println!("K_KN stats:");
-        println!("  Draws: {}", draw_count_b);
-        println!("  Wins: {}", win_count_b);
-        println!("  Losses: {}", loss_count_b);
-        println!("  Invalids: {}", invalid_count_b);
-
-        assert_eq!(win_count_b, 0);
-        assert_eq!(loss_count_b, 0);
-        assert!(draw_count_b > 0);
+        verify_table_generation(
+            "KN_K",
+            28644, 0, 25750, 0, 2894,
+            Some(28644), Some(0), Some(28056), Some(0), Some(588)
+        );
     }
 
     #[test]
     fn test_kp_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KP_K").unwrap();
-
-        assert!(file_b.is_some());
-        let mut file_b = file_b.unwrap();
-
-        let mut draw_count = 0;
-        let mut win_count = 0;
-        let mut loss_count = 0;
-        let mut invalid_count = 0;
-
-        for idx in 0..file_a.index_range {
-            let outcome = file_a.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count += 1;
-            } else if outcome.is_win() {
-                win_count += 1;
-            } else if outcome.is_loss() {
-                loss_count += 1;
-            } else if outcome.is_invalid() {
-                invalid_count += 1;
-            }
-        }
-
-        println!("KP_K stats:");
-        println!("  Draws: {}", draw_count);
-        println!("  Wins: {}", win_count);
-        println!("  Losses: {}", loss_count);
-        println!("  Invalids: {}", invalid_count);
-
-        assert!(draw_count > 0);
-
-        let mut draw_count_b = 0;
-        let mut win_count_b = 0;
-        let mut loss_count_b = 0;
-        let mut invalid_count_b = 0;
-
-        for idx in 0..file_b.index_range {
-            let outcome = file_b.read_from_index(idx).unwrap();
-            if outcome.is_draw() {
-                draw_count_b += 1;
-            } else if outcome.is_win() {
-                win_count_b += 1;
-            } else if outcome.is_loss() {
-                loss_count_b += 1;
-            } else if outcome.is_invalid() {
-                invalid_count_b += 1;
-            }
-        }
-
-        println!("K_KP stats:");
-        println!("  Draws: {}", draw_count_b);
-        println!("  Wins: {}", win_count_b);
-        println!("  Losses: {}", loss_count_b);
-        println!("  Invalids: {}", invalid_count_b);
-
-        assert!(draw_count_b > 0);
+        verify_table_generation(
+            "KP_K",
+            93744, 62480, 19184, 0, 12080,
+            Some(93744), Some(0), Some(35210), Some(48802), Some(9732)
+        );
     }
 }
