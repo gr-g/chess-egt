@@ -1,9 +1,101 @@
 use shakmaty::{Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
-use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_horizontally};
+use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
 use crate::piece_set::{EgtRole, EgtSide};
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
+
+struct EgtFileStatsBuilder {
+    endgame: String,
+    frame_size: usize,
+    num_frames: usize,
+    unique_positions: usize,
+    win: usize,
+    draw: usize,
+    loss: usize,
+    invalid_or_redundant: usize,
+    histogram_win: BTreeMap<u16, usize>,
+    histogram_loss: BTreeMap<u16, usize>,
+    longest_dtc_candidates: Vec<LongestDtcPosition>,
+    max_win_dtc: u16,
+}
+
+impl EgtFileStatsBuilder {
+    fn new(endgame: String, frame_size: usize, num_frames: usize) -> Self {
+        Self {
+            endgame,
+            frame_size,
+            num_frames,
+            unique_positions: 0,
+            win: 0,
+            draw: 0,
+            loss: 0,
+            invalid_or_redundant: 0,
+            histogram_win: BTreeMap::new(),
+            histogram_loss: BTreeMap::new(),
+            longest_dtc_candidates: Vec::new(),
+            max_win_dtc: 0,
+        }
+    }
+
+    fn record_outcome(&mut self, outcome: MaybeDtcOutcome, local_idx: usize, egt_idx: usize, file: &mut EgtFile, current_max_win_dtc: u16) {
+        let sym = file.egts[egt_idx].diagonal_symmetric(local_idx);
+        if let Some(other_idx) = sym {
+            if local_idx > other_idx {
+                self.invalid_or_redundant += 1;
+                return;
+            }
+        }
+
+        if outcome.is_win() {
+            self.win += 1;
+            self.unique_positions += 1;
+            let ply = outcome.to_u16() >> 3;
+            *self.histogram_win.entry(ply).or_insert(0) += 1;
+            if ply == current_max_win_dtc && current_max_win_dtc > 0 {
+                let global_idx = file.get_global_index(egt_idx, local_idx);
+                if let Some(pos) = file.index_to_position(global_idx, shakmaty::Color::White) {
+                    let fen = shakmaty::fen::Fen::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
+                    self.longest_dtc_candidates.push(LongestDtcPosition {
+                        fen,
+                        ply,
+                        outcome: "win".to_string(),
+                    });
+                }
+            }
+        } else if outcome.is_loss() {
+            self.loss += 1;
+            self.unique_positions += 1;
+            let ply = outcome.to_u16() >> 3;
+            *self.histogram_loss.entry(ply).or_insert(0) += 1;
+        } else if outcome.is_draw() {
+            self.draw += 1;
+            self.unique_positions += 1;
+        } else if outcome.is_invalid() {
+            self.invalid_or_redundant += 1;
+        }
+    }
+
+    fn build(mut self, bytes: u64, sha256: String) -> EgtFileStats {
+        let global_max = self.max_win_dtc;
+        self.longest_dtc_candidates.retain(|p| p.ply == global_max);
+        EgtFileStats {
+            endgame: self.endgame,
+            bytes,
+            sha256,
+            frame_size: self.frame_size,
+            num_frames: self.num_frames,
+            unique_positions: self.unique_positions,
+            win: self.win,
+            draw: self.draw,
+            loss: self.loss,
+            invalid_or_redundant: self.invalid_or_redundant,
+            histogram_win: self.histogram_win,
+            histogram_loss: self.histogram_loss,
+            longest_dtc: self.longest_dtc_candidates,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EgtHandle {
@@ -448,6 +540,21 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
 
     // Initialization & Propagation Phase for each independent pair
     let mut dep_cache = DependencyCache::new(base_path);
+    let mut stats_builder_a = EgtFileStatsBuilder::new(
+        solver.files[0].endgame.clone(),
+        solver.files[0].frame_size,
+        solver.files[0].num_frames(),
+    );
+    let mut stats_builder_b = if is_symmetric {
+        None
+    } else {
+        Some(EgtFileStatsBuilder::new(
+            solver.files[1].endgame.clone(),
+            solver.files[1].frame_size,
+            solver.files[1].num_frames(),
+        ))
+    };
+
     for (table_a, table_b) in &table_pairs {
         let mut queues_a = DepthQueues::new();
         let mut queues_b = DepthQueues::new();
@@ -456,13 +563,16 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_a.name, checkmates, stalemates);
 
-        if table_a != table_b {
+        if !solver.is_symmetric {
             let (checkmates, stalemates, _) =
                 initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a)?;
                 println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
         } else {
             queues_a.merge(&mut queues_b);
         }
+
+        let mut current_max_win_dtc_a = 0;
+        let mut current_max_win_dtc_b = 0;
 
         let mut plies = 1;
         while !queues_a.is_empty() || !queues_b.is_empty() {
@@ -475,7 +585,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             let mut losses_found_b = 0;
 
             // 1. Process loss-to-win queues (marking wins at depth `plies`)
-            if table_a == table_b {
+            if solver.is_symmetric {
                 for &idx in &queues_a.win_checkmate {
                     if propagate_loss_to_win(&mut solver, table_a, table_a, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
                         wins_found_a += 1;
@@ -582,12 +692,14 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
 
             if wins_found_a > 0 {
                 println!("{}: Found {} winning positions at depth {}", table_a.name, wins_found_a, plies);
+                current_max_win_dtc_a = current_max_win_dtc_a.max(plies);
             }
             if losses_found_a > 0 {
                 println!("{}: Found {} losing positions at depth {}", table_a.name, losses_found_a, plies);
             }
             if wins_found_b > 0 {
                 println!("{}: Found {} winning positions at depth {}", table_b.name, wins_found_b, plies);
+                current_max_win_dtc_b = current_max_win_dtc_b.max(plies);
             }
             if losses_found_b > 0 {
                 println!("{}: Found {} losing positions at depth {}", table_b.name, losses_found_b, plies);
@@ -598,31 +710,49 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             plies += 1;
         }
 
+        stats_builder_a.max_win_dtc = stats_builder_a.max_win_dtc.max(current_max_win_dtc_a);
+        if let Some(ref mut builder_b) = stats_builder_b {
+            builder_b.max_win_dtc = builder_b.max_win_dtc.max(current_max_win_dtc_b);
+        }
+
         // Mark all remaining 'unknown' positions as draws
         println!("{}: marking remaining positions as draws...", table_a.name);
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
-            let outcome = solver.read_outcome(table_a, idx);
+            let mut outcome = solver.read_outcome(table_a, idx);
             if outcome.is_unknown() {
-                solver.write_outcome(table_a, idx, MaybeDtcOutcome::DRAW)
+                outcome = MaybeDtcOutcome::DRAW;
+                solver.write_outcome(table_a, idx, outcome);
             }
+            stats_builder_a.record_outcome(outcome, idx, table_a.egt_idx, &mut solver.files[table_a.file_idx], current_max_win_dtc_a);
         }
 
         if table_a != table_b {
             println!("{}: marking remaining positions as draws...", table_b.name);
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
-                let outcome = solver.read_outcome(table_b, idx);
+                let mut outcome = solver.read_outcome(table_b, idx);
                 if outcome.is_unknown() {
-                    solver.write_outcome(table_b, idx, MaybeDtcOutcome::DRAW)
+                    outcome = MaybeDtcOutcome::DRAW;
+                    solver.write_outcome(table_b, idx, outcome);
+                }
+                if let Some(ref mut builder_b) = stats_builder_b {
+                    builder_b.record_outcome(outcome, idx, table_b.egt_idx, &mut solver.files[table_b.file_idx], current_max_win_dtc_b);
                 }
             }
         }
     }
 
     let mut files = solver.files;
-    let file_a = files.remove(0);
-    let file_b = if is_symmetric { None } else { Some(files.remove(0)) };
+    let mut file_a = files.remove(0);
+    let mut file_b = if is_symmetric { None } else { Some(files.remove(0)) };
+
+    file_a.stats = Some(stats_builder_a.build(0, String::new()));
+    if let Some(ref mut fb) = file_b {
+        if let Some(builder_b) = stats_builder_b {
+            fb.stats = Some(builder_b.build(0, String::new()));
+        }
+    }
 
     Ok((file_a, file_b))
 }

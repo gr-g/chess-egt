@@ -1,13 +1,38 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
 use crate::piece_set::{EgtRole, EgtSide};
+use serde::{Serialize, Deserialize};
 
 // 16k positions per frame, corresponding to 32k bytes per frame.
 const DEFAULT_FRAME_SIZE: usize = 16384;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LongestDtcPosition {
+    pub fen: String,
+    pub ply: u16,
+    pub outcome: String, // "win" or "loss"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgtFileStats {
+    pub endgame: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub frame_size: usize,
+    pub num_frames: usize,
+    pub unique_positions: usize,
+    pub win: usize,
+    pub draw: usize,
+    pub loss: usize,
+    pub invalid_or_redundant: usize,
+    pub histogram_win: BTreeMap<u16, usize>,
+    pub histogram_loss: BTreeMap<u16, usize>,
+    pub longest_dtc: Vec<LongestDtcPosition>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaybeDtcOutcome(pub u16);
@@ -85,8 +110,8 @@ impl MaybeDtcOutcome {
         Self(bits | (distance << 3))
     }
 
-    pub fn new_unknown(moves_counter: u16) -> Self {
-        Self(moves_counter << 3)
+    pub fn new_unknown(counter: u16) -> Self {
+        Self(counter << 3)
     }
 
     pub fn to_outcome(self) -> Result<DtcOutcome, ()> {
@@ -210,10 +235,13 @@ pub struct EgtFile {
     frames: Vec<FrameState>,
 
     /// Number of indexed locations per frame.
-    frame_size: usize,
+    pub frame_size: usize,
 
     /// Total number of indexed locations across all Egts in this file.
     pub index_range: usize,
+
+    /// Statistics about the generated endgame.
+    pub stats: Option<EgtFileStats>,
 }
 
 impl EgtFile {
@@ -269,6 +297,7 @@ impl EgtFile {
             frames,
             frame_size,
             index_range,
+            stats: None,
         })
     }
 
@@ -289,39 +318,14 @@ impl EgtFile {
         Ok(egt_file)
     }
 
+    pub fn num_frames(&self) -> usize {
+        self.frames.len()
+    }
+
     /// Probes the outcome of a specific position.
     pub fn probe(&mut self, position: &Chess) -> Result<MaybeDtcOutcome, ()> {
         let index = self.map_position_to_index(position)?;
         self.read_from_index(index)
-    }
-
-    /// Counts the number of wins, draws, losses, and invalid positions in the EgtFile.
-    pub fn count_outcomes(&mut self) -> (usize, usize, usize, usize) {
-        let mut wins = 0;
-        let mut draws = 0;
-        let mut losses = 0;
-        let mut invalid = 0;
-
-        for frame_idx in 0..self.frames.len() {
-            if let FrameState::Empty = &self.frames[frame_idx] {
-                invalid += self.frame_size;
-                continue;
-            }
-
-            for outcome in self.get_frame_data(frame_idx).unwrap() {
-                if outcome.is_win() {
-                    wins += 1;
-                } else if outcome.is_loss() {
-                    losses += 1;
-                } else if outcome.is_draw() {
-                    draws += 1;
-                } else if outcome.is_invalid() {
-                    invalid += 1;
-                }
-            }
-        }
-
-        (wins, draws, losses, invalid)
     }
 
     /// Save the entire EgtFile using seekable Zstd compression.

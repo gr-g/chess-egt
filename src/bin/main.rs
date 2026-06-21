@@ -39,32 +39,11 @@ fn main() {
             _ => {},
         };
     } else if cli.generate_all_3 {
-        println!("Generating all 3-men tables...");
-        let endgames = EgtGenerator::list_n_pieces_endgames(3);
-        let g = EgtGenerator::new(&cli.path);
-        for endgame in endgames {
-            if let Err(_) = g.generate(&endgame) {
-                println!("Failed to generate endgame {}", endgame);
-            }
-        }
+        generate_all(3, &cli.path);
     } else if cli.generate_all_4 {
-        println!("Generating all 4-men tables...");
-        let endgames = EgtGenerator::list_n_pieces_endgames(4);
-        let g = EgtGenerator::new(&cli.path);
-        for endgame in endgames {
-            if let Err(_) = g.generate(&endgame) {
-                println!("Failed to generate endgame {}", endgame);
-            }
-        }
+        generate_all(4, &cli.path);
     } else if cli.generate_all_5 {
-        println!("Generating all 5-men tables...");
-        let endgames = EgtGenerator::list_n_pieces_endgames(5);
-        let g = EgtGenerator::new(&cli.path);
-        for endgame in endgames {
-            if let Err(_) = g.generate(&endgame) {
-                println!("Failed to generate endgame {}", endgame);
-            }
-        }
+        generate_all(5, &cli.path);
     } else if let Some(fen) = cli.position {
         let fen_obj: Fen = fen.parse().expect("Invalid FEN");
         let position = fen_obj.into_position(CastlingMode::Standard).expect("Invalid position");
@@ -110,4 +89,69 @@ fn main() {
     } else {
         println!("No action specified. Use --help for options.");
     }
+}
+
+fn generate_all(n: usize, path: &std::path::Path) {
+    println!("Generating all {}-pieces tables...", n);
+    let endgames = EgtGenerator::list_n_pieces_endgames(n);
+    let g = EgtGenerator::new(path);
+    let start_all = std::time::Instant::now();
+    let mut unique_positions = 0;
+    let mut total_bytes = 0;
+    let mut worst_compression_endgame = String::new();
+    let mut worst_bits_per_pos = 0.0;
+
+    for endgame in endgames {
+        match g.generate(&endgame) {
+            Ok((stats_a, stats_b_opt)) => {
+                let mut process_stats = |stats: chess_egt::EgtFileStats| {
+                    let unique_pos = stats.win + stats.draw + stats.loss;
+                    unique_positions += unique_pos;
+                    total_bytes += stats.bytes;
+                    let bits_per_pos = if unique_pos > 0 {
+                        (stats.bytes as f64 * 8.0) / unique_pos as f64
+                    } else {
+                        0.0
+                    };
+                    if bits_per_pos > worst_bits_per_pos {
+                        worst_bits_per_pos = bits_per_pos;
+                        worst_compression_endgame = stats.endgame;
+                    }
+                };
+                process_stats(stats_a);
+                if let Some(stats_b) = stats_b_opt {
+                    process_stats(stats_b);
+                }
+            }
+            Err(_) => {
+                println!("Failed to generate endgame {}", endgame);
+            }
+        }
+    }
+    let duration = start_all.elapsed();
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    let format_dur = format!("{:02}h{:02}m{:02}s", hours, minutes, seconds);
+
+    let size_mb = total_bytes as f64 / (1024.0 * 1024.0);
+    let avg_bits_per_pos = if unique_positions > 0 {
+        (total_bytes as f64 * 8.0) / unique_positions as f64
+    } else {
+        0.0
+    };
+
+    println!("\n================================================================================");
+    println!("Generated all {}-pieces endgames, corresponding to {} unique positions.", n, unique_positions);
+    println!("Time: {}.", format_dur);
+    if !worst_compression_endgame.is_empty() {
+        println!(
+            "Size on disk: {:.2}MiB ({:.2} bits/pos on average; lowest compression for {}: {:.2} bits/pos).",
+            size_mb, avg_bits_per_pos, worst_compression_endgame, worst_bits_per_pos
+        );
+    } else {
+        println!("Size on disk: {:.2}MiB ({:.2} bits/pos on average).", size_mb, avg_bits_per_pos);
+    }
+    println!("================================================================================");
 }

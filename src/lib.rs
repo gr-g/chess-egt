@@ -3,7 +3,7 @@ mod egt;
 mod egt_file;
 mod retrograde;
 
-use egt_file::EgtFile;
+pub use egt_file::{EgtFile, EgtFileStats, LongestDtcPosition};
 use shakmaty::{Role, Chess, Color, Position};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ impl EgtGenerator {
         endgames
     }
 
-    pub fn generate(&self, endgame: &str) -> Result<(), ()> {
+    pub fn generate(&self, endgame: &str) -> Result<(EgtFileStats, Option<EgtFileStats>), ()> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
 
@@ -134,13 +134,40 @@ impl EgtGenerator {
         let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame)?;
 
         // Save to file
-        let bytes_a = file_a.save_to_file().expect("Failed to flush EgtFile A");
+        let bytes_a = file_a.save_to_file().map_err(|_| ())?;
         let mut bytes_b = None;
         if let Some(ref mut fb) = file_b {
-            bytes_b = Some(fb.save_to_file().expect("Failed to flush EgtFile B"));
+            bytes_b = Some(fb.save_to_file().map_err(|_| ())?);
         }
+
+        // Compute SHA-256 and finalize stats
+        let sha256_a = compute_sha256(&file_a.path).map_err(|_| ())?;
+        let mut stats_a = file_a.stats.take().unwrap();
+        stats_a.bytes = bytes_a;
+        stats_a.sha256 = sha256_a;
+
+        // Save JSON file for A
+        let json_path_a = file_a.path.with_extension("json");
+        let json_str_a = serde_json::to_string_pretty(&stats_a).map_err(|_| ())?;
+        std::fs::write(json_path_a, json_str_a).map_err(|_| ())?;
+
+        let mut stats_b = None;
+        if let Some(ref mut fb) = file_b {
+            let sha256_b = compute_sha256(&fb.path).map_err(|_| ())?;
+            let mut s_b = fb.stats.take().unwrap();
+            s_b.bytes = bytes_b.unwrap();
+            s_b.sha256 = sha256_b;
+
+            // Save JSON file for B
+            let json_path_b = fb.path.with_extension("json");
+            let json_str_b = serde_json::to_string_pretty(&s_b).map_err(|_| ())?;
+            std::fs::write(json_path_b, json_str_b).map_err(|_| ())?;
+
+            stats_b = Some(s_b);
+        }
+
         let duration = start_time.elapsed();
-        print_pair_stats(&mut file_a, file_b.as_mut(), bytes_a, bytes_b, duration);
+        print_pair_stats(&stats_a, stats_b.as_ref(), duration);
 
         // Check internal consistency
         let mut prober = EgtProber::new(&self.base_path);
@@ -148,7 +175,8 @@ impl EgtGenerator {
         if let Some(ref mut fb) = file_b {
             prober.verify_internal_consistency(&fb.endgame)?;
         }
-        Ok(())
+
+        Ok((stats_a, stats_b))
     }
 }
 
@@ -334,22 +362,22 @@ pub fn get_endgame(position: &Chess) -> String {
 }
 
 /// Prints table-specific statistics (wins, draws, losses, compression).
-pub fn print_table_stats(endgame: &str, wins: usize, draws: usize, losses: usize, bytes: u64) {
-    let unique_positions = wins + draws + losses;
-    let compressed_size_mb = bytes as f64 / (1024.0 * 1024.0);
+pub fn print_table_stats(stats: &EgtFileStats) {
+    let unique_positions = stats.unique_positions;
+    let compressed_size_mb = stats.bytes as f64 / (1024.0 * 1024.0);
     let bits_per_pos = if unique_positions > 0 {
-        (bytes as f64 * 8.0) / unique_positions as f64
+        (stats.bytes as f64 * 8.0) / unique_positions as f64
     } else {
         0.0
     };
 
     println!(
-        "Generated endgame {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MiB ({:.2} bits/pos).",
-        endgame,
+        "Generated endgame {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.2}MiB ({:.2} bits/pos).",
+        stats.endgame,
         unique_positions,
-        wins,
-        draws,
-        losses,
+        stats.win,
+        stats.draw,
+        stats.loss,
         compressed_size_mb,
         bits_per_pos
     );
@@ -357,20 +385,16 @@ pub fn print_table_stats(endgame: &str, wins: usize, draws: usize, losses: usize
 
 /// Prints detailed statistics about a pair of generated files (or a single file if symmetric).
 pub fn print_pair_stats(
-    file_a: &mut EgtFile,
-    file_b: Option<&mut EgtFile>,
-    bytes_a: u64,
-    bytes_b: Option<u64>,
+    stats_a: &EgtFileStats,
+    stats_b: Option<&EgtFileStats>,
     duration: std::time::Duration,
 ) {
-    let (wins_a, draws_a, losses_a, _) = file_a.count_outcomes();
-    let mut unique_positions = wins_a + draws_a + losses_a;
-    print_table_stats(&file_a.endgame, wins_a, draws_a, losses_a, bytes_a);
+    let mut unique_positions = stats_a.unique_positions;
+    print_table_stats(stats_a);
 
-    if let Some(fb) = file_b {
-        let (wins_b, draws_b, losses_b, _) = fb.count_outcomes();
-        unique_positions += wins_b + draws_b + losses_b;
-        print_table_stats(&fb.endgame, wins_b, draws_b, losses_b, bytes_b.unwrap());
+    if let Some(sb) = stats_b {
+        unique_positions += sb.unique_positions;
+        print_table_stats(sb);
     }
 
     let us_per_pos = if unique_positions > 0 {
@@ -390,6 +414,23 @@ pub fn print_pair_stats(
         format_dur,
         us_per_pos,
     );
+}
+
+
+fn compute_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Sha256, Digest};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -434,7 +475,7 @@ mod tests {
         ]);
 
         let all_two = EgtGenerator::list_n_pieces_endgames(2);
-        assert_eq!(two_men, vec!["K_K".to_string()]);
+        assert_eq!(all_two, vec!["K_K".to_string()]);
 
         let all_four = EgtGenerator::list_n_pieces_endgames(4);
         // Ensure pawnless endgames are first, then 1 pawn, then 2 pawns

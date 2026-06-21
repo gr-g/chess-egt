@@ -5,8 +5,6 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Add EgtFileStats as return value for generate(). Serialize to JSON similar to https://syzygy-tables.info/stats/KRRvKQ.json (but simplified).
-  - bytes, sha256, frame_size, num_frames, total win/draw/loss, histogram win/loss, positions with longest dtc.
 - Print queue memory usage
 - Keep track of number of uncompressed frames in EgtFile.
 - Add tests with real statistics from other tablebases.
@@ -18,7 +16,7 @@ TODO:
 - Experiment with different frame sizes, compression parameters, ...
 - Error management.
 - Visibility and public interface.
-- Exclude redundant positions during statistics generation. Implement EgtProber::verify_with_syzygy().
+- Implement EgtProber::verify_with_syzygy().
 - Refactor retrograde generation tests using a common function
 - Align ep_square with shakmaty
 - Verify index_ranges table-by-table
@@ -26,7 +24,6 @@ TODO:
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder).
 - Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames.
 - Make solver read-only, remove name from EgtHandle.
-- .egt -> .ggegt
 
 # Design Specifications
 
