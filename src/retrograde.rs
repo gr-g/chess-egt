@@ -159,6 +159,15 @@ impl DepthQueues {
         self.loss_capture.append(&mut other.loss_capture);
         self.loss_promotion.append(&mut other.loss_promotion);
     }
+
+    fn capacity(&self) -> usize {
+        self.win_checkmate.capacity() +
+            self.win_capture.capacity() +
+            self.win_promotion.capacity() +
+            self.loss_checkmate.capacity() +
+            self.loss_capture.capacity() +
+            self.loss_promotion.capacity()
+    }
 }
 
 pub struct RetrogradeSolver {
@@ -690,20 +699,23 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
                 }
             }
 
+            let queues_capacity_mb = (next_queues_a.capacity() + next_queues_b.capacity()) as f64 / (1024.0 * 1024.0);
+
             if wins_found_a > 0 {
-                println!("{}: Found {} winning positions at depth {}", table_a.name, wins_found_a, plies);
+                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_a.name, wins_found_a, plies, queues_capacity_mb);
                 current_max_win_dtc_a = current_max_win_dtc_a.max(plies);
             }
             if losses_found_a > 0 {
-                println!("{}: Found {} losing positions at depth {}", table_a.name, losses_found_a, plies);
+                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_a.name, losses_found_a, plies, queues_capacity_mb);
             }
             if wins_found_b > 0 {
-                println!("{}: Found {} winning positions at depth {}", table_b.name, wins_found_b, plies);
+                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, wins_found_b, plies, queues_capacity_mb);
                 current_max_win_dtc_b = current_max_win_dtc_b.max(plies);
             }
             if losses_found_b > 0 {
-                println!("{}: Found {} losing positions at depth {}", table_b.name, losses_found_b, plies);
+                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, losses_found_b, plies, queues_capacity_mb);
             }
+
 
             queues_a = next_queues_a;
             queues_b = next_queues_b;

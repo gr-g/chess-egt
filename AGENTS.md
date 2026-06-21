@@ -5,11 +5,10 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Print queue memory usage
-- Keep track of number of uncompressed frames in EgtFile.
 - Add tests with real statistics from other tablebases.
-- Print counter during verification.
+- Refactor retrograde generation tests using a common function
 - Proper memory management and LRU-eviction.
+- Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungrad/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
@@ -17,12 +16,11 @@ TODO:
 - Error management.
 - Visibility and public interface.
 - Implement EgtProber::verify_with_syzygy().
-- Refactor retrograde generation tests using a common function
 - Align ep_square with shakmaty
-- Verify index_ranges table-by-table
+- Verify index_ranges table-by-table. Print counter during verification.
 - Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder).
-- Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames.
+- Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames. One single queue?
 - Make solver read-only, remove name from EgtHandle.
 
 # Design Specifications

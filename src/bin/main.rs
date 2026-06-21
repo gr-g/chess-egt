@@ -142,16 +142,16 @@ fn generate_all(n: usize, path: &std::path::Path) {
         0.0
     };
 
-    println!("\n================================================================================");
+    println!("\n=============================================================================================");
     println!("Generated all {}-pieces endgames, corresponding to {} unique positions.", n, unique_positions);
     println!("Time: {}.", format_dur);
     if !worst_compression_endgame.is_empty() {
         println!(
-            "Size on disk: {:.2}MiB ({:.2} bits/pos on average; lowest compression for {}: {:.2} bits/pos).",
+            "Size on disk: {:.2}MiB ({:.2} bits/pos on average, lowest compression for {}: {:.2} bits/pos).",
             size_mb, avg_bits_per_pos, worst_compression_endgame, worst_bits_per_pos
         );
     } else {
         println!("Size on disk: {:.2}MiB ({:.2} bits/pos on average).", size_mb, avg_bits_per_pos);
     }
-    println!("================================================================================");
+    println!("=============================================================================================");
 }
