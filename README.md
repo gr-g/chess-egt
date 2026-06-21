@@ -21,14 +21,14 @@ The 16 bits of a `DtcOutcome` are structured as follows:
 - **Bits 0-2 (WDL and Conversion Type)**:
   - `0b000`: Invalid / Unknown (used for invalid/uncalculated positions)
   - `0b001`: Draw
-  - `0b010`: Win - Checkmate can be forced in n plys
-  - `0b100`: Win - A capture can be forced in n plys converting to a winning position
-  - `0b110`: Win - A promotion can be forced in n plys converting to a winning position
-  - `0b011`: Loss - Opponent can force checkmate in n plys (n = 0 for checkmated positions)
-  - `0b101`: Loss - Opponent can force a capture in n plys converting to a losing position
-  - `0b111`: Loss - Opponent can force a promotion in n plys converting to a losing position
+  - `0b010`: Win - Checkmate can be forced in n plies
+  - `0b100`: Win - A capture can be forced in n plies converting to a winning position
+  - `0b110`: Win - A promotion can be forced in n plies converting to a winning position
+  - `0b011`: Loss - Opponent can force checkmate in n plies (n = 0 for checkmated positions)
+  - `0b101`: Loss - Opponent can force a capture in n plies converting to a losing position
+  - `0b111`: Loss - Opponent can force a promotion in n plies converting to a losing position
 - **Bits 3-15 (Distance to Conversion)**:
-  - A 13-bit unsigned integer representing the number of plys to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plys.
+  - A 13-bit unsigned integer representing the number of plys to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 ## 3. Indexing & Symmetries
 

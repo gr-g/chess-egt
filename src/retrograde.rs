@@ -234,20 +234,20 @@ impl DependencyCache {
         }
     }
 
-    pub fn get_or_load(&mut self, tablename: &str) -> &mut EgtFile {
-        if !self.cache.contains_key(tablename) {
-            let file_from_disk = EgtFile::new_from_file(&self.base_path, tablename);
+    pub fn get_or_load(&mut self, endgame: &str) -> &mut EgtFile {
+        if !self.cache.contains_key(endgame) {
+            let file_from_disk = EgtFile::new_from_file(&self.base_path, endgame);
             let file = if file_from_disk.is_ok() {
                 file_from_disk.unwrap()
             } else {
-                println!("Dependency table {} not found. Generating on the fly...", tablename);
+                println!("Dependency endgame {} not found. Generating on the fly...", endgame);
                 let g = EgtGenerator::new(&self.base_path);
-                g.generate(tablename);
-                EgtFile::new_from_file(&self.base_path, tablename).unwrap()
+                g.generate(endgame);
+                EgtFile::new_from_file(&self.base_path, endgame).unwrap()
             };
-            self.cache.insert(tablename.to_string(), file);
+            self.cache.insert(endgame.to_string(), file);
         }
-        self.cache.get_mut(tablename).unwrap()
+        self.cache.get_mut(endgame).unwrap()
     }
 }
 
@@ -319,10 +319,10 @@ fn initialize_table(
                 if is_capture || is_promotion {
                     let mut successor_position = position.clone();
                     successor_position.play_unchecked(m);
-                    let dep_tablename = crate::get_tablename(&successor_position);
+                    let dep_endgame = crate::get_endgame(&successor_position);
 
                     // Probe the dependency table
-                    let dep_outcome = dep_cache.get_or_load(&dep_tablename).probe(&successor_position).unwrap();
+                    let dep_outcome = dep_cache.get_or_load(&dep_endgame).probe(&successor_position).unwrap();
 
                     let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
                     if dep_outcome.is_loss() {
@@ -391,18 +391,18 @@ fn propagate_win_to_loss(
     }
 }
 
-pub fn retrograde_analysis(base_path: &std::path::Path, tablename: &str) -> (EgtFile, Option<EgtFile>) {
-    let parts: Vec<&str> = tablename.split('_').collect();
+pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> (EgtFile, Option<EgtFile>) {
+    let parts: Vec<&str> = endgame.split('_').collect();
     assert_eq!(parts.len(), 2);
-    let twin_tablename = format!("{}_{}", parts[1], parts[0]);
+    let twin_endgame = format!("{}_{}", parts[1], parts[0]);
 
-    let is_symmetric = tablename == twin_tablename;
+    let is_symmetric = endgame == twin_endgame;
 
-    let file_a = EgtFile::new(&base_path.to_path_buf(), tablename).unwrap();
+    let file_a = EgtFile::new(&base_path.to_path_buf(), endgame).unwrap();
     let file_b = if is_symmetric {
         None
     } else {
-        Some(EgtFile::new(&base_path.to_path_buf(), &twin_tablename).unwrap())
+        Some(EgtFile::new(&base_path.to_path_buf(), &twin_endgame).unwrap())
     };
 
     let mut solver = RetrogradeSolver::new(file_a, file_b);
@@ -656,7 +656,7 @@ mod tests {
             }
         }
 
-        println!("K_K table stats:");
+        println!("K_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -696,7 +696,7 @@ mod tests {
             }
         }
 
-        println!("KQ_K table stats:");
+        println!("KQ_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -724,7 +724,7 @@ mod tests {
             }
         }
 
-        println!("K_KQ table stats:");
+        println!("K_KQ stats:");
         println!("  Draws: {}", draw_count_b);
         println!("  Wins: {}", win_count_b);
         println!("  Losses: {}", loss_count_b);
@@ -760,7 +760,7 @@ mod tests {
             }
         }
 
-        println!("KR_K table stats:");
+        println!("KR_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -788,7 +788,7 @@ mod tests {
             }
         }
 
-        println!("K_KR table stats:");
+        println!("K_KR stats:");
         println!("  Draws: {}", draw_count_b);
         println!("  Wins: {}", win_count_b);
         println!("  Losses: {}", loss_count_b);
@@ -824,7 +824,7 @@ mod tests {
             }
         }
 
-        println!("KB_K table stats:");
+        println!("KB_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -852,7 +852,7 @@ mod tests {
             }
         }
 
-        println!("K_KB table stats:");
+        println!("K_KB stats:");
         println!("  Draws: {}", draw_count_b);
         println!("  Wins: {}", win_count_b);
         println!("  Losses: {}", loss_count_b);
@@ -888,7 +888,7 @@ mod tests {
             }
         }
 
-        println!("KN_K table stats:");
+        println!("KN_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -916,7 +916,7 @@ mod tests {
             }
         }
 
-        println!("K_KN table stats:");
+        println!("K_KN stats:");
         println!("  Draws: {}", draw_count_b);
         println!("  Wins: {}", win_count_b);
         println!("  Losses: {}", loss_count_b);
@@ -952,7 +952,7 @@ mod tests {
             }
         }
 
-        println!("KP_K table stats:");
+        println!("KP_K stats:");
         println!("  Draws: {}", draw_count);
         println!("  Wins: {}", win_count);
         println!("  Losses: {}", loss_count);
@@ -978,7 +978,7 @@ mod tests {
             }
         }
 
-        println!("K_KP table stats:");
+        println!("K_KP stats:");
         println!("  Draws: {}", draw_count_b);
         println!("  Wins: {}", win_count_b);
         println!("  Losses: {}", loss_count_b);

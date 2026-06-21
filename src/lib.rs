@@ -62,9 +62,9 @@ impl EgtGenerator {
         self.assigned_memory = Some(n);
     }
 
-    pub fn generate(&self, tablename: &str) {
+    pub fn generate(&self, endgame: &str) {
         let start_time = std::time::Instant::now();
-        println!("Generating table {} at {:?}", tablename, self.base_path);
+        println!("Generating endgame {} at {:?}", endgame, self.base_path);
 
         // TODO: Preallocate memory
         //if let Some(n) = self.assigned_memory {
@@ -72,7 +72,7 @@ impl EgtGenerator {
         //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, tablename);
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame);
 
         // Save to file
         let bytes_a = file_a.save_to_file().expect("Failed to flush EgtFile A");
@@ -85,9 +85,9 @@ impl EgtGenerator {
 
         // Check internal consistency
         let mut prober = EgtProber::new(&self.base_path);
-        prober.verify_internal_consistency(&file_a.tablename).expect("Failed internal consistency check!");
+        prober.verify_internal_consistency(&file_a.endgame).expect("Failed internal consistency check!");
         if let Some(ref mut fb) = file_b {
-            prober.verify_internal_consistency(&fb.tablename).expect("Failed internal consistency check!");
+            prober.verify_internal_consistency(&fb.endgame).expect("Failed internal consistency check!");
         }
     }
 }
@@ -112,30 +112,30 @@ impl EgtProber {
     }
 
     pub fn probe(&mut self, position: &Chess) -> Result<DtcOutcome, ()> {
-        let tablename = get_tablename(position);
-        if !self.cache.contains_key(&tablename) {
-            let file = EgtFile::new_from_file(&self.base_path, &tablename)?;
-            self.cache.insert(tablename.clone(), file);
+        let endgame = get_endgame(position);
+        if !self.cache.contains_key(&endgame) {
+            let file = EgtFile::new_from_file(&self.base_path, &endgame)?;
+            self.cache.insert(endgame.clone(), file);
         }
-        let file = self.cache.get_mut(&tablename).unwrap();
+        let file = self.cache.get_mut(&endgame).unwrap();
         file.probe(position)?.to_outcome()
     }
 
-    pub fn verify_internal_consistency(&mut self, tablename: &str) -> Result<(), ()> {
-        // Ensure the main table is loaded in the cache
-        if !self.cache.contains_key(tablename) {
-            let file = EgtFile::new_from_file(&self.base_path, tablename)?;
-            self.cache.insert(tablename.to_string(), file);
+    pub fn verify_internal_consistency(&mut self, endgame: &str) -> Result<(), ()> {
+        // Ensure the main file is in the cache
+        if !self.cache.contains_key(endgame) {
+            let file = EgtFile::new_from_file(&self.base_path, endgame)?;
+            self.cache.insert(endgame.to_string(), file);
         }
 
-        let index_range = self.cache.get(tablename).unwrap().index_range;
+        let index_range = self.cache.get(endgame).unwrap().index_range;
 
-        println!("Verifying internal consistency of table {} ({} indexes)...", tablename, index_range);
+        println!("Verifying internal consistency of endgame {} ({} indexes)...", endgame, index_range);
 
         for idx in 0..index_range {
             // Retrieve the setup and the outcome for this index
             let (position_opt, outcome_maybe) = {
-                let file = self.cache.get_mut(tablename).unwrap();
+                let file = self.cache.get_mut(endgame).unwrap();
                 let position_opt = file.index_to_position(idx, Color::White);
                 let outcome_maybe = file.read_from_index(idx)?;
                 (position_opt, outcome_maybe)
@@ -210,7 +210,7 @@ impl EgtProber {
                 if outcome != best {
                     println!(
                         "Error: consistency check failed at index {} of {}.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
-                        idx, tablename, position, outcome, best
+                        idx, endgame, position, outcome, best
                     );
                     println!("Legal moves and their outcomes:");
                     for m in position.legal_moves() {
@@ -240,12 +240,12 @@ impl EgtProber {
             }
         }
 
-        println!("Successfully verified internal consistency of table {}.", tablename);
+        println!("Successfully verified internal consistency of endgame {}.", endgame);
         Ok(())
     }
 }
 
-pub fn get_tablename(position: &Chess) -> String {
+pub fn get_endgame(position: &Chess) -> String {
     let stm_color = position.turn();
     let sntm_color = !stm_color;
 
@@ -274,7 +274,7 @@ pub fn get_tablename(position: &Chess) -> String {
 }
 
 /// Prints table-specific statistics (wins, draws, losses, compression).
-pub fn print_table_stats(tablename: &str, wins: usize, draws: usize, losses: usize, bytes: u64) {
+pub fn print_table_stats(endgame: &str, wins: usize, draws: usize, losses: usize, bytes: u64) {
     let unique_positions = wins + draws + losses;
     let compressed_size_mb = bytes as f64 / (1024.0 * 1024.0);
     let bits_per_pos = if unique_positions > 0 {
@@ -284,8 +284,8 @@ pub fn print_table_stats(tablename: &str, wins: usize, draws: usize, losses: usi
     };
 
     println!(
-        "Generated table {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MB ({:.2} bits/pos).",
-        tablename,
+        "Generated endgame {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.0}MiB ({:.2} bits/pos).",
+        endgame,
         unique_positions,
         wins,
         draws,
@@ -295,7 +295,7 @@ pub fn print_table_stats(tablename: &str, wins: usize, draws: usize, losses: usi
     );
 }
 
-/// Prints detailed statistics about a pair of generated tables (or a single table if symmetric).
+/// Prints detailed statistics about a pair of generated files (or a single file if symmetric).
 pub fn print_pair_stats(
     file_a: &mut EgtFile,
     file_b: Option<&mut EgtFile>,
@@ -305,12 +305,12 @@ pub fn print_pair_stats(
 ) {
     let (wins_a, draws_a, losses_a, _) = file_a.count_outcomes();
     let mut unique_positions = wins_a + draws_a + losses_a;
-    print_table_stats(&file_a.tablename, wins_a, draws_a, losses_a, bytes_a);
+    print_table_stats(&file_a.endgame, wins_a, draws_a, losses_a, bytes_a);
 
     if let Some(fb) = file_b {
         let (wins_b, draws_b, losses_b, _) = fb.count_outcomes();
         unique_positions += wins_b + draws_b + losses_b;
-        print_table_stats(&fb.tablename, wins_b, draws_b, losses_b, bytes_b.unwrap());
+        print_table_stats(&fb.endgame, wins_b, draws_b, losses_b, bytes_b.unwrap());
     }
 
     let us_per_pos = if unique_positions > 0 {

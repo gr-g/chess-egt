@@ -5,20 +5,30 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Cli argument to generate all 3-4-5.
+- generate() returns Result
+- Add EgtFileStats as return value for generate(). Serialize to JSON similar to https://syzygy-tables.info/stats/KRRvKQ.json (but simplified).
+  - bytes, sha256, frame_size, num_frames, total win/draw/loss, histogram win/loss, positions with longest dtc.
+- Cli argument to generate all 3-4-5. Add function EgtGenerator::list_n_pieces_endgames(n: uize);
+- Print queue memory usage
+- Keep track of number of uncompressed frames in EgtFile.
 - Add tests with real statistics from other tablebases.
+- Print counter during verification.
 - Proper memory management and LRU-eviction.
-- Profiling/benchmarking.
+- Profiling with gungrad/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
 - Experiment with different frame sizes, compression parameters, ...
 - Error management.
 - Visibility and public interface.
-- Marking redundant positions, that are generated but are eventually not saved and excluded from statistics. This would make statistics aligned with Syzygy?
+- Exclude redundant positions during statistics generation. Implement EgtProber::verify_with_syzygy().
 - Refactor retrograde generation tests using a common function
 - Align ep_square with shakmaty
 - Verify index_ranges table-by-table
 - Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
+- Use compressed frames to generate compressed file (with zeekstd RawEncoder).
+- Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames.
+- Make solver read-only, remove name from EgtHandle.
+- .egt -> .ggegt
 
 # Design Specifications
 
@@ -36,14 +46,14 @@ The 16 bits of a `DtcOutcome` are structured as follows:
 - **Bits 0-2 (WDL and Conversion Type)**:
   - `0b000`: Invalid / Unknown (used for invalid/uncalculated positions)
   - `0b001`: Draw
-  - `0b010`: Win - Checkmate can be forced in n plys
-  - `0b100`: Win - A capture can be forced in n plys converting to a winning position
-  - `0b110`: Win - A promotion can be forced in n plys converting to a winning position
-  - `0b011`: Loss - Opponent can force checkmate in n plys (n = 0 for checkmated positions)
-  - `0b101`: Loss - Opponent can force a capture in n plys converting to a losing position
-  - `0b111`: Loss - Opponent can force a promotion in n plys converting to a losing position
+  - `0b010`: Win - Checkmate can be forced in n plies
+  - `0b100`: Win - A capture can be forced in n plies converting to a winning position
+  - `0b110`: Win - A promotion can be forced in n plies converting to a winning position
+  - `0b011`: Loss - Opponent can force checkmate in n plies (n = 0 for checkmated positions)
+  - `0b101`: Loss - Opponent can force a capture in n plies converting to a losing position
+  - `0b111`: Loss - Opponent can force a promotion in n plies converting to a losing position
 - **Bits 3-15 (Distance to Conversion)**:
-  - A 13-bit unsigned integer representing the number of plys to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plys.
+  - A 13-bit unsigned integer representing the number of plies to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 ## 3. Indexing & Symmetries
 

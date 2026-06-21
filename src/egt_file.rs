@@ -195,7 +195,7 @@ impl PawnKey {
 #[derive(Debug)]
 pub struct EgtFile {
     /// The name of this endgame file (e.g. "KQ_KP").
-    pub tablename: String,
+    pub endgame: String,
 
     /// Path to the file.
     pub path: PathBuf,
@@ -209,7 +209,7 @@ pub struct EgtFile {
     /// The frames of the file.
     frames: Vec<FrameState>,
 
-    /// Number of positions per frame.
+    /// Number of indexed locations per frame.
     frame_size: usize,
 
     /// Total number of indexed locations across all Egts in this file.
@@ -220,10 +220,10 @@ impl EgtFile {
     /// Creates a new EgtFile for a given piece configuration and path.
     ///
     /// The file starts with no memory allocated.
-    pub fn new(base_path: &PathBuf, tablename: &str) -> Result<Self, ()> {
-        let path = base_path.join(format!("{}.egt", tablename));
+    pub fn new(base_path: &PathBuf, endgame: &str) -> Result<Self, ()> {
+        let path = base_path.join(format!("{}.ggegt", endgame));
 
-        let (stm_pawns, sntm_pawns, other_pieces) = parse_top_level_tablename(tablename)?;
+        let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name(endgame)?;
 
         let stm_combos = get_file_combinations(stm_pawns);
         let sntm_combos = get_file_combinations(sntm_pawns);
@@ -262,7 +262,7 @@ impl EgtFile {
         }
 
         Ok(Self {
-            tablename: tablename.to_string(),
+            endgame: endgame.to_string(),
             path,
             egts,
             egt_map,
@@ -275,8 +275,8 @@ impl EgtFile {
     /// Creates an EgtFile representing an existing file.
     ///
     /// The file starts with no memory allocated. Data is read from the file on demand.
-    pub fn new_from_file(base_path: &PathBuf, tablename: &str) -> Result<Self, ()> {
-        let mut egt_file = Self::new(base_path, tablename)?;
+    pub fn new_from_file(base_path: &PathBuf, endgame: &str) -> Result<Self, ()> {
+        let mut egt_file = Self::new(base_path, endgame)?;
         let exists = std::fs::exists(&egt_file.path);
         if exists.is_err() || !exists.unwrap() {
             return Err(());
@@ -685,12 +685,12 @@ pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<MaybeDtcOu
     output
 }
 
-/// Parses the top-level tablename (e.g., "KRP_KP") to extract:
+/// Parses the endgame name (e.g., "KRP_KP") to extract:
 /// - Number of pawns for SideToMove
 /// - Number of pawns for SideNotToMove
 /// - List of non-pawn pieces
-fn parse_top_level_tablename(tablename: &str) -> Result<(usize, usize, Vec<(EgtRole, EgtSide, usize)>), ()> {
-    let (stm, sntm) = tablename.split_once('_').ok_or(())?;
+fn parse_endgame_name(endgame: &str) -> Result<(usize, usize, Vec<(EgtRole, EgtSide, usize)>), ()> {
+    let (stm, sntm) = endgame.split_once('_').ok_or(())?;
     let mut stm_pawns = 0;
     let mut sntm_pawns = 0;
     let mut other_pieces = Vec::new();
@@ -815,8 +815,8 @@ mod tests {
     use shakmaty::Color;
 
     #[test]
-    fn test_parse_top_level_tablename() {
-        let (stm_pawns, sntm_pawns, other_pieces) = parse_top_level_tablename("KRP_KP").unwrap();
+    fn test_parse_endgame_name() {
+        let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name("KRP_KP").unwrap();
         assert_eq!(stm_pawns, 1);
         assert_eq!(sntm_pawns, 1);
         assert_eq!(other_pieces.len(), 3); // King STM, King SNTM, Rook STM
@@ -906,9 +906,9 @@ mod tests {
         assert_eq!(outcome, Ok(expected_outcome));
     }
 
-    fn run_round_trip_test(tablename: &str, stride: usize) {
-        let path = PathBuf::from(format!("test_{}.egt", tablename.to_lowercase()));
-        let mut egt_file = EgtFile::new(&path, tablename).unwrap();
+    fn run_round_trip_test(endgame: &str, stride: usize) {
+        let path = PathBuf::from(".");
+        let mut egt_file = EgtFile::new(&path, endgame).unwrap();
 
         let mut offset = 0;
         let num_egts = egt_file.egts.len();

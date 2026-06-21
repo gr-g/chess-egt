@@ -5,27 +5,27 @@ use indexer::{Indexer, IndexerScratch};
 
 #[derive(Clone, Debug)]
 pub struct Egt {
-    // The pieces appearing in this endgame table with their multiplicity.
+    // The pieces appearing in this table, with their multiplicity.
     pub pieces: Vec<(EgtRole, EgtSide, usize)>,
 
     // The helper object storing the piece set and the information required
-    // to convert positions to tablebase indexes.
+    // to convert positions to table indexes.
     pub indexer: Indexer,
 
     // A mutable scratch buffer used to encode/decode positions.
     pub scratch: IndexerScratch,
 
-    // The precomputed name of this endgame table (e.g. "KQ_KPa").
+    // The name of this table (e.g. "KQ_KPa").
     pub tablename: String,
 }
 
 impl Egt {
-    // The set of pieces appearing in this endgame table.
+    // The set of pieces appearing in this table, with their multiplicity.
     pub fn pieces(&self) -> &[(EgtRole, EgtSide, usize)] {
         &self.pieces
     }
 
-    // The number of pawns in the endgame.
+    // The number of pawns.
     pub fn n_pawns(&self) -> usize {
         self.indexer.n_pawns
     }
@@ -35,17 +35,17 @@ impl Egt {
         self.indexer.n_pawns == 0
     }
 
-    // The total number of positions indexed in this endgame table.
+    // The total number of positions indexed in this table.
     pub fn index_range(&self) -> usize {
         self.indexer.index_range
     }
 
-    // The name of this endgame table (e.g. "KQ_KPa").
+    // The name of this table (e.g. "KQ_KPa").
     pub fn tablename(&self) -> &str {
         &self.tablename
     }
 
-    // Setup an endgame table from a set of pieces.
+    // Setup an `Egt` from a set of pieces.
     pub fn from_pieces(mut pieces: Vec<(EgtRole, EgtSide, usize)>) -> Result<Self, ()> {
         // Sort: first the pawns, then the kings, then all other pieces.
         pieces.sort();
