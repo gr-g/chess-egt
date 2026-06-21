@@ -7,6 +7,7 @@ use std::collections::{HashMap, BTreeMap};
 
 struct EgtFileStatsBuilder {
     endgame: String,
+    index_range: usize,
     frame_size: usize,
     num_frames: usize,
     unique_positions: usize,
@@ -16,14 +17,17 @@ struct EgtFileStatsBuilder {
     invalid_or_redundant: usize,
     histogram_win: BTreeMap<u16, usize>,
     histogram_loss: BTreeMap<u16, usize>,
-    longest_dtc_candidates: Vec<LongestDtcPosition>,
+    longest_dtc_win_candidates: Vec<LongestDtcPosition>,
+    longest_dtc_loss_candidates: Vec<LongestDtcPosition>,
     max_win_dtc: u16,
+    max_loss_dtc: u16,
 }
 
 impl EgtFileStatsBuilder {
-    fn new(endgame: String, frame_size: usize, num_frames: usize) -> Self {
+    fn new(endgame: String, index_range: usize, frame_size: usize, num_frames: usize) -> Self {
         Self {
             endgame,
+            index_range,
             frame_size,
             num_frames,
             unique_positions: 0,
@@ -33,12 +37,22 @@ impl EgtFileStatsBuilder {
             invalid_or_redundant: 0,
             histogram_win: BTreeMap::new(),
             histogram_loss: BTreeMap::new(),
-            longest_dtc_candidates: Vec::new(),
+            longest_dtc_win_candidates: Vec::new(),
+            longest_dtc_loss_candidates: Vec::new(),
             max_win_dtc: 0,
+            max_loss_dtc: 0,
         }
     }
 
-    fn record_outcome(&mut self, outcome: MaybeDtcOutcome, local_idx: usize, egt_idx: usize, file: &mut EgtFile, current_max_win_dtc: u16) {
+    fn record_outcome(
+        &mut self,
+        outcome: MaybeDtcOutcome,
+        local_idx: usize,
+        egt_idx: usize,
+        file: &mut EgtFile,
+        current_max_win_dtc: u16,
+        current_max_loss_dtc: u16,
+    ) {
         let sym = file.egts[egt_idx].diagonal_symmetric(local_idx);
         if let Some(other_idx) = sym {
             if local_idx > other_idx {
@@ -55,11 +69,10 @@ impl EgtFileStatsBuilder {
             if ply == current_max_win_dtc && current_max_win_dtc > 0 {
                 let global_idx = file.get_global_index(egt_idx, local_idx);
                 if let Some(pos) = file.index_to_position(global_idx, shakmaty::Color::White) {
-                    let fen = shakmaty::fen::Fen::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
-                    self.longest_dtc_candidates.push(LongestDtcPosition {
-                        fen,
+                    let epd = shakmaty::fen::Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
+                    self.longest_dtc_win_candidates.push(LongestDtcPosition {
+                        epd,
                         ply,
-                        outcome: "win".to_string(),
                     });
                 }
             }
@@ -68,6 +81,16 @@ impl EgtFileStatsBuilder {
             self.unique_positions += 1;
             let ply = outcome.to_u16() >> 3;
             *self.histogram_loss.entry(ply).or_insert(0) += 1;
+            if ply == current_max_loss_dtc {
+                let global_idx = file.get_global_index(egt_idx, local_idx);
+                if let Some(pos) = file.index_to_position(global_idx, shakmaty::Color::White) {
+                    let epd = shakmaty::fen::Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
+                    self.longest_dtc_loss_candidates.push(LongestDtcPosition {
+                        epd,
+                        ply,
+                    });
+                }
+            }
         } else if outcome.is_draw() {
             self.draw += 1;
             self.unique_positions += 1;
@@ -77,12 +100,15 @@ impl EgtFileStatsBuilder {
     }
 
     fn build(mut self, bytes: u64, sha256: String) -> EgtFileStats {
-        let global_max = self.max_win_dtc;
-        self.longest_dtc_candidates.retain(|p| p.ply == global_max);
+        let global_max_win = self.max_win_dtc;
+        self.longest_dtc_win_candidates.retain(|p| p.ply == global_max_win);
+        let global_max_loss = self.max_loss_dtc;
+        self.longest_dtc_loss_candidates.retain(|p| p.ply == global_max_loss);
         EgtFileStats {
             endgame: self.endgame,
             bytes,
             sha256,
+            index_range: self.index_range,
             frame_size: self.frame_size,
             num_frames: self.num_frames,
             unique_positions: self.unique_positions,
@@ -92,7 +118,8 @@ impl EgtFileStatsBuilder {
             invalid_or_redundant: self.invalid_or_redundant,
             histogram_win: self.histogram_win,
             histogram_loss: self.histogram_loss,
-            longest_dtc: self.longest_dtc_candidates,
+            longest_dtc_win: self.longest_dtc_win_candidates,
+            longest_dtc_loss: self.longest_dtc_loss_candidates,
         }
     }
 }
@@ -551,6 +578,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
     let mut dep_cache = DependencyCache::new(base_path);
     let mut stats_builder_a = EgtFileStatsBuilder::new(
         solver.files[0].endgame.clone(),
+        solver.files[0].index_range,
         solver.files[0].frame_size,
         solver.files[0].num_frames(),
     );
@@ -559,6 +587,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
     } else {
         Some(EgtFileStatsBuilder::new(
             solver.files[1].endgame.clone(),
+            solver.files[1].index_range,
             solver.files[1].frame_size,
             solver.files[1].num_frames(),
         ))
@@ -581,7 +610,9 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
         }
 
         let mut current_max_win_dtc_a = 0;
+        let mut current_max_loss_dtc_a = 0;
         let mut current_max_win_dtc_b = 0;
+        let mut current_max_loss_dtc_b = 0;
 
         let mut plies = 1;
         while !queues_a.is_empty() || !queues_b.is_empty() {
@@ -707,6 +738,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             }
             if losses_found_a > 0 {
                 println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_a.name, losses_found_a, plies, queues_capacity_mb);
+                current_max_loss_dtc_a = current_max_loss_dtc_a.max(plies);
             }
             if wins_found_b > 0 {
                 println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, wins_found_b, plies, queues_capacity_mb);
@@ -714,6 +746,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             }
             if losses_found_b > 0 {
                 println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, losses_found_b, plies, queues_capacity_mb);
+                current_max_loss_dtc_b = current_max_loss_dtc_b.max(plies);
             }
 
 
@@ -723,8 +756,10 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
         }
 
         stats_builder_a.max_win_dtc = stats_builder_a.max_win_dtc.max(current_max_win_dtc_a);
+        stats_builder_a.max_loss_dtc = stats_builder_a.max_loss_dtc.max(current_max_loss_dtc_a);
         if let Some(ref mut builder_b) = stats_builder_b {
             builder_b.max_win_dtc = builder_b.max_win_dtc.max(current_max_win_dtc_b);
+            builder_b.max_loss_dtc = builder_b.max_loss_dtc.max(current_max_loss_dtc_b);
         }
 
         // Mark all remaining 'unknown' positions as draws
@@ -736,7 +771,14 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
                 outcome = MaybeDtcOutcome::DRAW;
                 solver.write_outcome(table_a, idx, outcome);
             }
-            stats_builder_a.record_outcome(outcome, idx, table_a.egt_idx, &mut solver.files[table_a.file_idx], current_max_win_dtc_a);
+            stats_builder_a.record_outcome(
+                outcome,
+                idx,
+                table_a.egt_idx,
+                &mut solver.files[table_a.file_idx],
+                current_max_win_dtc_a,
+                current_max_loss_dtc_a,
+            );
         }
 
         if table_a != table_b {
@@ -749,7 +791,14 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
                     solver.write_outcome(table_b, idx, outcome);
                 }
                 if let Some(ref mut builder_b) = stats_builder_b {
-                    builder_b.record_outcome(outcome, idx, table_b.egt_idx, &mut solver.files[table_b.file_idx], current_max_win_dtc_b);
+                    builder_b.record_outcome(
+                        outcome,
+                        idx,
+                        table_b.egt_idx,
+                        &mut solver.files[table_b.file_idx],
+                        current_max_win_dtc_b,
+                        current_max_loss_dtc_b,
+                    );
                 }
             }
         }

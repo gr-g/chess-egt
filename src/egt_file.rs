@@ -12,9 +12,8 @@ const DEFAULT_FRAME_SIZE: usize = 16384;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LongestDtcPosition {
-    pub fen: String,
+    pub epd: String,
     pub ply: u16,
-    pub outcome: String, // "win" or "loss"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +21,7 @@ pub struct EgtFileStats {
     pub endgame: String,
     pub bytes: u64,
     pub sha256: String,
+    pub index_range: usize,
     pub frame_size: usize,
     pub num_frames: usize,
     pub unique_positions: usize,
@@ -31,7 +31,8 @@ pub struct EgtFileStats {
     pub invalid_or_redundant: usize,
     pub histogram_win: BTreeMap<u16, usize>,
     pub histogram_loss: BTreeMap<u16, usize>,
-    pub longest_dtc: Vec<LongestDtcPosition>,
+    pub longest_dtc_win: Vec<LongestDtcPosition>,
+    pub longest_dtc_loss: Vec<LongestDtcPosition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
