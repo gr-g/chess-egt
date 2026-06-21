@@ -40,6 +40,31 @@ fn main() {
         };
     } else if cli.generate_all_3 {
         println!("Generating all 3-men tables...");
+        let endgames = EgtGenerator::list_n_pieces_endgames(3);
+        let g = EgtGenerator::new(&cli.path);
+        for endgame in endgames {
+            if let Err(_) = g.generate(&endgame) {
+                println!("Failed to generate endgame {}", endgame);
+            }
+        }
+    } else if cli.generate_all_4 {
+        println!("Generating all 4-men tables...");
+        let endgames = EgtGenerator::list_n_pieces_endgames(4);
+        let g = EgtGenerator::new(&cli.path);
+        for endgame in endgames {
+            if let Err(_) = g.generate(&endgame) {
+                println!("Failed to generate endgame {}", endgame);
+            }
+        }
+    } else if cli.generate_all_5 {
+        println!("Generating all 5-men tables...");
+        let endgames = EgtGenerator::list_n_pieces_endgames(5);
+        let g = EgtGenerator::new(&cli.path);
+        for endgame in endgames {
+            if let Err(_) = g.generate(&endgame) {
+                println!("Failed to generate endgame {}", endgame);
+            }
+        }
     } else if let Some(fen) = cli.position {
         let fen_obj: Fen = fen.parse().expect("Invalid FEN");
         let position = fen_obj.into_position(CastlingMode::Standard).expect("Invalid position");

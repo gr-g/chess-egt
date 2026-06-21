@@ -7,7 +7,6 @@
 TODO:
 - Add EgtFileStats as return value for generate(). Serialize to JSON similar to https://syzygy-tables.info/stats/KRRvKQ.json (but simplified).
   - bytes, sha256, frame_size, num_frames, total win/draw/loss, histogram win/loss, positions with longest dtc.
-- Cli argument to generate all 3-4-5. Add function EgtGenerator::list_n_pieces_endgames(n: uize);
 - Print queue memory usage
 - Keep track of number of uncompressed frames in EgtFile.
 - Add tests with real statistics from other tablebases.

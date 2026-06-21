@@ -62,6 +62,65 @@ impl EgtGenerator {
         self.assigned_memory = Some(n);
     }
 
+    pub fn list_n_pieces_endgames(n: usize) -> Vec<String> {
+        assert!(n <= 8, "list_n_pieces_endgames() called with n > 8");
+        if n < 2 {
+            return Vec::new();
+        }
+        let mut endgames = Vec::new();
+        let num_non_kings = n - 2;
+
+        // Helper to generate all combinations of non-king pieces of size k
+        fn get_piece_combinations(k: usize) -> Vec<String> {
+            let mut results = Vec::new();
+            let mut current = String::new();
+            let roles = ['Q', 'R', 'B', 'N', 'P'];
+            fn recurse(k: usize, start_idx: usize, current: &mut String, results: &mut Vec<String>, roles: &[char]) {
+                if current.len() == k {
+                    results.push(current.clone());
+                    return;
+                }
+                for idx in start_idx..roles.len() {
+                    current.push(roles[idx]);
+                    recurse(k, idx, current, results, roles);
+                    current.pop();
+                }
+            }
+            recurse(k, 0, &mut current, &mut results, &roles);
+            results
+        }
+
+        // Distribute num_non_kings between side_a and side_b
+        for a in 0..=num_non_kings {
+            let b = num_non_kings - a;
+            let combos_a = get_piece_combinations(a);
+            let combos_b = get_piece_combinations(b);
+
+            for pieces_a in &combos_a {
+                for pieces_b in &combos_b {
+                    let side_a = format!("K{}", pieces_a);
+                    let side_b = format!("K{}", pieces_b);
+
+                    // Keep only one-sided endgames: side_a >= side_b
+                    if side_a >= side_b {
+                        endgames.push(format!("{}_{}", side_a, side_b));
+                    }
+                }
+            }
+        }
+
+        // Sort by:
+        // 1. Number of pawns (ascending)
+        // 2. Lexicographical order of the endgame string
+        endgames.sort_by(|a, b| {
+            let pawns_a = a.chars().filter(|&c| c == 'P').count();
+            let pawns_b = b.chars().filter(|&c| c == 'P').count();
+            pawns_a.cmp(&pawns_b).then_with(|| a.cmp(b))
+        });
+
+        endgames
+    }
+
     pub fn generate(&self, endgame: &str) -> Result<(), ()> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
@@ -361,5 +420,29 @@ mod tests {
 
         let mut prober = EgtProber::new(&temp_dir);
         prober.verify_internal_consistency("KR_K").unwrap();
+    }
+
+    #[test]
+    fn test_list_n_pieces_endgames() {
+        let all_three = EgtGenerator::list_n_pieces_endgames(3);
+        assert_eq!(all_three, vec![
+            "KB_K".to_string(),
+            "KN_K".to_string(),
+            "KQ_K".to_string(),
+            "KR_K".to_string(),
+            "KP_K".to_string(),
+        ]);
+
+        let all_two = EgtGenerator::list_n_pieces_endgames(2);
+        assert_eq!(two_men, vec!["K_K".to_string()]);
+
+        let all_four = EgtGenerator::list_n_pieces_endgames(4);
+        // Ensure pawnless endgames are first, then 1 pawn, then 2 pawns
+        let mut max_pawns = 0;
+        for eg in all_four {
+            let pawns = eg.chars().filter(|&c| c == 'P').count();
+            assert!(pawns >= max_pawns, "Endgame {} with {} pawns came after an endgame with more pawns", eg, pawns);
+            max_pawns = pawns;
+        }
     }
 }

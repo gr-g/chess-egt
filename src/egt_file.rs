@@ -330,6 +330,9 @@ impl EgtFile {
         use std::fs::File;
         use std::io::BufWriter;
         use zeekstd::Encoder;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| ())?;
+        }
         let file = File::create(&self.path).map_err(|_| ())?;
         let writer = BufWriter::new(file);
         let mut encoder = Encoder::new(writer).map_err(|_| ())?;
