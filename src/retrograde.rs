@@ -234,7 +234,7 @@ impl DependencyCache {
         }
     }
 
-    pub fn get_or_load(&mut self, endgame: &str) -> &mut EgtFile {
+    pub fn get_or_load(&mut self, endgame: &str) -> Result<&mut EgtFile, ()> {
         if !self.cache.contains_key(endgame) {
             let file_from_disk = EgtFile::new_from_file(&self.base_path, endgame);
             let file = if file_from_disk.is_ok() {
@@ -242,12 +242,12 @@ impl DependencyCache {
             } else {
                 println!("Dependency endgame {} not found. Generating on the fly...", endgame);
                 let g = EgtGenerator::new(&self.base_path);
-                g.generate(endgame);
-                EgtFile::new_from_file(&self.base_path, endgame).unwrap()
+                g.generate(endgame)?;
+                EgtFile::new_from_file(&self.base_path, endgame)?
             };
             self.cache.insert(endgame.to_string(), file);
         }
-        self.cache.get_mut(endgame).unwrap()
+        Ok(self.cache.get_mut(endgame).unwrap())
     }
 }
 
@@ -258,7 +258,7 @@ fn initialize_table(
     dep_cache: &mut DependencyCache,
     table_queues: &mut DepthQueues,
     twin_queues: &mut DepthQueues,
-) -> (usize, usize, usize) {
+) -> Result<(usize, usize, usize), ()> {
     let (size, pawnless) = {
         let egt = &solver.files[table.file_idx].egts[table.egt_idx];
         (egt.index_range(), egt.is_pawnless())
@@ -322,7 +322,7 @@ fn initialize_table(
                     let dep_endgame = crate::get_endgame(&successor_position);
 
                     // Probe the dependency table
-                    let dep_outcome = dep_cache.get_or_load(&dep_endgame).probe(&successor_position).unwrap();
+                    let dep_outcome = dep_cache.get_or_load(&dep_endgame)?.probe(&successor_position)?;
 
                     let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
                     if dep_outcome.is_loss() {
@@ -339,7 +339,7 @@ fn initialize_table(
         }
     }
 
-    (checkmate_count, stalemate_count, unknown_count)
+    Ok((checkmate_count, stalemate_count, unknown_count))
 }
 
 fn propagate_loss_to_win(
@@ -391,18 +391,18 @@ fn propagate_win_to_loss(
     }
 }
 
-pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> (EgtFile, Option<EgtFile>) {
+pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result<(EgtFile, Option<EgtFile>), ()> {
     let parts: Vec<&str> = endgame.split('_').collect();
     assert_eq!(parts.len(), 2);
     let twin_endgame = format!("{}_{}", parts[1], parts[0]);
 
     let is_symmetric = endgame == twin_endgame;
 
-    let file_a = EgtFile::new(&base_path.to_path_buf(), endgame).unwrap();
+    let file_a = EgtFile::new(&base_path.to_path_buf(), endgame)?;
     let file_b = if is_symmetric {
         None
     } else {
-        Some(EgtFile::new(&base_path.to_path_buf(), &twin_endgame).unwrap())
+        Some(EgtFile::new(&base_path.to_path_buf(), &twin_endgame)?)
     };
 
     let mut solver = RetrogradeSolver::new(file_a, file_b);
@@ -453,12 +453,12 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> (EgtFi
         let mut queues_b = DepthQueues::new();
 
         let (checkmates, stalemates, _) =
-            initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b);
+            initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_a.name, checkmates, stalemates);
 
         if table_a != table_b {
             let (checkmates, stalemates, _) =
-                initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a);
+                initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a)?;
                 println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
         } else {
             queues_a.merge(&mut queues_b);
@@ -624,7 +624,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> (EgtFi
     let file_a = files.remove(0);
     let file_b = if is_symmetric { None } else { Some(files.remove(0)) };
 
-    (file_a, file_b)
+    Ok((file_a, file_b))
 }
 
 #[cfg(test)]
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_k_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "K_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "K_K").unwrap();
 
         assert!(file_b.is_none());
         assert_eq!(file_a.index_range, 462);
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_kq_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KQ_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KQ_K").unwrap();
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_kr_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KR_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KR_K").unwrap();
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_kb_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KB_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KB_K").unwrap();
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_kn_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KN_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KN_K").unwrap();
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn test_kp_k_table_generation() {
-        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KP_K");
+        let (mut file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), "KP_K").unwrap();
 
         assert!(file_b.is_some());
         let mut file_b = file_b.unwrap();

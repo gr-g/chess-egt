@@ -12,6 +12,9 @@ struct Cli {
     path: PathBuf,
 
     #[arg(long)]
+    memory: Option<String>,
+
+    #[arg(long)]
     generate: Option<String>,
 
     #[arg(long)]
@@ -29,9 +32,12 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(table) = cli.generate {
+    if let Some(endgame) = cli.generate {
         let g = EgtGenerator::new(&cli.path);
-        g.generate(&table);
+        match g.generate(&endgame) {
+            Err(_) => println!("Failed to generate endgame"),
+            _ => {},
+        };
     } else if cli.generate_all_3 {
         println!("Generating all 3-men tables...");
     } else if let Some(fen) = cli.position {

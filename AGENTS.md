@@ -5,7 +5,6 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- generate() returns Result
 - Add EgtFileStats as return value for generate(). Serialize to JSON similar to https://syzygy-tables.info/stats/KRRvKQ.json (but simplified).
   - bytes, sha256, frame_size, num_frames, total win/draw/loss, histogram win/loss, positions with longest dtc.
 - Cli argument to generate all 3-4-5. Add function EgtGenerator::list_n_pieces_endgames(n: uize);

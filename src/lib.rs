@@ -62,7 +62,7 @@ impl EgtGenerator {
         self.assigned_memory = Some(n);
     }
 
-    pub fn generate(&self, endgame: &str) {
+    pub fn generate(&self, endgame: &str) -> Result<(), ()> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
 
@@ -72,7 +72,7 @@ impl EgtGenerator {
         //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame);
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame)?;
 
         // Save to file
         let bytes_a = file_a.save_to_file().expect("Failed to flush EgtFile A");
@@ -85,10 +85,11 @@ impl EgtGenerator {
 
         // Check internal consistency
         let mut prober = EgtProber::new(&self.base_path);
-        prober.verify_internal_consistency(&file_a.endgame).expect("Failed internal consistency check!");
+        prober.verify_internal_consistency(&file_a.endgame)?;
         if let Some(ref mut fb) = file_b {
-            prober.verify_internal_consistency(&fb.endgame).expect("Failed internal consistency check!");
+            prober.verify_internal_consistency(&fb.endgame)?;
         }
+        Ok(())
     }
 }
 
@@ -339,7 +340,7 @@ mod tests {
     #[test]
     fn test_verify_internal_consistency_k_k() {
         let temp_dir = std::env::temp_dir();
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "K_K");
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "K_K").unwrap();
         file_a.save_to_file().unwrap();
         if let Some(ref mut fb) = file_b {
             fb.save_to_file().unwrap();
@@ -352,7 +353,7 @@ mod tests {
     #[test]
     fn test_verify_internal_consistency_kr_k() {
         let temp_dir = std::env::temp_dir();
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "KR_K");
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "KR_K").unwrap();
         file_a.save_to_file().unwrap();
         if let Some(ref mut fb) = file_b {
             fb.save_to_file().unwrap();
