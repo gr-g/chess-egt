@@ -6,6 +6,7 @@
 
 TODO:
 - Error management.
+- Cli options --generate-deps, --verify, --input-path. Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungraun/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
@@ -20,6 +21,7 @@ TODO:
 - Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames (somewhat linear instead of random). One single queue instead of 6?
 - Make solver read-only, remove name from EgtHandle.
 - Experiment with approach using capture/promotion unmoves for initialization.
+- Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers.
 
 # Design Specifications
 

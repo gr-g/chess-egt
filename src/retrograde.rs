@@ -162,6 +162,24 @@ impl DepthQueues {
             && self.loss_promotion.is_empty()
     }
 
+    fn clear(&mut self) {
+        self.win_checkmate.clear();
+        self.win_capture.clear();
+        self.win_promotion.clear();
+        self.loss_checkmate.clear();
+        self.loss_capture.clear();
+        self.loss_promotion.clear();
+    }
+
+    //fn sort(&mut self) {
+    //    self.win_checkmate.sort_unstable();
+    //    self.win_capture.sort_unstable();
+    //    self.win_promotion.sort_unstable();
+    //    self.loss_checkmate.sort_unstable();
+    //    self.loss_capture.sort_unstable();
+    //    self.loss_promotion.sort_unstable();
+    //}
+
     fn push_win(&mut self, idx: usize, ct: ConversionType) {
         match ct {
             ConversionType::Checkmate => self.win_checkmate.push(idx),
@@ -596,6 +614,8 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
     for (table_a, table_b) in &table_pairs {
         let mut queues_a = DepthQueues::new();
         let mut queues_b = DepthQueues::new();
+        let mut next_queues_a = DepthQueues::new();
+        let mut next_queues_b = DepthQueues::new();
 
         let (checkmates, stalemates, _) =
             initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b)?;
@@ -616,9 +636,6 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
 
         let mut plies = 1;
         while !queues_a.is_empty() || !queues_b.is_empty() {
-            let mut next_queues_a = DepthQueues::new();
-            let mut next_queues_b = DepthQueues::new();
-
             let mut wins_found_a = 0;
             let mut losses_found_a = 0;
             let mut wins_found_b = 0;
@@ -750,8 +767,16 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
             }
 
 
-            queues_a = next_queues_a;
-            queues_b = next_queues_b;
+            queues_a.clear();
+            queues_b.clear();
+
+            // Sort the queues to update the indexes in a more linear order in memory,
+            // compared to random access. Does it help?
+            //next_queues_a.sort();
+            //next_queues_b.sort();
+
+            std::mem::swap(&mut queues_a, &mut next_queues_a);
+            std::mem::swap(&mut queues_b, &mut next_queues_b);
             plies += 1;
         }
 
