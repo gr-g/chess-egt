@@ -1,13 +1,13 @@
 # AGENTS.md
 
 - The goal of the project is to produce chess endgame tablebases (EGTs).
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is only a stub of memory management (LRU-eviction of frames from memory), not implemented yet. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. The exact library interface to expose and the command line interface are still to be defined.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is only a stub of memory management (LRU-eviction of frames from memory), not implemented yet. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Error management.
 - Cli options --generate-deps, --verify, --input-path. Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
+- Clippy
 - Profiling with gungraun/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
@@ -21,7 +21,7 @@ TODO:
 - Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames (somewhat linear instead of random). One single queue instead of 6?
 - Make solver read-only, remove name from EgtHandle.
 - Experiment with approach using capture/promotion unmoves for initialization.
-- Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers.
+- Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
 
 # Design Specifications
 

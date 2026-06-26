@@ -1,5 +1,5 @@
 use clap::Parser;
-use chess_egt::{DtcOutcome, ConversionType, EgtGenerator, EgtProber};
+use chess_egt::{DtcOutcome, ConversionType, EgtGenerator, EgtProber, EgtError};
 use shakmaty::{CastlingMode, Position};
 use shakmaty::fen::Fen;
 use std::path::PathBuf;
@@ -30,14 +30,18 @@ struct Cli {
 }
 
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), EgtError> {
     let cli = Cli::parse();
 
     if let Some(endgame) = cli.generate {
         let g = EgtGenerator::new(&cli.path);
-        match g.generate(&endgame) {
-            Err(_) => println!("Failed to generate endgame"),
-            _ => {},
-        };
+        g.generate(&endgame)?;
     } else if cli.generate_all_3 {
         generate_all(3, &cli.path);
     } else if cli.generate_all_4 {
@@ -45,10 +49,11 @@ fn main() {
     } else if cli.generate_all_5 {
         generate_all(5, &cli.path);
     } else if let Some(fen) = cli.position {
-        let fen_obj: Fen = fen.parse().expect("Invalid FEN");
-        let position = fen_obj.into_position(CastlingMode::Standard).expect("Invalid position");
+        let fen_obj: Fen = fen.parse().map_err(|e| EgtError::InvalidPosition(format!("invalid FEN: {e:?}")))?;
+        let position = fen_obj.into_position(CastlingMode::Standard)
+            .map_err(|e| EgtError::InvalidPosition(format!("invalid position: {e:?}")))?;
         let mut prober = EgtProber::new(&cli.path);
-        let outcome = prober.probe(&position).expect("Failed to query position");
+        let outcome = prober.probe(&position)?;
 
         let message = match outcome {
             DtcOutcome::Win(ct, n) => {
@@ -89,11 +94,18 @@ fn main() {
     } else {
         println!("No action specified. Use --help for options.");
     }
+    Ok(())
 }
 
 fn generate_all(n: usize, path: &std::path::Path) {
     println!("Generating all {}-pieces tables...", n);
-    let endgames = EgtGenerator::list_n_pieces_endgames(n);
+    let endgames = match EgtGenerator::list_n_pieces_endgames(n) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("Failed to list {}-pieces endgames: {}", n, e);
+            return;
+        }
+    };
     let g = EgtGenerator::new(path);
     let start_all = std::time::Instant::now();
     let mut unique_positions = 0;
@@ -123,8 +135,8 @@ fn generate_all(n: usize, path: &std::path::Path) {
                     process_stats(stats_b);
                 }
             }
-            Err(_) => {
-                println!("Failed to generate endgame {}", endgame);
+            Err(e) => {
+                println!("Failed to generate endgame {}: {}", endgame, e);
             }
         }
     }

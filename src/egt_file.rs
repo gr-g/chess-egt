@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
+use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
 use serde::{Serialize, Deserialize};
 
@@ -66,15 +67,6 @@ impl MaybeDtcOutcome {
         self.0 >> 3
     }
 
-    pub fn conversion_type(&self) -> ConversionType {
-        match self.0 & 0b110 {
-            0b010 => ConversionType::Checkmate,
-            0b100 => ConversionType::Capture,
-            0b110 => ConversionType::Promotion,
-            _ => panic!()
-        }
-    }
-
     pub fn is_draw(&self) -> bool {
         self.0 == 0b001
     }
@@ -115,11 +107,9 @@ impl MaybeDtcOutcome {
         Self(counter << 3)
     }
 
-    pub fn to_outcome(self) -> Result<DtcOutcome, ()> {
+    pub fn to_outcome_at(self, index: usize) -> EgtResult<DtcOutcome> {
         let n = self.0 >> 3;
         match self.0 & 0b111 {
-            0b000 if n == 0 => Err(()),
-            0b000 if n != 0 => Err(()),
             0b001 => Ok(DtcOutcome::Draw),
             0b010 => Ok(DtcOutcome::Win(ConversionType::Checkmate, n)),
             0b100 => Ok(DtcOutcome::Win(ConversionType::Capture, n)),
@@ -127,7 +117,7 @@ impl MaybeDtcOutcome {
             0b011 => Ok(DtcOutcome::Loss(ConversionType::Checkmate, n)),
             0b101 => Ok(DtcOutcome::Loss(ConversionType::Capture, n)),
             0b111 => Ok(DtcOutcome::Loss(ConversionType::Promotion, n)),
-            _ => unreachable!(),
+            _ => Err(EgtError::CorruptedOutcome { value: self.0, index }),
         }
     }
 }
@@ -249,7 +239,7 @@ impl EgtFile {
     /// Creates a new EgtFile for a given piece configuration and path.
     ///
     /// The file starts with no memory allocated.
-    pub fn new(base_path: &PathBuf, endgame: &str) -> Result<Self, ()> {
+    pub fn new(base_path: &PathBuf, endgame: &str) -> EgtResult<Self> {
         let path = base_path.join(format!("{}.ggegt", endgame));
 
         let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name(endgame)?;
@@ -305,11 +295,10 @@ impl EgtFile {
     /// Creates an EgtFile representing an existing file.
     ///
     /// The file starts with no memory allocated. Data is read from the file on demand.
-    pub fn new_from_file(base_path: &PathBuf, endgame: &str) -> Result<Self, ()> {
+    pub fn new_from_file(base_path: &PathBuf, endgame: &str) -> EgtResult<Self> {
         let mut egt_file = Self::new(base_path, endgame)?;
-        let exists = std::fs::exists(&egt_file.path);
-        if exists.is_err() || !exists.unwrap() {
-            return Err(());
+        if !std::fs::exists(&egt_file.path)? {
+            return Err(EgtError::FileNotFound(egt_file.path));
         }
 
         for f in 0..egt_file.frames.len() {
@@ -324,23 +313,23 @@ impl EgtFile {
     }
 
     /// Probes the outcome of a specific position.
-    pub fn probe(&mut self, position: &Chess) -> Result<MaybeDtcOutcome, ()> {
+    pub fn probe(&mut self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
         let index = self.map_position_to_index(position)?;
         self.read_from_index(index)
     }
 
     /// Save the entire EgtFile using seekable Zstd compression.
     /// Leaves the data in a compressed state in memory afterwards.
-    pub fn save_to_file(&mut self) -> Result<u64, ()> {
+    pub fn save_to_file(&mut self) -> EgtResult<u64> {
         use std::fs::File;
         use std::io::BufWriter;
         use zeekstd::Encoder;
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| ())?;
+            std::fs::create_dir_all(parent)?;
         }
-        let file = File::create(&self.path).map_err(|_| ())?;
+        let file = File::create(&self.path)?;
         let writer = BufWriter::new(file);
-        let mut encoder = Encoder::new(writer).map_err(|_| ())?;
+        let mut encoder = Encoder::new(writer)?;
 
         // TODO: this does the encoding in one go with the uncompressed data,
         // but in principle we could reuse the compressed frames.
@@ -352,34 +341,34 @@ impl EgtFile {
                 let transposed = transpose_frame(&uncompressed);
 
                 // Compress the transposed frame
-                encoder.compress(&transposed).map_err(|_| ())?;
-                encoder.end_frame().map_err(|_| ())?;
+                encoder.compress(&transposed)?;
+                encoder.end_frame()?;
 
                 // Drop the uncompressed data from memory
                 self.ensure_compressed(frame_idx)?;
             } else {
-                unreachable!();
+                return Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"));
             }
         }
 
         // Finish the seekable Zstd file (writes the seek table)
-        encoder.finish().map_err(|_| ())
+        Ok(encoder.finish()?)
     }
 
     /// Get uncompressed data for the frame at `frame_index`.
-    fn get_frame_data(&mut self, frame_idx: usize) -> Result<&mut [MaybeDtcOutcome], ()> {
+    fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&mut [MaybeDtcOutcome]> {
         self.ensure_uncompressed(frame_idx)?;
 
         if let FrameState::Uncompressed { uncompressed, .. } = &mut self.frames[frame_idx] {
             Ok(uncompressed)
         } else {
-            unreachable!();
+            Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"))
         }
     }
 
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
-    pub fn map_position_to_index(&mut self, position: &Chess) -> Result<usize, ()> {
+    pub fn map_position_to_index(&mut self, position: &Chess) -> EgtResult<usize> {
         let stm_color = position.turn();
         let sntm_color = !stm_color;
 
@@ -399,17 +388,17 @@ impl EgtFile {
         } else {
             let stm_ref = reflect_files(&stm_files);
             let sntm_ref = reflect_files(&sntm_files);
-            let mirrored = mirror_horizontally(position);
+            let mirrored = mirror_horizontally(position)?;
             (stm_ref, sntm_ref, mirrored)
         };
 
         let key = PawnKey::new(&target_stm_files, &target_sntm_files);
-        let &egt_idx = self.egt_map.get(&key).ok_or(())?;
+        let &egt_idx = self.egt_map.get(&key).ok_or(EgtError::PositionNotInTable { table: self.endgame.clone() })?;
         let local_index = self.egts[egt_idx].position_to_index(&target_position);
 
         let global_index = self.get_global_index(egt_idx, local_index);
         if global_index >= self.index_range {
-            return Err(());
+            return Err(EgtError::IndexOutOfRange { index: global_index, range: self.index_range });
         }
 
         Ok(global_index)
@@ -443,9 +432,9 @@ impl EgtFile {
     }
 
     /// Reads an outcome directly by its global index.
-    pub fn read_from_index(&mut self, index: usize) -> Result<MaybeDtcOutcome, ()> {
+    pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
         if index >= self.index_range {
-            return Err(());
+            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
         }
 
         let frame_idx = index / self.frame_size;
@@ -456,9 +445,9 @@ impl EgtFile {
     }
 
     /// Writes an outcome directly by its global index.
-    pub fn write_to_index(&mut self, index: usize, outcome: MaybeDtcOutcome) -> Result<(), ()> {
+    pub fn write_to_index(&mut self, index: usize, outcome: MaybeDtcOutcome) -> EgtResult<()> {
         if index >= self.index_range {
-            return Err(());
+            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
         }
 
         let frame_idx = index / self.frame_size;
@@ -471,13 +460,13 @@ impl EgtFile {
             *dirty = true;
             Ok(())
         } else {
-            unreachable!();
+            Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"))
         }
     }
 
     /// Ensures that the frame at `frame_idx` is in the `Uncompressed` state.
     /// Allocates memory and decompresses if necessary.
-    fn ensure_uncompressed(&mut self, frame_idx: usize) -> Result<(), ()> {
+    fn ensure_uncompressed(&mut self, frame_idx: usize) -> EgtResult<()> {
         match &self.frames[frame_idx] {
             FrameState::Empty => {
                 // TODO: Allocate memory from arena
@@ -492,13 +481,19 @@ impl EgtFile {
             },
             FrameState::CompressedOnFile => {
                 // Load compressed data from file
-                let file = std::fs::File::open(&self.path).map_err(|_| ())?;
-                let mut decoder = zeekstd::Decoder::new(file).map_err(|_| ())?;
+                let file = std::fs::File::open(&self.path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        EgtError::FileNotFound(self.path.clone())
+                    } else {
+                        EgtError::Io(e)
+                    }
+                })?;
+                let mut decoder = zeekstd::Decoder::new(file)?;
                 let mut transposed = vec![0u8; self.frame_size * 2];
 
                 let uncompressed_offset = (frame_idx * self.frame_size * 2) as u64;
-                decoder.seek(SeekFrom::Start(uncompressed_offset)).map_err(|_| ())?;
-                decoder.read_exact(&mut transposed).map_err(|_| ())?;
+                decoder.seek(SeekFrom::Start(uncompressed_offset))?;
+                decoder.read_exact(&mut transposed)?;
 
                 // Detranspose the frame
                 // TODO: allocate memory from arena
@@ -519,8 +514,8 @@ impl EgtFile {
                 use zeekstd::{BytesWrapper, Decoder};
 
                 let wrapper = BytesWrapper::new(compressed_bytes);
-                let mut decoder = Decoder::new(wrapper).map_err(|_| ())?;
-                decoder.read_exact(&mut transposed).map_err(|_| ())?;
+                let mut decoder = Decoder::new(wrapper)?;
+                decoder.read_exact(&mut transposed)?;
 
                 // Detranspose the frame
                 let uncompressed = detranspose_frame(&transposed, self.frame_size);
@@ -541,7 +536,7 @@ impl EgtFile {
     }
 
     /// Ensures that the frame at `frame_idx` is in the `Compressed` state.
-    fn ensure_compressed(&mut self, frame_idx: usize) -> Result<(), ()> {
+    fn ensure_compressed(&mut self, frame_idx: usize) -> EgtResult<()> {
         match &self.frames[frame_idx] {
             FrameState::Empty | FrameState::CompressedOnFile => {
                 self.ensure_uncompressed(frame_idx)?;
@@ -565,15 +560,15 @@ impl EgtFile {
                     use zeekstd::Encoder;
 
                     let mut compressed_bytes = vec![];
-                    let mut encoder = Encoder::new(&mut compressed_bytes).map_err(|_| ())?;
+                    let mut encoder = Encoder::new(&mut compressed_bytes)?;
 
                     // Transpose (bit-slice) the frame
                     let transposed = transpose_frame(&uncompressed);
 
                     // Compress the transposed frame
-                    encoder.compress(&transposed).map_err(|_| ())?;
-                    encoder.end_frame().map_err(|_| ())?;
-                    encoder.finish().map_err(|_| ())?;
+                    encoder.compress(&transposed)?;
+                    encoder.end_frame()?;
+                    encoder.finish()?;
 
                     self.frames[frame_idx] = FrameState::Compressed(compressed_bytes);
                 }
@@ -697,8 +692,11 @@ pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<MaybeDtcOu
 /// - Number of pawns for SideToMove
 /// - Number of pawns for SideNotToMove
 /// - List of non-pawn pieces
-fn parse_endgame_name(endgame: &str) -> Result<(usize, usize, Vec<(EgtRole, EgtSide, usize)>), ()> {
-    let (stm, sntm) = endgame.split_once('_').ok_or(())?;
+fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<(EgtRole, EgtSide, usize)>)> {
+    let (stm, sntm) = endgame.split_once('_').ok_or(EgtError::InvalidEndgameName {
+        name: endgame.to_string(),
+        reason: "missing '_' separator",
+    })?;
     let mut stm_pawns = 0;
     let mut sntm_pawns = 0;
     let mut other_pieces = Vec::new();
@@ -716,11 +714,17 @@ fn parse_endgame_name(endgame: &str) -> Result<(usize, usize, Vec<(EgtRole, EgtS
                 'R' => count[EgtRole::Rook.to_index()] += 1,
                 'B' => count[EgtRole::Bishop.to_index()] += 1,
                 'N' => count[EgtRole::Knight.to_index()] += 1,
-                _ => return Err(()),
+                _ => return Err(EgtError::InvalidEndgameName {
+                    name: endgame.to_string(),
+                    reason: "invalid piece character",
+                }),
             }
         }
         if count[EgtRole::King.to_index()] != 1 {
-            return Err(());
+            return Err(EgtError::InvalidEndgameName {
+                name: endgame.to_string(),
+                reason: "each side must have exactly one king",
+            });
         }
         for piece in crate::piece_set::ALL_EGT_ROLES {
             if !piece.is_pawn() {
@@ -809,11 +813,13 @@ fn build_pieces(
 }
 
 /// Mirrors a chess position horizontally.
-pub fn mirror_horizontally(position: &Chess) -> Chess {
+pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
     let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
     setup.board.flip_horizontal();
     setup.ep_square = setup.ep_square.map(|sq| sq.flip_horizontal());
-    setup.position(CastlingMode::Standard).unwrap()
+    setup
+        .position(CastlingMode::Standard)
+        .map_err(|e| EgtError::InvalidPosition(format!("mirrored position is invalid: {:?}", e)))
 }
 
 #[cfg(test)]
@@ -878,8 +884,8 @@ mod tests {
         let position = fen.into_position(CastlingMode::Standard).unwrap();
 
         // Probing should succeed (returns Invalid because the frame is initialized to 0/invalid)
-        let outcome = egt_file.probe(&position);
-        assert_eq!(outcome, Ok(MaybeDtcOutcome::INVALID));
+        let outcome = egt_file.probe(&position).unwrap();
+        assert_eq!(outcome, MaybeDtcOutcome::INVALID);
 
         // Write an outcome
         let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
@@ -887,8 +893,8 @@ mod tests {
         egt_file.write_to_index(idx, expected_outcome).unwrap();
 
         // Probe again
-        let outcome = egt_file.probe(&position);
-        assert_eq!(outcome, Ok(expected_outcome));
+        let outcome = egt_file.probe(&position).unwrap();
+        assert_eq!(outcome, expected_outcome);
     }
 
     #[test]
@@ -910,8 +916,8 @@ mod tests {
         egt_file.write_to_index(idx_canonical, expected_outcome).unwrap();
 
         // Probing the mirrored position should return the same outcome because it gets canonicalized/mirrored
-        let outcome = egt_file.probe(&position_mirrored);
-        assert_eq!(outcome, Ok(expected_outcome));
+        let outcome = egt_file.probe(&position_mirrored).unwrap();
+        assert_eq!(outcome, expected_outcome);
     }
 
     fn run_round_trip_test(endgame: &str, stride: usize) {
@@ -970,7 +976,7 @@ mod tests {
         let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
         let idx = egt_file.map_position_to_index(&position).unwrap();
         egt_file.write_to_index(idx, outcome).unwrap();
-        assert_eq!(egt_file.probe(&position), Ok(outcome));
+        assert_eq!(egt_file.probe(&position).unwrap(), outcome);
 
         // Save to file
         egt_file.save_to_file().unwrap();
@@ -983,8 +989,8 @@ mod tests {
 
         // Probe again (triggers on-demand decompression from file)
         let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();
-        let loaded_outcome = another_egt_file.probe(&position);
-        assert_eq!(loaded_outcome, Ok(outcome));
+        let loaded_outcome = another_egt_file.probe(&position).unwrap();
+        assert_eq!(loaded_outcome, outcome);
 
         // Clean up
         let _ = std::fs::remove_file(&egt_file.path);
@@ -1001,7 +1007,7 @@ mod tests {
         let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
         let idx = egt_file.map_position_to_index(&position).unwrap();
         egt_file.write_to_index(idx, outcome).unwrap();
-        assert_eq!(egt_file.probe(&position), Ok(outcome));
+        assert_eq!(egt_file.probe(&position).unwrap(), outcome);
 
         for f in 0..egt_file.frames.len() {
             egt_file.ensure_compressed(f).unwrap();
@@ -1012,8 +1018,8 @@ mod tests {
         }
 
         // Probe again (triggers decompression from memory)
-        let loaded_outcome = egt_file.probe(&position);
-        assert_eq!(loaded_outcome, Ok(outcome));
+        let loaded_outcome = egt_file.probe(&position).unwrap();
+        assert_eq!(loaded_outcome, outcome);
 
         // Clean up
         let _ = std::fs::remove_file(&path);

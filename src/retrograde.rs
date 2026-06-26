@@ -2,6 +2,7 @@ use shakmaty::{Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
+use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
 use std::collections::{HashMap, BTreeMap};
 
@@ -171,14 +172,14 @@ impl DepthQueues {
         self.loss_promotion.clear();
     }
 
-    //fn sort(&mut self) {
-    //    self.win_checkmate.sort_unstable();
-    //    self.win_capture.sort_unstable();
-    //    self.win_promotion.sort_unstable();
-    //    self.loss_checkmate.sort_unstable();
-    //    self.loss_capture.sort_unstable();
-    //    self.loss_promotion.sort_unstable();
-    //}
+    fn sort(&mut self) {
+        self.win_checkmate.sort_unstable();
+        self.win_capture.sort_unstable();
+        self.win_promotion.sort_unstable();
+        self.loss_checkmate.sort_unstable();
+        self.loss_capture.sort_unstable();
+        self.loss_promotion.sort_unstable();
+    }
 
     fn push_win(&mut self, idx: usize, ct: ConversionType) {
         match ct {
@@ -302,7 +303,8 @@ pub fn quiet_unmoves<F>(
         .with_castling_mode(CastlingRetrogradeMode::NoCastling)
         .quiet_unmoves(|mut pred_position, _m| {
             if mirrored {
-                pred_position = mirror_horizontally(&pred_position);
+                pred_position = mirror_horizontally(&pred_position)
+                    .expect("mirrored predecessor position must be legal");
             }
 
             let pred_idx = {
@@ -380,20 +382,24 @@ impl DependencyCache {
         }
     }
 
-    pub fn get_or_load(&mut self, endgame: &str) -> Result<&mut EgtFile, ()> {
+    pub fn get_or_load(&mut self, endgame: &str) -> EgtResult<&mut EgtFile> {
         if !self.cache.contains_key(endgame) {
-            let file_from_disk = EgtFile::new_from_file(&self.base_path, endgame);
-            let file = if file_from_disk.is_ok() {
-                file_from_disk.unwrap()
-            } else {
-                println!("Dependency endgame {} not found. Generating on the fly...", endgame);
-                let g = EgtGenerator::new(&self.base_path);
-                g.generate(endgame)?;
-                EgtFile::new_from_file(&self.base_path, endgame)?
+            let file = match EgtFile::new_from_file(&self.base_path, endgame) {
+                Ok(f) => f,
+                Err(EgtError::FileNotFound(_)) => {
+                    println!("Dependency endgame {} not found. Generating on the fly...", endgame);
+                    let g = EgtGenerator::new(&self.base_path);
+                    g.generate(endgame).map_err(|source| EgtError::DependencyUnavailable {
+                        dependency: endgame.to_string(),
+                        source: Box::new(source),
+                    })?;
+                    EgtFile::new_from_file(&self.base_path, endgame)?
+                }
+                Err(e) => return Err(e),
             };
             self.cache.insert(endgame.to_string(), file);
         }
-        Ok(self.cache.get_mut(endgame).unwrap())
+        self.cache.get_mut(endgame).ok_or(EgtError::Internal("cache entry missing after insert"))
     }
 }
 
@@ -404,7 +410,7 @@ fn initialize_table(
     dep_cache: &mut DependencyCache,
     table_queues: &mut DepthQueues,
     twin_queues: &mut DepthQueues,
-) -> Result<(usize, usize, usize), ()> {
+) -> EgtResult<(usize, usize, usize)> {
     let (size, pawnless) = {
         let egt = &solver.files[table.file_idx].egts[table.egt_idx];
         (egt.index_range(), egt.is_pawnless())
@@ -521,7 +527,7 @@ fn propagate_win_to_loss(
     let outcome = solver.read_outcome(table, idx);
     if outcome.is_unknown() {
         let counter = outcome.get_unknown_counter();
-        assert!(counter > 0);
+        debug_assert!(counter > 0);
         if counter == 1 {
             solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, plies));
             quiet_unmoves(solver, table, twin, idx, |_solver, pred_idx| {
@@ -537,9 +543,14 @@ fn propagate_win_to_loss(
     }
 }
 
-pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result<(EgtFile, Option<EgtFile>), ()> {
+pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> EgtResult<(EgtFile, Option<EgtFile>)> {
     let parts: Vec<&str> = endgame.split('_').collect();
-    assert_eq!(parts.len(), 2);
+    if parts.len() != 2 {
+        return Err(EgtError::InvalidEndgameName {
+            name: endgame.to_string(),
+            reason: "expected exactly one '_' separator",
+        });
+    }
     let twin_endgame = format!("{}_{}", parts[1], parts[0]);
 
     let is_symmetric = endgame == twin_endgame;
@@ -566,10 +577,12 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
         let twin_key = PawnKey::new(&twin_stm, &twin_sntm);
 
         let (file_idx_b, egt_idx_b, name_b) = if solver.is_symmetric {
-            let egt_idx_b = *solver.files[0].egt_map.get(&twin_key).unwrap();
+            let egt_idx_b = *solver.files[0].egt_map.get(&twin_key)
+                .expect("twin sub-table must exist in symmetric endgame");
             (0, egt_idx_b, solver.files[0].egts[egt_idx_b].tablename().to_string())
         } else {
-            let egt_idx_b = *solver.files[1].egt_map.get(&twin_key).unwrap();
+            let egt_idx_b = *solver.files[1].egt_map.get(&twin_key)
+                .expect("twin sub-table must exist in asymmetric endgame");
             (1, egt_idx_b, solver.files[1].egts[egt_idx_b].tablename().to_string())
         };
 
@@ -772,8 +785,8 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> Result
 
             // Sort the queues to update the indexes in a more linear order in memory,
             // compared to random access. Does it help?
-            //next_queues_a.sort();
-            //next_queues_b.sort();
+            next_queues_a.sort();
+            next_queues_b.sort();
 
             std::mem::swap(&mut queues_a, &mut next_queues_a);
             std::mem::swap(&mut queues_b, &mut next_queues_b);

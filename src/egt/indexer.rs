@@ -1,5 +1,6 @@
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use crate::piece_set::{EgtRole, EgtSide};
+use crate::error::{EgtError, EgtResult};
 use std::cmp::Reverse;
 
 // Supporting up to 8 pieces should be fine for some time :)
@@ -172,7 +173,7 @@ pub struct Indexer {
 
 impl Indexer {
     // Initialize the indexer with the given set of pieces (type, side, multiplicity).
-    pub fn from_pieces(pieces: &[(EgtRole, EgtSide, usize)]) -> Result<Self, ()> {
+    pub fn from_pieces(pieces: &[(EgtRole, EgtSide, usize)]) -> EgtResult<Self> {
         // Setup the piece set elements.
         let mut piece_set: Vec<_> = pieces.iter().map(|p| PieceSetElement{
             role: p.0,
@@ -185,8 +186,7 @@ impl Indexer {
 
         let n_pieces = piece_set.iter().map(|p| p.multiplicity).sum();
         if n_pieces > MAX_PIECES {
-            println!("too many pieces?");
-            return Err(());
+            return Err(EgtError::InvalidPieceConfig("too many pieces"));
         }
 
         let n_pawns = piece_set.iter().filter(|p| p.role.is_pawn()).map(|p| p.multiplicity).sum();
@@ -238,7 +238,7 @@ impl Indexer {
             if p.role.is_pawn() {
                 pawnless = false;
                 p.n_squares = available_pawn_squares[p.role.to_index()];
-                assert!(p.n_squares >= k);
+                debug_assert!(p.n_squares >= k);
                 available_pawn_squares[p.role.to_index()] -= k;
             } else {
                 p.n_squares = available_squares;
@@ -250,8 +250,8 @@ impl Indexer {
             span_end = p.span.1;
         }
         if pawnless {
-            assert_eq!(piece_set[0].multiplicity, 1); // white king
-            assert_eq!(piece_set[1].multiplicity, 1); // black king
+            debug_assert_eq!(piece_set[0].multiplicity, 1); // white king
+            debug_assert_eq!(piece_set[1].multiplicity, 1); // black king
             // Encode the position of both kings using a single canonical index.
             piece_set[0].n_squares = 462;
             piece_set[0].combinations = 462;
@@ -397,7 +397,10 @@ impl Indexer {
     // If the index represents an invalid position, returns None.
     pub fn position_from_index(&self, scratch: &mut IndexerScratch, index: usize, side_to_move: Color) -> Option<Chess> {
         //println!("position_from_index: {}", index);
-        assert!(index < self.index_range);
+        if index >= self.index_range {
+            return None;
+        }
+        debug_assert!(index < self.index_range);
         let index_offset = self.adjust_ep_from_index(scratch, index);
         // Now `current_ep_option` reflects the en passant status as encoded in the index.
         // If there are pawns on the en passant file (different from the en passant
@@ -724,11 +727,11 @@ impl Indexer {
             let mut i = p.span.1;
             for k in 1..=p.multiplicity {
                 i -= 1;
-                assert!(scratch.buffer_pidx[i] < p.n_squares); // valid cpidx
+                debug_assert!(scratch.buffer_pidx[i] < p.n_squares); // valid cpidx
                 if k == 1 {
                     index += scratch.buffer_pidx[i];
                 } else {
-                    assert!(scratch.buffer_pidx[i] > scratch.buffer_pidx[i+1]); // decreasing cpidx
+                    debug_assert!(scratch.buffer_pidx[i] > scratch.buffer_pidx[i+1]); // decreasing cpidx
                     index += N_CHOOSE_K[k][scratch.buffer_pidx[i]];
                 }
             }

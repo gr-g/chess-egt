@@ -1,8 +1,10 @@
+pub mod error;
 pub mod piece_set;
 mod egt;
 mod egt_file;
 mod retrograde;
 
+pub use error::{EgtError, EgtResult};
 pub use egt_file::{EgtFile, EgtFileStats, LongestDtcPosition};
 use shakmaty::{Role, Chess, Color, Position};
 use std::cmp::Ordering;
@@ -62,10 +64,12 @@ impl EgtGenerator {
         self.assigned_memory = Some(n);
     }
 
-    pub fn list_n_pieces_endgames(n: usize) -> Vec<String> {
-        assert!(n <= 8, "list_n_pieces_endgames() called with n > 8");
+    pub fn list_n_pieces_endgames(n: usize) -> EgtResult<Vec<String>> {
+        if n > 8 {
+            return Err(EgtError::InvalidPieceConfig("list_n_pieces_endgames() called with n > 8"));
+        }
         if n < 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut endgames = Vec::new();
         let num_non_kings = n - 2;
@@ -118,10 +122,10 @@ impl EgtGenerator {
             pawns_a.cmp(&pawns_b).then_with(|| a.cmp(b))
         });
 
-        endgames
+        Ok(endgames)
     }
 
-    pub fn generate(&self, endgame: &str) -> Result<(EgtFileStats, Option<EgtFileStats>), ()> {
+    pub fn generate(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
 
@@ -134,34 +138,38 @@ impl EgtGenerator {
         let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame)?;
 
         // Save to file
-        let bytes_a = file_a.save_to_file().map_err(|_| ())?;
+        let bytes_a = file_a.save_to_file()?;
         let mut bytes_b = None;
         if let Some(ref mut fb) = file_b {
-            bytes_b = Some(fb.save_to_file().map_err(|_| ())?);
+            bytes_b = Some(fb.save_to_file()?);
         }
 
         // Compute SHA-256 and finalize stats
-        let sha256_a = compute_sha256(&file_a.path).map_err(|_| ())?;
-        let mut stats_a = file_a.stats.take().unwrap();
+        let sha256_a = compute_sha256(&file_a.path)?;
+        let mut stats_a = file_a.stats.take()
+            .ok_or(EgtError::Internal("stats missing for file_a after generation"))?;
         stats_a.bytes = bytes_a;
         stats_a.sha256 = sha256_a;
 
         // Save JSON file for A
         let json_path_a = file_a.path.with_extension("json");
-        let json_str_a = serde_json::to_string_pretty(&stats_a).map_err(|_| ())?;
-        std::fs::write(json_path_a, json_str_a).map_err(|_| ())?;
+        let json_str_a = serde_json::to_string_pretty(&stats_a)?;
+        std::fs::write(json_path_a, json_str_a)?;
 
         let mut stats_b = None;
         if let Some(ref mut fb) = file_b {
-            let sha256_b = compute_sha256(&fb.path).map_err(|_| ())?;
-            let mut s_b = fb.stats.take().unwrap();
-            s_b.bytes = bytes_b.unwrap();
+            let sha256_b = compute_sha256(&fb.path)?;
+            let mut s_b = fb.stats.take()
+                .ok_or(EgtError::Internal("stats missing for file_b after generation"))?;
+            let bytes_b_val = bytes_b
+                .ok_or(EgtError::Internal("bytes_b missing despite file_b being present"))?;
+            s_b.bytes = bytes_b_val;
             s_b.sha256 = sha256_b;
 
             // Save JSON file for B
             let json_path_b = fb.path.with_extension("json");
-            let json_str_b = serde_json::to_string_pretty(&s_b).map_err(|_| ())?;
-            std::fs::write(json_path_b, json_str_b).map_err(|_| ())?;
+            let json_str_b = serde_json::to_string_pretty(&s_b)?;
+            std::fs::write(json_path_b, json_str_b)?;
 
             stats_b = Some(s_b);
         }
@@ -199,31 +207,36 @@ impl EgtProber {
         self.assigned_memory = Some(n);
     }
 
-    pub fn probe(&mut self, position: &Chess) -> Result<DtcOutcome, ()> {
+    pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
         let endgame = get_endgame(position);
         if !self.cache.contains_key(&endgame) {
             let file = EgtFile::new_from_file(&self.base_path, &endgame)?;
             self.cache.insert(endgame.clone(), file);
         }
-        let file = self.cache.get_mut(&endgame).unwrap();
-        file.probe(position)?.to_outcome()
+        let file = self.cache.get_mut(&endgame)
+            .ok_or(EgtError::Internal("cache entry missing after insert"))?;
+        let idx = file.map_position_to_index(position)?;
+        let outcome = file.read_from_index(idx)?;
+        outcome.to_outcome_at(idx)
     }
 
-    pub fn verify_internal_consistency(&mut self, endgame: &str) -> Result<(), ()> {
+    pub fn verify_internal_consistency(&mut self, endgame: &str) -> EgtResult<()> {
         // Ensure the main file is in the cache
         if !self.cache.contains_key(endgame) {
             let file = EgtFile::new_from_file(&self.base_path, endgame)?;
             self.cache.insert(endgame.to_string(), file);
         }
 
-        let index_range = self.cache.get(endgame).unwrap().index_range;
+        let index_range = self.cache.get(endgame)
+            .ok_or(EgtError::Internal("cache entry missing after insert"))?.index_range;
 
         println!("Verifying internal consistency of endgame {} ({} indexes)...", endgame, index_range);
 
         for idx in 0..index_range {
             // Retrieve the setup and the outcome for this index
             let (position_opt, outcome_maybe) = {
-                let file = self.cache.get_mut(endgame).unwrap();
+                let file = self.cache.get_mut(endgame)
+                    .ok_or(EgtError::Internal("cache entry missing after insert"))?;
                 let position_opt = file.index_to_position(idx, Color::White);
                 let outcome_maybe = file.read_from_index(idx)?;
                 (position_opt, outcome_maybe)
@@ -231,31 +244,44 @@ impl EgtProber {
 
             if position_opt.is_none() {
                 if !outcome_maybe.is_invalid() {
-                    println!("Error: index {} is invalid but outcome is not invalid", idx);
-                    return Err(());
+                    return Err(EgtError::ConsistencyCheckFailed {
+                        endgame: endgame.to_string(),
+                        index: idx,
+                        reason: "index is invalid but outcome is not invalid".to_string(),
+                    });
                 }
                 continue;
             }
 
             if outcome_maybe.is_invalid() {
-                println!("Error: index {} is valid but outcome is invalid", idx);
-                return Err(());
+                return Err(EgtError::ConsistencyCheckFailed {
+                    endgame: endgame.to_string(),
+                    index: idx,
+                    reason: "index is valid but outcome is invalid".to_string(),
+                });
             }
 
-            let position = position_opt.unwrap();
-            let outcome = outcome_maybe.to_outcome()?;
+            let position = position_opt
+                .ok_or(EgtError::Internal("position_opt should be Some after the None check"))?;
+            let outcome = outcome_maybe.to_outcome_at(idx)?;
             let legals = position.legal_moves();
 
             if legals.is_empty() {
                 if position.is_check() {
                     if outcome != DtcOutcome::Loss(ConversionType::Checkmate, 0) {
-                        println!("Error: checkmate position at index {} has outcome {:?}", idx, outcome);
-                        return Err(());
+                        return Err(EgtError::ConsistencyCheckFailed {
+                            endgame: endgame.to_string(),
+                            index: idx,
+                            reason: format!("checkmate position has outcome {:?}", outcome),
+                        });
                     }
                 } else {
                     if outcome != DtcOutcome::Draw {
-                        println!("Error: stalemate position at index {} has outcome {:?}", idx, outcome);
-                        return Err(());
+                        return Err(EgtError::ConsistencyCheckFailed {
+                            endgame: endgame.to_string(),
+                            index: idx,
+                            reason: format!("stalemate position has outcome {:?}", outcome),
+                        });
                     }
                 }
             } else {
@@ -294,36 +320,43 @@ impl EgtProber {
                     }
                 }
 
-                let best = best_value.unwrap();
+                let best = best_value
+                    .ok_or(EgtError::Internal("best_value should be Some when legals is non-empty"))?;
                 if outcome != best {
-                    println!(
-                        "Error: consistency check failed at index {} of {}.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
-                        idx, endgame, position, outcome, best
+                    let mut reason = format!(
+                        "consistency check failed.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
+                        position, outcome, best
                     );
-                    println!("Legal moves and their outcomes:");
+                    reason.push_str("\nLegal moves and their outcomes:");
                     for m in position.legal_moves() {
                         let mut successor_position = position.clone();
                         successor_position.play_unchecked(m);
-                        let successor_outcome = self.probe(&successor_position).unwrap();
-                        let is_capture = m.is_capture();
-                        let is_promotion = m.is_promotion();
-                        let v_m = if is_capture || is_promotion {
-                            let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
-                            match successor_outcome {
-                                DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
-                                DtcOutcome::Draw => DtcOutcome::Draw,
-                                DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
-                            }
-                        } else {
-                            match successor_outcome {
-                                DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
-                                DtcOutcome::Draw => DtcOutcome::Draw,
-                                DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
-                            }
-                        };
-                        println!("  Move: {:?}, Successor Outcome: {:?}, Value: {:?}", m, successor_outcome, v_m);
+                        // Best-effort diagnostic: skip moves whose successor cannot be probed.
+                        if let Ok(successor_outcome) = self.probe(&successor_position) {
+                            let is_capture = m.is_capture();
+                            let is_promotion = m.is_promotion();
+                            let v_m = if is_capture || is_promotion {
+                                let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
+                                match successor_outcome {
+                                    DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
+                                    DtcOutcome::Draw => DtcOutcome::Draw,
+                                    DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
+                                }
+                            } else {
+                                match successor_outcome {
+                                    DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
+                                    DtcOutcome::Draw => DtcOutcome::Draw,
+                                    DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
+                                }
+                            };
+                            reason.push_str(&format!("\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}", m, successor_outcome, v_m));
+                        }
                     }
-                    return Err(());
+                    return Err(EgtError::ConsistencyCheckFailed {
+                        endgame: endgame.to_string(),
+                        index: idx,
+                        reason,
+                    });
                 }
             }
         }
@@ -465,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_list_n_pieces_endgames() {
-        let all_three = EgtGenerator::list_n_pieces_endgames(3);
+        let all_three = EgtGenerator::list_n_pieces_endgames(3).unwrap();
         assert_eq!(all_three, vec![
             "KB_K".to_string(),
             "KN_K".to_string(),
@@ -474,10 +507,10 @@ mod tests {
             "KP_K".to_string(),
         ]);
 
-        let all_two = EgtGenerator::list_n_pieces_endgames(2);
+        let all_two = EgtGenerator::list_n_pieces_endgames(2).unwrap();
         assert_eq!(all_two, vec!["K_K".to_string()]);
 
-        let all_four = EgtGenerator::list_n_pieces_endgames(4);
+        let all_four = EgtGenerator::list_n_pieces_endgames(4).unwrap();
         // Ensure pawnless endgames are first, then 1 pawn, then 2 pawns
         let mut max_pawns = 0;
         for eg in all_four {

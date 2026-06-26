@@ -1,6 +1,7 @@
 use shakmaty::{Color, File, Chess};
 mod indexer;
 use crate::piece_set::{EgtRole, EgtSide};
+use crate::error::EgtResult;
 use indexer::{Indexer, IndexerScratch};
 
 #[derive(Clone, Debug)]
@@ -46,7 +47,7 @@ impl Egt {
     }
 
     // Setup an `Egt` from a set of pieces.
-    pub fn from_pieces(mut pieces: Vec<(EgtRole, EgtSide, usize)>) -> Result<Self, ()> {
+    pub fn from_pieces(mut pieces: Vec<(EgtRole, EgtSide, usize)>) -> EgtResult<Self> {
         // Sort: first the pawns, then the kings, then all other pieces.
         pieces.sort();
 
@@ -181,10 +182,14 @@ fn compute_tablename(pieces: &[(EgtRole, EgtSide, usize)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::EgtError;
 
     // Setup an endgame table from a string such as "KQ_KRPb"
-    fn from_tablename(tablename: &str) -> Result<Egt, ()> {
-        let (stm, sntm) = tablename.split_once('_').ok_or(())?;
+    fn from_tablename(tablename: &str) -> EgtResult<Egt> {
+        let (stm, sntm) = tablename.split_once('_').ok_or(EgtError::InvalidEndgameName {
+            name: tablename.to_string(),
+            reason: "missing '_' separator",
+        })?;
 
         let mut pieces = vec![];
 
@@ -203,8 +208,10 @@ mod tests {
                         Some('g') => EgtRole::Pawn(File::G),
                         Some('h') => EgtRole::Pawn(File::H),
                         _ => {
-                            println!("invalid tablename");
-                            return Err(());
+                            return Err(EgtError::InvalidEndgameName {
+                                name: tablename.to_string(),
+                                reason: "invalid pawn file specifier",
+                            });
                         }
                     },
                     'K' => EgtRole::King,
@@ -213,16 +220,20 @@ mod tests {
                     'B' => EgtRole::Bishop,
                     'N' => EgtRole::Knight,
                     _ => {
-                        println!("invalid tablename");
-                        return Err(());
+                        return Err(EgtError::InvalidEndgameName {
+                            name: tablename.to_string(),
+                            reason: "invalid piece character",
+                        });
                     }
                 };
                 count[piece.to_index()] += 1;
             }
 
             if count[EgtRole::King.to_index()] != 1 {
-                println!("missing king");
-                return Err(());
+                return Err(EgtError::InvalidEndgameName {
+                    name: tablename.to_string(),
+                    reason: "each side must have exactly one king",
+                });
             }
 
             for piece in crate::piece_set::ALL_EGT_ROLES {
