@@ -11,6 +11,11 @@ struct Cli {
     #[arg(long)]
     path: PathBuf,
 
+    /// Additional path used to look up dependency tables, in addition to --path.
+    /// If not given, --path is used for dependencies as well.
+    #[arg(long)]
+    input_path: Option<PathBuf>,
+
     #[arg(long)]
     memory: Option<String>,
 
@@ -26,6 +31,15 @@ struct Cli {
     #[arg(long)]
     generate_all_5: bool,
 
+    /// Automatically generate missing dependency endgames on the fly.
+    /// By default dependencies must already be available.
+    #[arg(long)]
+    generate_deps: bool,
+
+    /// Skip the internal consistency check performed after generation.
+    #[arg(long)]
+    noverify: bool,
+
     position: Option<String>,
 }
 
@@ -39,15 +53,18 @@ fn main() {
 fn run() -> Result<(), EgtError> {
     let cli = Cli::parse();
 
-    if let Some(endgame) = cli.generate {
-        let g = EgtGenerator::new(&cli.path);
-        g.generate(&endgame)?;
+    if let Some(ref endgame) = cli.generate {
+        let mut g = EgtGenerator::new(&cli.path);
+        configure_generator(&mut g, &cli);
+        g.generate(endgame)?;
     } else if cli.generate_all_3 {
-        generate_all(3, &cli.path);
+        let g = EgtGenerator::new(&cli.path);
+        g.generate("K_K")?;
+        generate_all(3, &cli);
     } else if cli.generate_all_4 {
-        generate_all(4, &cli.path);
+        generate_all(4, &cli);
     } else if cli.generate_all_5 {
-        generate_all(5, &cli.path);
+        generate_all(5, &cli);
     } else if let Some(fen) = cli.position {
         let fen_obj: Fen = fen.parse().map_err(|e| EgtError::InvalidPosition(format!("invalid FEN: {e:?}")))?;
         let position = fen_obj.into_position(CastlingMode::Standard)
@@ -97,8 +114,17 @@ fn run() -> Result<(), EgtError> {
     Ok(())
 }
 
-fn generate_all(n: usize, path: &std::path::Path) {
-    println!("Generating all {}-pieces tables...", n);
+fn configure_generator(g: &mut EgtGenerator, cli: &Cli) {
+    if let Some(ref input) = cli.input_path {
+        g.with_input_path(input.clone());
+    }
+    g.with_generate_deps(cli.generate_deps);
+    g.with_verify(!cli.noverify);
+}
+
+fn generate_all(n: usize, cli: &Cli) {
+    let path = &cli.path;
+    println!("Generating all {}-pieces endgames...", n);
     let endgames = match EgtGenerator::list_n_pieces_endgames(n) {
         Ok(e) => e,
         Err(e) => {
@@ -106,7 +132,8 @@ fn generate_all(n: usize, path: &std::path::Path) {
             return;
         }
     };
-    let g = EgtGenerator::new(path);
+    let mut g = EgtGenerator::new(path);
+    configure_generator(&mut g, cli);
     let start_all = std::time::Instant::now();
     let mut unique_positions = 0;
     let mut total_bytes = 0;

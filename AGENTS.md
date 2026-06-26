@@ -5,7 +5,7 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Cli options --generate-deps, --verify, --input-path. Use object_store crate to use cloud storage in addition to local filesystem.
+- Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Clippy
 - Profiling with gungraun/valgrind. Benchmarking.

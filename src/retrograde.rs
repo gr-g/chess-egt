@@ -372,27 +372,62 @@ fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
 pub struct DependencyCache {
     pub cache: HashMap<String, EgtFile>,
     pub base_path: std::path::PathBuf,
+    /// Additional path used to look up dependency files. If `None`, only
+    /// `base_path` is consulted.
+    pub input_path: Option<std::path::PathBuf>,
+    /// Whether missing dependencies should be generated on the fly. When
+    /// `false`, a missing dependency results in a `DependencyUnavailable`
+    /// error instead of triggering a recursive generation.
+    pub generate_deps: bool,
 }
 
 impl DependencyCache {
-    pub fn new(base_path: &std::path::Path) -> Self {
+    pub fn with_options(
+        base_path: &std::path::Path,
+        input_path: Option<&std::path::Path>,
+        generate_deps: bool,
+    ) -> Self {
         Self {
             cache: HashMap::new(),
             base_path: base_path.to_path_buf(),
+            input_path: input_path.map(|p| p.to_path_buf()),
+            generate_deps,
         }
+    }
+
+    /// Attempts to load an existing dependency table, looking it up first in
+    /// `input_path` (if set) and then in `base_path`.
+    fn load_existing(&self, endgame: &str) -> EgtResult<EgtFile> {
+        crate::load_existing_file(&self.base_path, self.input_path.as_deref(), endgame)
     }
 
     pub fn get_or_load(&mut self, endgame: &str) -> EgtResult<&mut EgtFile> {
         if !self.cache.contains_key(endgame) {
-            let file = match EgtFile::new_from_file(&self.base_path, endgame) {
+            let file = match self.load_existing(endgame) {
                 Ok(f) => f,
                 Err(EgtError::FileNotFound(_)) => {
+                    if !self.generate_deps {
+                        return Err(EgtError::DependencyUnavailable {
+                            dependency: endgame.to_string(),
+                            source: Box::new(EgtError::FileNotFound(
+                                self.base_path.join(format!("{}.ggegt", endgame)),
+                            )),
+                        });
+                    }
                     println!("Dependency endgame {} not found. Generating on the fly...", endgame);
-                    let g = EgtGenerator::new(&self.base_path);
+                    let mut g = EgtGenerator::new(&self.base_path);
+                    // Propagate lookup options so transitively-missing
+                    // dependencies can also be resolved. Generated files are
+                    // always written to `base_path` (never to `input_path`).
+                    if let Some(ref input) = self.input_path {
+                        g.with_input_path(input.clone());
+                    }
+                    g.with_generate_deps(self.generate_deps);
                     g.generate(endgame).map_err(|source| EgtError::DependencyUnavailable {
                         dependency: endgame.to_string(),
                         source: Box::new(source),
                     })?;
+                    // The freshly generated file lives under `base_path`.
                     EgtFile::new_from_file(&self.base_path, endgame)?
                 }
                 Err(e) => return Err(e),
@@ -543,7 +578,12 @@ fn propagate_win_to_loss(
     }
 }
 
-pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> EgtResult<(EgtFile, Option<EgtFile>)> {
+pub fn retrograde_analysis(
+    base_path: &std::path::Path,
+    endgame: &str,
+    input_path: Option<&std::path::Path>,
+    generate_deps: bool,
+) -> EgtResult<(EgtFile, Option<EgtFile>)> {
     let parts: Vec<&str> = endgame.split('_').collect();
     if parts.len() != 2 {
         return Err(EgtError::InvalidEndgameName {
@@ -606,7 +646,7 @@ pub fn retrograde_analysis(base_path: &std::path::Path, endgame: &str) -> EgtRes
     }
 
     // Initialization & Propagation Phase for each independent pair
-    let mut dep_cache = DependencyCache::new(base_path);
+    let mut dep_cache = DependencyCache::with_options(base_path, input_path, generate_deps);
     let mut stats_builder_a = EgtFileStatsBuilder::new(
         solver.files[0].endgame.clone(),
         solver.files[0].index_range,
@@ -885,7 +925,7 @@ mod tests {
         expected_losses_b: Option<usize>,
         expected_invalid_b: Option<usize>,
     ) {
-        let (file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), endgame).unwrap();
+        let (file_a, file_b) = retrograde_analysis(&std::env::temp_dir(), endgame, None, true).unwrap();
 
         let stats_a = file_a.stats.as_ref().expect("file_a should have stats");
         println!("{} stats:", file_a.endgame);

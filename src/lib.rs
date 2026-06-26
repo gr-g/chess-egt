@@ -50,6 +50,9 @@ impl PartialOrd for DtcOutcome {
 pub struct EgtGenerator {
     base_path: PathBuf,
     assigned_memory: Option<usize>,
+    input_path: Option<PathBuf>,
+    generate_deps: bool,
+    verify: bool,
 }
 
 impl EgtGenerator {
@@ -57,11 +60,33 @@ impl EgtGenerator {
         Self {
             base_path: path.into(),
             assigned_memory: None,
+            input_path: None,
+            generate_deps: false,
+            verify: true,
         }
     }
 
     pub fn with_assigned_memory(&mut self, n: usize) {
         self.assigned_memory = Some(n);
+    }
+
+    /// Sets an additional path used to look up dependency files. If not set,
+    /// only `base_path` is consulted for dependencies.
+    pub fn with_input_path(&mut self, path: impl Into<PathBuf>) {
+        self.input_path = Some(path.into());
+    }
+
+    /// Enables automatic generation of missing dependencies on the fly.
+    /// Disabled by default: when disabled, a missing dependency causes
+    /// `generate()` to return a `DependencyUnavailable` error.
+    pub fn with_generate_deps(&mut self, generate_deps: bool) {
+        self.generate_deps = generate_deps;
+    }
+
+    /// Enables or disables the internal consistency check performed after
+    /// generation. Enabled by default.
+    pub fn with_verify(&mut self, verify: bool) {
+        self.verify = verify;
     }
 
     pub fn list_n_pieces_endgames(n: usize) -> EgtResult<Vec<String>> {
@@ -135,7 +160,12 @@ impl EgtGenerator {
         //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&self.base_path, endgame)?;
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(
+            &self.base_path,
+            endgame,
+            self.input_path.as_deref(),
+            self.generate_deps,
+        )?;
 
         // Save to file
         let bytes_a = file_a.save_to_file()?;
@@ -178,10 +208,15 @@ impl EgtGenerator {
         print_pair_stats(&stats_a, stats_b.as_ref(), duration);
 
         // Check internal consistency
-        let mut prober = EgtProber::new(&self.base_path);
-        prober.verify_internal_consistency(&file_a.endgame)?;
-        if let Some(ref mut fb) = file_b {
-            prober.verify_internal_consistency(&fb.endgame)?;
+        if self.verify {
+            let mut prober = EgtProber::new(&self.base_path);
+            if let Some(ref input) = self.input_path {
+                prober.with_input_path(input.clone());
+            }
+            prober.verify_internal_consistency(&file_a.endgame)?;
+            if let Some(ref mut fb) = file_b {
+                prober.verify_internal_consistency(&fb.endgame)?;
+            }
         }
 
         Ok((stats_a, stats_b))
@@ -190,6 +225,9 @@ impl EgtGenerator {
 
 pub struct EgtProber {
     base_path: PathBuf,
+    /// Additional path used to look up dependency files. If `None`, only
+    /// `base_path` is consulted.
+    input_path: Option<PathBuf>,
     assigned_memory: Option<usize>,
     cache: HashMap<String, EgtFile>,
 }
@@ -198,6 +236,7 @@ impl EgtProber {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             base_path: path.into(),
+            input_path: None,
             assigned_memory: None,
             cache: HashMap::new(),
         }
@@ -207,10 +246,22 @@ impl EgtProber {
         self.assigned_memory = Some(n);
     }
 
+    /// Sets an additional path used to look up dependency files. If not set,
+    /// only `base_path` is consulted.
+    pub fn with_input_path(&mut self, path: impl Into<PathBuf>) {
+        self.input_path = Some(path.into());
+    }
+
+    /// Attempts to load an existing file, looking it up first in `input_path`
+    /// (if set and distinct from `base_path`) and then in `base_path`.
+    fn load_existing(&self, endgame: &str) -> EgtResult<EgtFile> {
+        load_existing_file(&self.base_path, self.input_path.as_deref(), endgame)
+    }
+
     pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
         let endgame = get_endgame(position);
         if !self.cache.contains_key(&endgame) {
-            let file = EgtFile::new_from_file(&self.base_path, &endgame)?;
+            let file = self.load_existing(&endgame)?;
             self.cache.insert(endgame.clone(), file);
         }
         let file = self.cache.get_mut(&endgame)
@@ -223,7 +274,7 @@ impl EgtProber {
     pub fn verify_internal_consistency(&mut self, endgame: &str) -> EgtResult<()> {
         // Ensure the main file is in the cache
         if !self.cache.contains_key(endgame) {
-            let file = EgtFile::new_from_file(&self.base_path, endgame)?;
+            let file = self.load_existing(endgame)?;
             self.cache.insert(endgame.to_string(), file);
         }
 
@@ -366,6 +417,25 @@ impl EgtProber {
     }
 }
 
+/// Attempts to load an existing `EgtFile`, looking it up first in `input_path`
+/// (if set and distinct from `base_path`) and then in `base_path`.
+fn load_existing_file(
+    base_path: &std::path::Path,
+    input_path: Option<&std::path::Path>,
+    endgame: &str,
+) -> EgtResult<EgtFile> {
+    if let Some(input) = input_path {
+        if input != base_path {
+            match EgtFile::new_from_file(&input.to_path_buf(), endgame) {
+                Ok(f) => return Ok(f),
+                Err(EgtError::FileNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    EgtFile::new_from_file(&base_path.to_path_buf(), endgame)
+}
+
 pub fn get_endgame(position: &Chess) -> String {
     let stm_color = position.turn();
     let sntm_color = !stm_color;
@@ -473,7 +543,7 @@ mod tests {
     #[test]
     fn test_verify_internal_consistency_k_k() {
         let temp_dir = std::env::temp_dir();
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "K_K").unwrap();
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "K_K", None, true).unwrap();
         file_a.save_to_file().unwrap();
         if let Some(ref mut fb) = file_b {
             fb.save_to_file().unwrap();
@@ -486,7 +556,7 @@ mod tests {
     #[test]
     fn test_verify_internal_consistency_kr_k() {
         let temp_dir = std::env::temp_dir();
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "KR_K").unwrap();
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "KR_K", None, true).unwrap();
         file_a.save_to_file().unwrap();
         if let Some(ref mut fb) = file_b {
             fb.save_to_file().unwrap();
