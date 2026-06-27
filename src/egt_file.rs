@@ -1,6 +1,6 @@
 use std::collections::{HashMap, BTreeMap};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
@@ -47,42 +47,36 @@ impl MaybeDtcOutcome {
         Self(value)
     }
 
-    pub fn to_u16(&self) -> u16 {
+    pub fn to_u16(self) -> u16 {
         self.0
     }
 
-    pub fn is_assigned(&self) -> bool {
+    pub fn is_assigned(self) -> bool {
         (self.0 & 0b111) != 0b000
     }
 
-    pub fn is_invalid(&self) -> bool {
+    pub fn is_invalid(self) -> bool {
         self.0 == 0b000
     }
 
-    pub fn is_unknown(&self) -> bool {
+    pub fn is_unknown(self) -> bool {
         (self.0 & 0b111) == 0b000 && (self.0 >> 3) != 0
     }
 
-    pub fn get_unknown_counter(&self) -> u16 {
+    pub fn get_unknown_counter(self) -> u16 {
         self.0 >> 3
     }
 
-    pub fn is_draw(&self) -> bool {
+    pub fn is_draw(self) -> bool {
         self.0 == 0b001
     }
 
-    pub fn is_win(&self) -> bool {
-        match self.0 & 0b111 {
-            0b010 | 0b100 | 0b110 => true,
-            _ => false,
-        }
+    pub fn is_win(self) -> bool {
+        matches!(self.0 & 0b111, 0b010 | 0b100 | 0b110)
     }
 
-    pub fn is_loss(&self) -> bool {
-        match self.0 & 0b111 {
-            0b011 | 0b101 | 0b111 => true,
-            _ => false,
-        }
+    pub fn is_loss(self) -> bool {
+        matches!(self.0 & 0b111, 0b011 | 0b101 | 0b111)
     }
 
     pub fn new_win(ct: ConversionType, distance: u16) -> Self {
@@ -141,44 +135,6 @@ pub enum FrameState {
         dirty: bool,
     },
 }
-
-/// A simple stub for the memory Arena that manages a fixed pool of memory.
-//#[derive(Debug)]
-//pub struct Arena {
-//    capacity: usize,
-//    used: usize,
-//}
-
-//impl Arena {
-    /// Creates a new Arena with the given capacity in bytes.
-    //pub fn new(capacity: usize) -> Self {
-    //    Self { capacity, used: 0 }
-    //}
-
-    /// Attempts to allocate memory from the arena.
-    /// In a full implementation, this would trigger eviction of LRU frames if capacity is exceeded.
-    //pub fn allocate(&mut self, size: usize) -> bool {
-    //    if self.used + size <= self.capacity {
-    //        self.used += size;
-    //        true
-    //    } else {
-    //        false
-    //    }
-    //}
-
-    /// Returns memory to the arena.
-    //pub fn deallocate(&mut self, size: usize) {
-    //    self.used = self.used.saturating_sub(size);
-    //}
-
-    //pub fn capacity(&self) -> usize {
-    //    self.capacity
-    //}
-
-    //pub fn used(&self) -> usize {
-    //    self.used
-    //}
-//}
 
 /// A stack-allocated, copyable key representing the pawn file assignments for both sides.
 /// This avoids all string formatting and heap allocations during tablebase probing.
@@ -239,7 +195,7 @@ impl EgtFile {
     /// Creates a new EgtFile for a given piece configuration and path.
     ///
     /// The file starts with no memory allocated.
-    pub fn new(base_path: &PathBuf, endgame: &str) -> EgtResult<Self> {
+    pub fn new(base_path: &Path, endgame: &str) -> EgtResult<Self> {
         let path = base_path.join(format!("{}.ggegt", endgame));
 
         let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name(endgame)?;
@@ -273,7 +229,7 @@ impl EgtFile {
 
         let index_range: usize = egts.iter().map(|egt| egt.index_range()).sum();
         let frame_size = DEFAULT_FRAME_SIZE;
-        let num_frames = (index_range + frame_size - 1) / frame_size;
+        let num_frames = index_range.div_ceil(frame_size);
 
         let mut frames = Vec::with_capacity(num_frames);
         for _ in 0..num_frames {
@@ -295,7 +251,7 @@ impl EgtFile {
     /// Creates an EgtFile representing an existing file.
     ///
     /// The file starts with no memory allocated. Data is read from the file on demand.
-    pub fn new_from_file(base_path: &PathBuf, endgame: &str) -> EgtResult<Self> {
+    pub fn new_from_file(base_path: &Path, endgame: &str) -> EgtResult<Self> {
         let mut egt_file = Self::new(base_path, endgame)?;
         if !std::fs::exists(&egt_file.path)? {
             return Err(EgtError::FileNotFound(egt_file.path));
@@ -338,7 +294,7 @@ impl EgtFile {
 
             // Transpose the frame
             if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
-                let transposed = transpose_frame(&uncompressed);
+                let transposed = transpose_frame(uncompressed);
 
                 // Compress the transposed frame
                 encoder.compress(&transposed)?;
@@ -563,7 +519,7 @@ impl EgtFile {
                     let mut encoder = Encoder::new(&mut compressed_bytes)?;
 
                     // Transpose (bit-slice) the frame
-                    let transposed = transpose_frame(&uncompressed);
+                    let transposed = transpose_frame(uncompressed);
 
                     // Compress the transposed frame
                     encoder.compress(&transposed)?;

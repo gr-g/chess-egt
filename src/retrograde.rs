@@ -55,11 +55,9 @@ impl EgtFileStatsBuilder {
         current_max_loss_dtc: u16,
     ) {
         let sym = file.egts[egt_idx].diagonal_symmetric(local_idx);
-        if let Some(other_idx) = sym {
-            if local_idx > other_idx {
-                self.invalid_or_redundant += 1;
-                return;
-            }
+        if let Some(other_idx) = sym && local_idx > other_idx {
+            self.invalid_or_redundant += 1;
+            return;
         }
 
         if outcome.is_win() {
@@ -595,11 +593,11 @@ pub fn retrograde_analysis(
 
     let is_symmetric = endgame == twin_endgame;
 
-    let file_a = EgtFile::new(&base_path.to_path_buf(), endgame)?;
+    let file_a = EgtFile::new(base_path, endgame)?;
     let file_b = if is_symmetric {
         None
     } else {
-        Some(EgtFile::new(&base_path.to_path_buf(), &twin_endgame)?)
+        Some(EgtFile::new(base_path, &twin_endgame)?)
     };
 
     let mut solver = RetrogradeSolver::new(file_a, file_b);
@@ -899,10 +897,8 @@ pub fn retrograde_analysis(
     let mut file_b = if is_symmetric { None } else { Some(files.remove(0)) };
 
     file_a.stats = Some(stats_builder_a.build(0, String::new()));
-    if let Some(ref mut fb) = file_b {
-        if let Some(builder_b) = stats_builder_b {
-            fb.stats = Some(builder_b.build(0, String::new()));
-        }
+    if let Some(ref mut fb) = file_b && let Some(builder_b) = stats_builder_b {
+        fb.stats = Some(builder_b.build(0, String::new()));
     }
 
     Ok((file_a, file_b))

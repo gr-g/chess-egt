@@ -111,51 +111,41 @@ fn compute_tablename(pieces: &[(EgtRole, EgtSide, usize)]) -> String {
         // Order: Q, R, B, N, P
         // First, check for Queen
         for &(piece, p_side, mult) in pieces {
-            if p_side == *side {
-                if let EgtRole::Queen = piece {
-                    for _ in 0..mult {
-                        parts.push("Q".to_string());
-                    }
+            if p_side == *side && let EgtRole::Queen = piece {
+                for _ in 0..mult {
+                    parts.push("Q".to_string());
                 }
             }
         }
         // Rook
         for &(piece, p_side, mult) in pieces {
-            if p_side == *side {
-                if let EgtRole::Rook = piece {
-                    for _ in 0..mult {
-                        parts.push("R".to_string());
-                    }
+            if p_side == *side && let EgtRole::Rook = piece {
+                for _ in 0..mult {
+                    parts.push("R".to_string());
                 }
             }
         }
         // Bishop
         for &(piece, p_side, mult) in pieces {
-            if p_side == *side {
-                if let EgtRole::Bishop = piece {
-                    for _ in 0..mult {
-                        parts.push("B".to_string());
-                    }
+            if p_side == *side && let EgtRole::Bishop = piece {
+                for _ in 0..mult {
+                    parts.push("B".to_string());
                 }
             }
         }
         // Knight
         for &(piece, p_side, mult) in pieces {
-            if p_side == *side {
-                if let EgtRole::Knight = piece {
-                    for _ in 0..mult {
-                        parts.push("N".to_string());
-                    }
+            if p_side == *side && let EgtRole::Knight = piece {
+                for _ in 0..mult {
+                    parts.push("N".to_string());
                 }
             }
         }
         // Pawn (with file)
         let mut pawns = Vec::new();
         for &(piece, p_side, mult) in pieces {
-            if p_side == *side {
-                if let EgtRole::Pawn(file) = piece {
-                    pawns.push((file, mult));
-                }
+            if p_side == *side && let EgtRole::Pawn(file) = piece {
+                pawns.push((file, mult));
             }
         }
         pawns.sort_by_key(|(file, _)| file.to_usize());

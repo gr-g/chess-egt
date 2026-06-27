@@ -81,14 +81,14 @@ fn run() -> Result<(), EgtError> {
                     (ConversionType::Capture, _) => "A capture of your own piece converting to a winning position",
                     (ConversionType::Promotion, _) => "A promotion of an opponent's pawn converting to a winning position",
                 };
-                if (n+1) / 2 == 1 {
+                if n.div_ceil(2) == 1 {
                     format!("Win - {} can be played on this move", conversion_str)
                 } else {
-                    format!("Win - {} can be forced in {} moves ({} plies)", conversion_str, (n+1) / 2, n)
+                    format!("Win - {} can be forced in {} moves ({} plies)", conversion_str, n.div_ceil(2), n)
                 }
             },
             DtcOutcome::Draw => {
-                format!("Draw")
+                "Draw".to_string()
             },
             DtcOutcome::Loss(ct, n) => {
                 let conversion_str = match (ct, n % 2) {

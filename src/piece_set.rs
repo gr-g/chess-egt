@@ -1,5 +1,4 @@
 use shakmaty::{File, Role};
-use std::cmp::Ordering;
 
 pub static ALL_EGT_ROLES: [EgtRole; 13] = [
     EgtRole::Pawn(File::A),
@@ -17,7 +16,7 @@ pub static ALL_EGT_ROLES: [EgtRole; 13] = [
     EgtRole::Knight,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EgtRole {
     Pawn(File),
     King,
@@ -29,10 +28,7 @@ pub enum EgtRole {
 
 impl EgtRole {
     pub fn is_pawn(&self) -> bool {
-        match self {
-            EgtRole::Pawn(_) => true,
-            _ => false,
-        }
+        matches!(self, EgtRole::Pawn(_))
     }
 
     pub fn to_role(&self) -> Role {
@@ -62,12 +58,6 @@ impl EgtRole {
             EgtRole::Bishop => 11,
             EgtRole::Knight => 12,
         }
-    }
-}
-
-impl Ord for EgtRole {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(&other).unwrap()
     }
 }
 

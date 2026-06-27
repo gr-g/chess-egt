@@ -43,7 +43,7 @@ impl Ord for DtcOutcome {
 
 impl PartialOrd for DtcOutcome {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -424,16 +424,14 @@ fn load_existing_file(
     input_path: Option<&std::path::Path>,
     endgame: &str,
 ) -> EgtResult<EgtFile> {
-    if let Some(input) = input_path {
-        if input != base_path {
-            match EgtFile::new_from_file(&input.to_path_buf(), endgame) {
-                Ok(f) => return Ok(f),
-                Err(EgtError::FileNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
+    if let Some(input) = input_path && input != base_path {
+        match EgtFile::new_from_file(input, endgame) {
+            Ok(f) => return Ok(f),
+            Err(EgtError::FileNotFound(_)) => {}
+            Err(e) => return Err(e),
         }
     }
-    EgtFile::new_from_file(&base_path.to_path_buf(), endgame)
+    EgtFile::new_from_file(base_path, endgame)
 }
 
 pub fn get_endgame(position: &Chess) -> String {
