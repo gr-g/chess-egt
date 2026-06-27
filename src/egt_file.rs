@@ -8,8 +8,8 @@ use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
 use serde::{Serialize, Deserialize};
 
-// 128k positions per frame, corresponding to 256k bytes per frame.
-const DEFAULT_FRAME_SIZE: usize = 128 * 1024;
+// 256k positions per frame, corresponding to 512kiB per frame.
+const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 
 // Compression level used when storing data on disk
 const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
@@ -541,113 +541,46 @@ impl EgtFile {
     }
 }
 
-/// Transposes (bit-slices) a frame of N positions to maximize Zstd compressibility.
+/// Transposes (bit-slices) a frame of `MaybeDtcOutcome` values using an 8-8
+/// pattern: the low bytes (bits 0-7) are written first, then the high bytes
+/// (bits 8-15).
 pub fn transpose_frame(uncompressed: &[MaybeDtcOutcome]) -> Vec<u8> {
     let n = uncompressed.len();
     let mut output = vec![0u8; n * 2];
 
-    let set_bit = |slice: &mut [u8], bit_idx: usize, bit_val: u16| {
-        if bit_val != 0 {
-            slice[bit_idx / 8] |= 1 << (bit_idx % 8);
-        }
-    };
-
-    // Slice offsets in bytes
-    let offset_0 = 0;
-    let offset_1 = n / 8;
-    let offset_2 = (n / 8) * 2;
-    let offset_3 = (n / 8) * 3;
-    let offset_4 = offset_3 + (n / 2);
-    let offset_5 = offset_4 + (n / 2);
-
+    // Slice 0 (bits 0-7) -> n bytes
+    // Slice 1 (bits 8-15) -> n bytes
+    let mut j = n;
     for i in 0..n {
         let val = uncompressed[i].to_u16();
-
-        // Slice 0 (bit 0)
-        set_bit(&mut output[offset_0..], i, val & 1);
-
-        // Slice 1 (bit 1)
-        set_bit(&mut output[offset_1..], i, val & 2);
-
-        // Slice 2 (bit 2)
-        set_bit(&mut output[offset_2..], i, val & 4);
-
-        // Slice 3 (bits 3-6)
-        let val_3 = (val >> 3) & 0xF;
-        for b in 0..4 {
-            set_bit(&mut output[offset_3..], i * 4 + b, val_3 & (1 << b));
-        }
-
-        // Slice 4 (bits 7-10)
-        let val_4 = (val >> 7) & 0xF;
-        for b in 0..4 {
-            set_bit(&mut output[offset_4..], i * 4 + b, val_4 & (1 << b));
-        }
-
-        // Slice 5 (bits 11-15)
-        let val_5 = (val >> 11) & 0x1F;
-        for b in 0..5 {
-            set_bit(&mut output[offset_5..], i * 5 + b, val_5 & (1 << b));
+        if val == 0b000 || val == 0b001 {
+            output[i] = val as u8;
+        } else {
+            output[i] = (val & 0xFF) as u8;
+            output[j] = (val >> 8) as u8;
+            j += 1;
         }
     }
 
     output
 }
 
-/// Reverses the transposition (un-bit-slices) of a frame.
-pub fn detranspose_frame(transposed: &[u8], frame_size: usize) -> Vec<MaybeDtcOutcome> {
-    let n = frame_size;
+/// Reverses the transposition (un-bit-slices) of a frame produced by
+/// `transpose_frame` using the 8-8 pattern.
+pub fn detranspose_frame(transposed: &[u8], n: usize) -> Vec<MaybeDtcOutcome> {
     let mut output = vec![MaybeDtcOutcome::INVALID; n];
 
-    let get_bit = |slice: &[u8], bit_idx: usize| -> u16 {
-        let byte = slice[bit_idx / 8];
-        ((byte >> (bit_idx % 8)) & 1) as u16
-    };
-
-    // Slice offsets in bytes
-    let offset_0 = 0;
-    let offset_1 = n / 8;
-    let offset_2 = (n / 8) * 2;
-    let offset_3 = (n / 8) * 3;
-    let offset_4 = offset_3 + (n / 2);
-    let offset_5 = offset_4 + (n / 2);
-
+    let mut j = n;
     for i in 0..n {
-        let mut val = 0u16;
-
-        // Slice 0 (bit 0)
-        val |= get_bit(&transposed[offset_0..], i);
-
-        // Slice 1 (bit 1)
-        val |= get_bit(&transposed[offset_1..], i) << 1;
-
-        // Slice 2 (bit 2)
-        val |= get_bit(&transposed[offset_2..], i) << 2;
-
-        // Slice 3 (bits 3-6)
-        let mut val_3 = 0u16;
-        for b in 0..4 {
-            val_3 |= get_bit(&transposed[offset_3..], i * 4 + b) << b;
+        if transposed[i] == 0b000 || transposed[i] == 0b001 {
+            let val = transposed[i] as u16;
+            output[i] = MaybeDtcOutcome::from_u16(val);
+        } else {
+            let val = u16::from_le_bytes([transposed[i], transposed[j]]);
+            output[i] = MaybeDtcOutcome::from_u16(val);
+            j += 1;
         }
-        val |= val_3 << 3;
-
-        // Slice 4 (bits 7-10)
-        let mut val_4 = 0u16;
-        for b in 0..4 {
-            val_4 |= get_bit(&transposed[offset_4..], i * 4 + b) << b;
-        }
-        val |= val_4 << 7;
-
-        // Slice 5 (bits 11-15)
-        let mut val_5 = 0u16;
-        for b in 0..5 {
-            val_5 |= get_bit(&transposed[offset_5..], i * 5 + b) << b;
-        }
-        val |= val_5 << 11;
-
-        output[i] = MaybeDtcOutcome::from_u16(val);
     }
-
     output
 }
 
@@ -926,6 +859,26 @@ mod tests {
     fn egt_file_decode_encode_kpp_kp() {
         // KPP_KP has ~15 million positions across 156 sub-tables.
         run_round_trip_test("KPP_KP", 500);
+    }
+
+    #[test]
+    fn test_transpose_detranspose_roundtrip() {
+        // Use a frame size that is a multiple of 8 (as in production).
+        let n = 16;
+        let mut inputs = vec![MaybeDtcOutcome::INVALID; n];
+        inputs[4] = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 67);
+        inputs[6] = MaybeDtcOutcome::new_loss(ConversionType::Capture, 12);
+        inputs[7] = MaybeDtcOutcome::new_win(ConversionType::Promotion, 4567);
+        inputs[8] = MaybeDtcOutcome::DRAW;
+        inputs[10] = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 30);
+        inputs[11] = MaybeDtcOutcome::new_win(ConversionType::Capture, 1);
+        inputs[12] = MaybeDtcOutcome::DRAW;
+        inputs[13] = MaybeDtcOutcome::new_loss(ConversionType::Promotion, 1200);
+        let transposed = transpose_frame(&inputs);
+        let recovered = detranspose_frame(&transposed, n);
+        for i in 0..n {
+            assert_eq!(inputs[i].to_u16(), recovered[i].to_u16(), "mismatch at i={}", i);
+        }
     }
 
     #[test]

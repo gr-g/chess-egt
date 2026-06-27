@@ -5,8 +5,7 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
-- Idea to keep only the win/lose DTC bits in the bit-fiddling.
+- Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 - Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungraun/valgrind. Benchmarking.
@@ -14,7 +13,6 @@ TODO:
 - Implement EgtProber::verify_with_syzygy().
 - Align ep_square with shakmaty
 - Verify index_ranges table-by-table. Print counter during verification.
-- Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder).
 - Pre-allocate queues. Put queues inside EgtHandle. Use is_symmetric instead of table_a == table_b. Sort queues for better access to allocated frames (somewhat linear instead of random). One single queue instead of 6?
 - Make solver read-only, remove name from EgtHandle.
