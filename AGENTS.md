@@ -5,13 +5,11 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Use object_store crate to use cloud storage in addition to local filesystem.
-- Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
-- Clippy
-- Profiling with gungraun/valgrind. Benchmarking.
 - Experiments with different bit-fiddling: 8-8, 4-4-4-4, 2-2-2-2-2-2-2-2, ...
 - Idea to keep only the win/lose DTC bits in the bit-fiddling.
-- Experiment with different frame sizes, compression parameters, ...
+- Use object_store crate to use cloud storage in addition to local filesystem.
+- Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
+- Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
 - Implement EgtProber::verify_with_syzygy().
 - Align ep_square with shakmaty

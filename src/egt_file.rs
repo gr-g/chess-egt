@@ -8,8 +8,11 @@ use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
 use serde::{Serialize, Deserialize};
 
-// 16k positions per frame, corresponding to 32k bytes per frame.
-const DEFAULT_FRAME_SIZE: usize = 16384;
+// 128k positions per frame, corresponding to 256k bytes per frame.
+const DEFAULT_FRAME_SIZE: usize = 128 * 1024;
+
+// Compression level used when storing data on disk
+const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LongestDtcPosition {
@@ -279,13 +282,15 @@ impl EgtFile {
     pub fn save_to_file(&mut self) -> EgtResult<u64> {
         use std::fs::File;
         use std::io::BufWriter;
-        use zeekstd::Encoder;
+        use zeekstd::EncodeOptions;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = File::create(&self.path)?;
         let writer = BufWriter::new(file);
-        let mut encoder = Encoder::new(writer)?;
+        let mut encoder = EncodeOptions::new()
+            .compression_level(DEFAULT_COMPRESSION_LEVEL)
+            .into_encoder(writer)?;
 
         // TODO: this does the encoding in one go with the uncompressed data,
         // but in principle we could reuse the compressed frames.
@@ -513,10 +518,12 @@ impl EgtFile {
                     // Regenerate the compressed bytes
                     // TODO: Use the exact compressed frame bytes that would be used for the
                     // full compressed file.
-                    use zeekstd::Encoder;
+                    use zeekstd::EncodeOptions;
 
                     let mut compressed_bytes = vec![];
-                    let mut encoder = Encoder::new(&mut compressed_bytes)?;
+                    let mut encoder = EncodeOptions::new()
+                        .compression_level(DEFAULT_COMPRESSION_LEVEL)
+                        .into_encoder(&mut compressed_bytes)?;
 
                     // Transpose (bit-slice) the frame
                     let transposed = transpose_frame(uncompressed);
