@@ -114,18 +114,19 @@ pub struct PieceSetElement {
 // where en passant is not possible. One instance of this struct represents one
 // option for the en passant status of positions, together with the range of
 // indexes associated to these positions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Each option carries its own pre-adjusted `piece_set`, with the `multiplicity`,
+// `n_squares` and `combinations` of the pawn groups on the en passant file
+// already reduced to reflect the constraints imposed by that option (the pawn
+// on the 5th rank is not encoded, and the remaining pawns on that file cannot
+// occupy the 5th, 6th or 7th rank). `span` is kept at its original value so that
+// the ep-pawn slot stays reserved in the buffers.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnpassantOption {
     // The en passant square if en passant is possible, or None.
     pub square: Option<Square>,
 
-    // The index of the pawns (side-not-to-move) on the file where the
-    // en passant capture is possible.
-    pub pawn_idx_sntm: Option<usize>,
-
-    // The index of the pawns (side-to-move) on the file where the
-    // en passant capture is possible.
-    pub pawn_idx_stm: Option<usize>,
+    // The piece set adjusted for this en passant option.
+    pub piece_set: Vec<PieceSetElement>,
 
     // The start of the range used to encode positions with this en passant status.
     pub range_start: usize,
@@ -137,8 +138,8 @@ pub struct EnpassantOption {
 // A mutable scratch buffer used to encode/decode positions.
 #[derive(Clone, Debug)]
 pub struct IndexerScratch {
-    pub piece_set: Vec<PieceSetElement>,
-    pub current_ep_option: EnpassantOption,
+    // The index into `Indexer::ep_options` of the currently selected option.
+    pub current_ep_idx: usize,
     pub buffer_coord: Vec<(usize, usize)>,
     pub buffer_pidx: Vec<usize>,
 }
@@ -147,9 +148,6 @@ pub struct IndexerScratch {
 // compact indexes representing the positions, and viceversa.
 #[derive(Clone, Debug)]
 pub struct Indexer {
-    // The set of pieces appearing in this endgame table.
-    pub piece_set: Vec<PieceSetElement>,
-
     // The number of pieces in the endgame.
     pub n_pieces: usize,
 
@@ -198,7 +196,7 @@ impl Indexer {
         let combinations_without_ep = piece_set.iter().map(|p| p.combinations).product();
 
         // Check en passant options.
-        let ep_options = Self::setup_ep_options(&mut piece_set[0..n_unique_pawns], combinations_without_ep);
+        let ep_options = Self::setup_ep_options(&piece_set, n_unique_pawns, combinations_without_ep);
 
         //println!("pieces: {:?}", &piece_set);
         //println!("ep_options: {:?}", &ep_options);
@@ -208,7 +206,6 @@ impl Indexer {
         let (kings_map_from_index, kings_map_to_index) = initialize_kings_map();
 
         Ok(Indexer {
-            piece_set,
             n_pieces,
             n_pawns,
             n_unique_pawns,
@@ -221,11 +218,22 @@ impl Indexer {
 
     pub fn create_scratch(&self) -> IndexerScratch {
         IndexerScratch {
-            piece_set: self.piece_set.clone(),
-            current_ep_option: self.ep_options[0],
+            current_ep_idx: 0,
             buffer_coord: vec![(0, 0); self.n_pieces],
             buffer_pidx: vec![0; self.n_pieces],
         }
+    }
+
+    // Returns the piece set adjusted for the currently selected en passant option.
+    #[inline]
+    fn piece_set(&self, scratch: &IndexerScratch) -> &Vec<PieceSetElement> {
+        &self.ep_options[scratch.current_ep_idx].piece_set
+    }
+
+    // Returns the currently selected en passant option.
+    #[inline]
+    fn current_ep_option(&self, scratch: &IndexerScratch) -> &EnpassantOption {
+        &self.ep_options[scratch.current_ep_idx]
     }
 
     fn compute_piece_squares(piece_set: &mut[PieceSetElement]) {
@@ -260,18 +268,18 @@ impl Indexer {
         }
     }
 
-    fn setup_ep_options(pawns: &mut[PieceSetElement], combinations_without_ep: usize) -> Vec<EnpassantOption> {
+    fn setup_ep_options(base_piece_set: &[PieceSetElement], n_unique_pawns: usize, combinations_without_ep: usize) -> Vec<EnpassantOption> {
         let mut ep_options = vec![];
         let mut range_start = 0;
         let mut range_end = combinations_without_ep;
         ep_options.push(EnpassantOption {
             square: None,
-            pawn_idx_sntm: None,
-            pawn_idx_stm: None,
+            piece_set: base_piece_set.to_vec(),
             range_start,
             range_end,
         });
         range_start = range_end;
+        let pawns = &base_piece_set[0..n_unique_pawns];
         for i in 0..pawns.len() {
             if pawns[i].side == EgtSide::SideNotToMove {
                 for j in 0..pawns.len() {
@@ -313,10 +321,27 @@ impl Indexer {
                             }
 
                             range_end = range_start + combinations;
+
+                            // Build the pre-adjusted piece set for this option by cloning
+                            // the base set and reducing multiplicity/n_squares.
+                            let mut option_piece_set = base_piece_set.to_vec();
+                            // sntm pawn: multiplicity -= 1, n_squares -= 3.
+                            {
+                                let p = &mut option_piece_set[i];
+                                p.multiplicity -= 1;
+                                p.n_squares -= 3;
+                                p.combinations = N_CHOOSE_K[p.multiplicity][p.n_squares];
+                            }
+                            // stm pawn (if any): n_squares -= 3.
+                            if let Some(x) = istm {
+                                let p = &mut option_piece_set[x];
+                                p.n_squares -= 3;
+                                p.combinations = N_CHOOSE_K[p.multiplicity][p.n_squares];
+                            }
+
                             ep_options.push(EnpassantOption {
                                 square: Some(Square::from_coords(File::new(i_file as u32), Rank::Fifth)),
-                                pawn_idx_sntm: Some(i),
-                                pawn_idx_stm: istm,
+                                piece_set: option_piece_set,
                                 range_start,
                                 range_end,
                             });
@@ -336,7 +361,7 @@ impl Indexer {
         //println!("en passant: {:?}", position.en_passant());
         let ep_pawn_square = position.legal_ep_square().map(|sq| Square::from_coords(sq.file(), Rank::Fifth));
         let index_offset = self.adjust_ep_from_position(scratch, ep_pawn_square);
-        // Now `current_ep_option` reflects the en passant status of the position.
+        // Now the en passant option reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
 
@@ -373,8 +398,9 @@ impl Indexer {
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
 
             for i in 1..self.n_unique_pawns {
-                if scratch.piece_set[i-1].role == scratch.piece_set[i].role {
-                    let span = (scratch.piece_set[i-1].span.0, scratch.piece_set[i].span.1);
+                let piece_set = self.piece_set(scratch);
+                if piece_set[i-1].role == piece_set[i].role {
+                    let span = (piece_set[i-1].span.0, piece_set[i].span.1);
                     Self::compact_pidx(&mut scratch.buffer_pidx[span.0..span.1]);
                 }
             }
@@ -402,7 +428,7 @@ impl Indexer {
         }
         debug_assert!(index < self.index_range);
         let index_offset = self.adjust_ep_from_index(scratch, index);
-        // Now `current_ep_option` reflects the en passant status as encoded in the index.
+        // Now the en passant option reflects the en passant status as encoded in the index.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be decoded from indexes in 0..3 instead of 0..6.
 
@@ -412,8 +438,9 @@ impl Indexer {
             // `buffer_pidx` has value ranges that look like [0..6, 0..5, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
             for i in 1..self.n_unique_pawns {
-                if scratch.piece_set[i-1].role == scratch.piece_set[i].role {
-                    let span = (scratch.piece_set[i-1].span.0, scratch.piece_set[i].span.1);
+                let piece_set = self.piece_set(scratch);
+                if piece_set[i-1].role == piece_set[i].role {
+                    let span = (piece_set[i-1].span.0, piece_set[i].span.1);
                     Self::uncompact_cpidx(&mut scratch.buffer_pidx[span.0..span.1]);
                 }
             }
@@ -447,27 +474,24 @@ impl Indexer {
         self.coord_to_position(scratch, side_to_move)
     }
 
-    // Checks whether the position allows en passant and adjusts the internal
-    // setup to encode it. Returns the index offset to apply to the encoded value.
+    // Checks whether the position allows en passant and selects the corresponding
+    // en passant option. Returns the index offset to apply to the encoded value.
     fn adjust_ep_from_position(&self, scratch: &mut IndexerScratch, ep_square: Option<Square>) -> usize {
-        if scratch.current_ep_option.square != ep_square {
-            self.unapply_ep_option(scratch);
-            scratch.current_ep_option = *self.ep_options.iter().find(|opt| opt.square == ep_square).unwrap();
-            self.apply_ep_option(scratch);
+        if self.ep_options[scratch.current_ep_idx].square != ep_square {
+            scratch.current_ep_idx = self.ep_options.iter().position(|opt| opt.square == ep_square).unwrap();
         }
-        scratch.current_ep_option.range_start
+        self.ep_options[scratch.current_ep_idx].range_start
     }
 
-    // Checks to which en passant option this index corresponds and adjusts the
-    // internal setup to decode it. Returns the index offset to apply to decode the value.
+    // Checks to which en passant option this index corresponds and selects it.
+    // Returns the index offset to apply to decode the value.
     fn adjust_ep_from_index(&self, scratch: &mut IndexerScratch, index: usize) -> usize {
-        let new_ep_option = *self.ep_options.iter().find(|ep| index < ep.range_end).unwrap();
-        if scratch.current_ep_option.square != new_ep_option.square {
-            self.unapply_ep_option(scratch);
-            scratch.current_ep_option = new_ep_option;
-            self.apply_ep_option(scratch);
+        if index >= self.ep_options[scratch.current_ep_idx].range_end
+            || index < self.ep_options[scratch.current_ep_idx].range_start
+        {
+            scratch.current_ep_idx = self.ep_options.iter().position(|ep| index < ep.range_end).unwrap();
         }
-        scratch.current_ep_option.range_start
+        self.ep_options[scratch.current_ep_idx].range_start
     }
 
     // Pawnless positions are reduced to a canonical form through rotations and reflections
@@ -510,43 +534,12 @@ impl Indexer {
 
     }
 
-    fn apply_ep_option(&self, scratch: &mut IndexerScratch) {
-        if let Some(i) = scratch.current_ep_option.pawn_idx_sntm {
-            // For pawns (side-not-to-move) on the file
-            // where en passant capture is possible:
-            // - the pawn on 5th rank does not need to be encoded.
-            // - the remaining k-1 pawns cannot occupy the 5th, 6th
-            //   or 7th rank.
-            scratch.piece_set[i].multiplicity -= 1;
-            scratch.piece_set[i].n_squares -= 3;
-            scratch.piece_set[i].combinations = N_CHOOSE_K[scratch.piece_set[i].multiplicity][scratch.piece_set[i].n_squares];
-        }
-        if let Some(i) = scratch.current_ep_option.pawn_idx_stm {
-            // For pawns (side-to-move) on the file
-            // where en passant capture is possible:
-            // - the pawns cannot occupy the 5th, 6th
-            //   or 7th rank.
-            scratch.piece_set[i].n_squares -= 3;
-            scratch.piece_set[i].combinations = N_CHOOSE_K[scratch.piece_set[i].multiplicity][scratch.piece_set[i].n_squares];
-        }
-    }
 
-    fn unapply_ep_option(&self, scratch: &mut IndexerScratch) {
-        if let Some(i) = scratch.current_ep_option.pawn_idx_sntm {
-            scratch.piece_set[i].multiplicity += 1;
-            scratch.piece_set[i].n_squares += 3;
-            scratch.piece_set[i].combinations = N_CHOOSE_K[scratch.piece_set[i].multiplicity][scratch.piece_set[i].n_squares];
-        }
-        if let Some(i) = scratch.current_ep_option.pawn_idx_stm {
-            scratch.piece_set[i].n_squares += 3;
-            scratch.piece_set[i].combinations = N_CHOOSE_K[scratch.piece_set[i].multiplicity][scratch.piece_set[i].n_squares];
-        }
-    }
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
     fn position_to_coord(&self, scratch: &mut IndexerScratch, position: &Chess) {
         assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
-        for p in &scratch.piece_set {
+        for p in self.piece_set(scratch) {
             let mut bb = match p.role {
                 EgtRole::Pawn(f) => position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
                 EgtRole::King => position.board().by_role(Role::King),
@@ -585,7 +578,7 @@ impl Indexer {
 
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
-        for p in &scratch.piece_set {
+        for p in self.piece_set(scratch) {
             let role = p.role.to_role();
             let color = match p.side {
                 EgtSide::SideToMove => side_to_move,
@@ -599,7 +592,7 @@ impl Indexer {
             }
         }
 
-        let ep_square = if let Some(square) = scratch.current_ep_option.square {
+        let ep_square = if let Some(square) = self.current_ep_option(scratch).square {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
@@ -643,7 +636,7 @@ impl Indexer {
 
     // Sort coordinates for repeated pieces from highest to lowest.
     fn sort_coord_repeated_pieces(&self, scratch: &mut IndexerScratch) {
-        for p in &scratch.piece_set {
+        for p in self.piece_set(scratch) {
             if p.span.1 - p.span.0 > 1 {
                 scratch.buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
             }
@@ -691,7 +684,7 @@ impl Indexer {
     // where 0 indicates that the pawn is on the 2nd rank, 5 indicates that
     // the pawn is on the 7th rank.
     fn pawn_pidx_to_cpidx(&self, scratch: &mut IndexerScratch) {
-        for p in &scratch.piece_set[0..self.n_unique_pawns] {
+        for p in &self.piece_set(scratch)[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
                 scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 - 1;
             }
@@ -701,7 +694,7 @@ impl Indexer {
     // Converts compact position indexes (cpidx) for pawns (in 0..6) to indexes
     // in 0..64, and converts these indexes to piece coordinates.
     fn pawn_cpidx_to_pidx(&self, scratch: &mut IndexerScratch) {
-        for p in &scratch.piece_set[0..self.n_unique_pawns] {
+        for p in &self.piece_set(scratch)[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
                 scratch.buffer_coord[i] = (scratch.buffer_pidx[i] + 1, p.role.to_index());
                 scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 * 8 + scratch.buffer_coord[i].1;
@@ -722,7 +715,7 @@ impl Indexer {
     // the values of the compact position indexes (cpidx) into a single number.
     fn cpidx_to_index(&self, scratch: &IndexerScratch) -> usize {
         let mut index = 0;
-        for p in &scratch.piece_set {
+        for p in self.piece_set(scratch) {
             index *= p.combinations;
             let mut i = p.span.1;
             for k in 1..=p.multiplicity {
@@ -746,7 +739,7 @@ impl Indexer {
     //   occupy among the set of non-already-occupied squares.
     fn index_to_cpidx(&self, scratch: &mut IndexerScratch, index: usize) {
         let mut v = index;
-        for p in scratch.piece_set.iter().rev() {
+        for p in self.piece_set(scratch).iter().rev() {
             let mut x = v % p.combinations;
             v /= p.combinations;
             let mut n = p.n_squares;
