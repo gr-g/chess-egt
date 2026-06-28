@@ -122,8 +122,10 @@ pub struct PieceSetElement {
 // the ep-pawn slot stays reserved in the buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnpassantOption {
-    // The en passant square if en passant is possible, or None.
-    pub square: Option<Square>,
+    // The file of the en passant pawn if en passant is possible, or None.
+    // The rank is implicit: from the side-to-move's perspective, the en
+    // passant pawn is always on the 5th rank.
+    pub file: Option<File>,
 
     // The piece set adjusted for this en passant option.
     pub piece_set: Vec<PieceSetElement>,
@@ -273,7 +275,7 @@ impl Indexer {
         let mut range_start = 0;
         let mut range_end = combinations_without_ep;
         ep_options.push(EnpassantOption {
-            square: None,
+            file: None,
             piece_set: base_piece_set.to_vec(),
             range_start,
             range_end,
@@ -340,7 +342,7 @@ impl Indexer {
                             }
 
                             ep_options.push(EnpassantOption {
-                                square: Some(Square::from_coords(File::new(i_file as u32), Rank::Fifth)),
+                                file: Some(File::new(i_file as u32)),
                                 piece_set: option_piece_set,
                                 range_start,
                                 range_end,
@@ -359,8 +361,8 @@ impl Indexer {
     pub fn position_to_index(&self, scratch: &mut IndexerScratch, position: &Chess) -> usize {
         //println!("position_to_index: {}", position);
         //println!("en passant: {:?}", position.en_passant());
-        let ep_pawn_square = position.legal_ep_square().map(|sq| Square::from_coords(sq.file(), Rank::Fifth));
-        let index_offset = self.adjust_ep_from_position(scratch, ep_pawn_square);
+        let ep_file = position.legal_ep_square().map(|sq| sq.file());
+        let index_offset = self.adjust_ep_from_position(scratch, ep_file);
         // Now the en passant option reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
@@ -476,9 +478,9 @@ impl Indexer {
 
     // Checks whether the position allows en passant and selects the corresponding
     // en passant option. Returns the index offset to apply to the encoded value.
-    fn adjust_ep_from_position(&self, scratch: &mut IndexerScratch, ep_square: Option<Square>) -> usize {
-        if self.ep_options[scratch.current_ep_idx].square != ep_square {
-            scratch.current_ep_idx = self.ep_options.iter().position(|opt| opt.square == ep_square).unwrap();
+    fn adjust_ep_from_position(&self, scratch: &mut IndexerScratch, ep_file: Option<File>) -> usize {
+        if self.ep_options[scratch.current_ep_idx].file != ep_file {
+            scratch.current_ep_idx = self.ep_options.iter().position(|opt| opt.file == ep_file).unwrap();
         }
         self.ep_options[scratch.current_ep_idx].range_start
     }
@@ -592,12 +594,12 @@ impl Indexer {
             }
         }
 
-        let ep_square = if let Some(square) = self.current_ep_option(scratch).square {
+        let ep_square = if let Some(file) = self.current_ep_option(scratch).file {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
             };
-            Some(Square::from_coords(square.file(), target_rank))
+            Some(Square::from_coords(file, target_rank))
         } else {
             None
         };

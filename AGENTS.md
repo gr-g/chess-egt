@@ -11,7 +11,7 @@ TODO:
 - Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
 - Implement EgtProber::verify_with_syzygy(). Understand mismatch in Syzygy statistics for KP_KP (we have more wins and draws).
-- Align ep_square with shakmaty
+
 - Verify index_ranges table-by-table. Print counter during verification.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle. Use something else instead of table_a == table_b.
