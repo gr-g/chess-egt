@@ -11,8 +11,8 @@ Goals:
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt` & `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFile` & `Arena`)**: Manages the physical files on disk, seekable Zstd compression/decompression, and the in-memory frame cache.
-4. **Retrograde Analysis**: The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
+3. **Storage & Memory Layer (`EgtFile`)**: Manages the physical files on disk, seekable Zstd compression/decompression, and the in-memory frame cache.
+4. **Retrograde Analysis** (`RetrogradeSolver`): The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
 Each position's outcome is represented by a 16-bit `DtcOutcome` value.
@@ -28,7 +28,7 @@ The 16 bits of a `DtcOutcome` are structured as follows:
   - `0b101`: Loss - Opponent can force a capture in n plies converting to a losing position
   - `0b111`: Loss - Opponent can force a promotion in n plies converting to a losing position
 - **Bits 3-15 (Distance to Conversion)**:
-  - A 13-bit unsigned integer representing the number of plys to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
+  - A 13-bit unsigned integer representing the number of plies to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 ## 3. Indexing & Symmetries
 
@@ -70,20 +70,13 @@ On disk, an `EgtFile` is compressed using a seekable Zstd format (via the `zeeks
 - The file is divided into **frames**, each containing a fixed number of positions (default: 16384).
 - Each frame is compressed independently, allowing seekable random access.
 
-Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed (bit-sliced) to maximize compressibility:
-1. **Slice 0 (1 bit/pos)**: Bit 0 of all $N$ outcomes ($N/8$ bytes).
-2. **Slice 1 (1 bit/pos)**: Bit 1 of all $N$ outcomes ($N/8$ bytes).
-3. **Slice 2 (1 bit/pos)**: Bit 2 of all $N$ outcomes ($N/8$ bytes).
-   *(Slices 0-2 encode the WDL outcome and conversion type).*
-4. **Slice 3 (4 bits/pos)**: Bits 3-6 of all $N$ outcomes ($N/2$ bytes).
-5. **Slice 4 (4 bits/pos)**: Bits 7-10 of all $N$ outcomes ($N/2$ bytes).
-6. **Slice 5 (5 bits/pos)**: Bits 11-15 of all $N$ outcomes ($5N/8$ bytes).
-   *(Slices 3-5 encode the distance to conversion. Slice 5 is almost always all zeros).*
+Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
+1. First: the low byte of all $N$ outcomes ($N$ bytes).
+2. Second: the high byte of all $N$ outcomes, skipping the (unused) high byte for invalid and drawn positions (max $N$ bytes).
 
-The scrambled sequence of bits is concatenated and compressed using Zstd.
+The new sequence of bytes is compressed using Zstd.
 
-## 5. Memory Management & Arena
-An `Arena` manages a fixed pool of memory (e.g., 16GB) allocated at startup.
+## 5. Memory Management
 
 ### 5.1 Frame States
 Each frame in an `EgtFile` can be in one of three states:
@@ -91,10 +84,10 @@ Each frame in an `EgtFile` can be in one of three states:
 2. **Compressed**: Only the compressed representation of the frame is stored in memory.
 3. **Uncompressed**: The frame is fully uncompressed in memory as a contiguous array of `u16` values.
 
-When a frame needs to be written to or read, its uncompressed buffer is allocated from the `Arena`.
-If the `Arena` runs out of memory, the Least Recently Used (LRU) uncompressed frames are evicted:
+When a frame needs to be written to or read, its uncompressed buffer is allocated.
+If the memory used reaches an assigned limit, the Least Recently Used (LRU) uncompressed frames are evicted:
 - **If `dirty == true`**: The frame is bit-sliced, compressed using Zstd, and its state transitions to `Compressed`. The uncompressed memory is returned to the `Arena`.
-- **If `dirty == false`**: The uncompressed memory is immediately freed and returned to the `Arena` without re-compression (using the cached `compressed` bytes).
+- **If `dirty == false`**: The uncompressed memory is immediately freed without re-compression (using the cached `compressed` bytes).
 
 ## 6. Retrograde Analysis
 Retrograde analysis is the recursive algorithm used to generate endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.
@@ -111,7 +104,7 @@ During the retrograde propagation, each unresolved position must track a decreme
 The move counter is generally initialized as the number of legal moves in a position. But note that there are interactions between the move counter initialization and the use of symmetries to canonicalize pawnless positions: there is the possibility that different legal moves result in positions that map to the same index, and similarly the retrograde analsys can find different reverse moves that map to the same index. For reference see section 4.6 [here](https://issuu.com/jespertk/docs/master_thesis).
 
 A formal approach is the following. Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent positions and `#p=4` if it represents 4 equivalent positions (with our choice of canonicalization, `#p=4` positions are positions with both kings on the a1-h8 diagonal). When initializing the counters, if there is a legal move `p -> p'` with `#p=8` and `#p'=4`, then there is a move (the symmetric along the diagonal) which goes from a non canonical position (the reflection of `p` along the diagonal) to a canonical position (the reflection of `p'` along the diagonal), which will be explored during backward propagation. To account for this, moves `p -> p'` with `#p=8` and `#p'=4` should increment the counter by 2 during initialization.
-Similarly, when retrograde propagation from `p'` finds move `p -> p'` with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the counter for the reflection of `p` along the diagonal should also be decremented (since the symmetric move contributed to the counter for the reflection of `p` but led to a non-canonical position).
+Similarly, when retrograde propagation from `p'` finds a reverse move `p -> p'` with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the counter for the reflection of `p` along the diagonal should also be decremented (since the symmetric move contributed to the counter for the reflection of `p` but led to a non-canonical position).
 
 ### 6.3 Initialization Phase
 Before starting the main retrograde loop, both tables in the pair are initialized:
@@ -161,4 +154,4 @@ The current approach relies only on `quiet_unmoves()`: a function that lists rev
 
 In principle another approach is possible, which consists in scanning all indexes of simpler endgames, generating reverse capture/promotion moves from there (with unmove functions such as `capture_unmoves()`, `promotion_unmoves()`, or `promotion_capture_unmoves()`) and using these for populating the queue of indexes to update.
 
-If this approach was used, note that special care should be given to unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry). The process would be to reconstruct the 4 rotations of the canonical pawnless board, then call the retrograde unmove function on each of the 4 rotations. As a final step, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.
+If this approach was used, note that special care should be given to unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry). The process would be to reconstruct the 4 rotations of the canonical pawnless board, then call the retrograde unmove function on each of the 4 rotations. For each resulting predecessor board, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.

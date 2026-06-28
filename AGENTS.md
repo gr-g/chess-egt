@@ -9,7 +9,7 @@ TODO:
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
-- Implement EgtProber::verify_with_syzygy(). Understand mismatch in Syzygy statistics for KP_KP (we have more wins and draws).
+- Add stats without en passant positions to EgtFileStats and implement EgtProber::verify_with_syzygy() to check our stats against the Syzygy stats available on the internet.
 - Verify index_ranges table-by-table. Print counter during verification.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle? Use something else instead of table_a == table_b?
