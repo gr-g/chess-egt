@@ -329,7 +329,7 @@ impl EgtFile {
 
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
-    pub fn map_position_to_index(&mut self, position: &Chess) -> EgtResult<usize> {
+    pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
         let stm_color = position.turn();
         let sntm_color = !stm_color;
 
@@ -372,7 +372,7 @@ impl EgtFile {
     }
 
     /// Converts a global index to a position.
-    pub fn index_to_position(&mut self, index: usize, side_to_move: Color) -> Option<Chess> {
+    pub fn index_to_position(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         if index >= self.index_range {
             return None;
         }
@@ -818,7 +818,7 @@ mod tests {
 
     fn run_round_trip_test(endgame: &str, stride: usize) {
         let path = PathBuf::from(".");
-        let mut egt_file = EgtFile::new(&path, endgame).unwrap();
+        let egt_file = EgtFile::new(&path, endgame).unwrap();
 
         let mut offset = 0;
         let num_egts = egt_file.egts.len();

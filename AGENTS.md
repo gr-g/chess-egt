@@ -5,19 +5,18 @@
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 TODO:
-- Use ArrayVec and use new IndexScratch on each position_from_index/position_to_index call.
 - Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
 - Implement EgtProber::verify_with_syzygy(). Understand mismatch in Syzygy statistics for KP_KP (we have more wins and draws).
-
 - Verify index_ranges table-by-table. Print counter during verification.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
-- Put queues inside EgtHandle. Use something else instead of table_a == table_b.
-- Make solver read-only, remove name from EgtHandle.
+- Put queues inside EgtHandle? Use something else instead of table_a == table_b?
 - Experiment with approach using capture/promotion unmoves for initialization.
 - Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
+- Internalize quiet_unmoves() and use stock shakmaty?
+- Frontend, cloning https://syzygy-tables.info/
 
 # Design Specifications
 
@@ -25,8 +24,8 @@ TODO:
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt` & `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFile` & `Arena`)**: Manages the physical files on disk, seekable Zstd compression/decompression, and the in-memory frame cache.
-4. **Retrograde Analysis**: The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
+3. **Storage & Memory Layer (`EgtFile`)**: Manages the physical files on disk, seekable Zstd compression/decompression, and the in-memory frame cache.
+4. **Retrograde Analysis** (`RetrogradeSolver`): The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
 Each position's outcome is represented by a 16-bit `DtcOutcome` value.
@@ -84,20 +83,13 @@ On disk, an `EgtFile` is compressed using a seekable Zstd format (via the `zeeks
 - The file is divided into **frames**, each containing a fixed number of positions (default: 16384).
 - Each frame is compressed independently, allowing seekable random access.
 
-Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed (bit-sliced) to maximize compressibility:
-1. **Slice 0 (1 bit/pos)**: Bit 0 of all $N$ outcomes ($N/8$ bytes).
-2. **Slice 1 (1 bit/pos)**: Bit 1 of all $N$ outcomes ($N/8$ bytes).
-3. **Slice 2 (1 bit/pos)**: Bit 2 of all $N$ outcomes ($N/8$ bytes).
-   *(Slices 0-2 encode the WDL outcome and conversion type).*
-4. **Slice 3 (4 bits/pos)**: Bits 3-6 of all $N$ outcomes ($N/2$ bytes).
-5. **Slice 4 (4 bits/pos)**: Bits 7-10 of all $N$ outcomes ($N/2$ bytes).
-6. **Slice 5 (5 bits/pos)**: Bits 11-15 of all $N$ outcomes ($5N/8$ bytes).
-   *(Slices 3-5 encode the distance to conversion. Slice 5 is almost always all zeros).*
+Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
+1. First: the low byte of all $N$ outcomes ($N$ bytes).
+2. Second: the high byte of all $N$ outcomes, skipping the (unused) high byte for invalid and drawn positions (max $N$ bytes).
 
-The scrambled sequence of bits is concatenated and compressed using Zstd.
+The new sequence of bytes is compressed using Zstd.
 
-## 5. Memory Management & Arena
-An `Arena` manages a fixed pool of memory (e.g., 16GB) allocated at startup.
+## 5. Memory Management
 
 ### 5.1 Frame States
 Each frame in an `EgtFile` can be in one of three states:
@@ -105,10 +97,10 @@ Each frame in an `EgtFile` can be in one of three states:
 2. **Compressed**: Only the compressed representation of the frame is stored in memory.
 3. **Uncompressed**: The frame is fully uncompressed in memory as a contiguous array of `u16` values.
 
-When a frame needs to be written to or read, its uncompressed buffer is allocated from the `Arena`.
-If the `Arena` runs out of memory, the Least Recently Used (LRU) uncompressed frames are evicted:
+When a frame needs to be written to or read, its uncompressed buffer is allocated.
+If the memory used reaches an assigned limit, the Least Recently Used (LRU) uncompressed frames are evicted:
 - **If `dirty == true`**: The frame is bit-sliced, compressed using Zstd, and its state transitions to `Compressed`. The uncompressed memory is returned to the `Arena`.
-- **If `dirty == false`**: The uncompressed memory is immediately freed and returned to the `Arena` without re-compression (using the cached `compressed` bytes).
+- **If `dirty == false`**: The uncompressed memory is immediately freed without re-compression (using the cached `compressed` bytes).
 
 ## 6. Retrograde Analysis
 Retrograde analysis is the recursive algorithm used to generate endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.

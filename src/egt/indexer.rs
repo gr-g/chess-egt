@@ -1,4 +1,5 @@
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
+use arrayvec::ArrayVec;
 use crate::piece_set::{EgtRole, EgtSide};
 use crate::error::{EgtError, EgtResult};
 use std::cmp::Reverse;
@@ -137,14 +138,10 @@ pub struct EnpassantOption {
     pub range_end: usize,
 }
 
-// A mutable scratch buffer used to encode/decode positions.
-#[derive(Clone, Debug)]
-pub struct IndexerScratch {
-    // The index into `Indexer::ep_options` of the currently selected option.
-    pub current_ep_idx: usize,
-    pub buffer_coord: Vec<(usize, usize)>,
-    pub buffer_pidx: Vec<usize>,
-}
+// Stack-allocated buffers used to encode/decode positions without heap allocation.
+// Both are sized to `MAX_PIECES`, the maximum number of pieces supported by an endgame.
+type CoordBuf = ArrayVec<(usize, usize), MAX_PIECES>;
+type PidxBuf = ArrayVec<usize, MAX_PIECES>;
 
 // Helper object taking care of the efficient conversion from positions to
 // compact indexes representing the positions, and viceversa.
@@ -218,24 +215,28 @@ impl Indexer {
         })
     }
 
-    pub fn create_scratch(&self) -> IndexerScratch {
-        IndexerScratch {
-            current_ep_idx: 0,
-            buffer_coord: vec![(0, 0); self.n_pieces],
-            buffer_pidx: vec![0; self.n_pieces],
-        }
+    // Returns the piece set adjusted for the given en passant option.
+    #[inline]
+    fn piece_set(&self, ep_idx: usize) -> &Vec<PieceSetElement> {
+        &self.ep_options[ep_idx].piece_set
     }
 
-    // Returns the piece set adjusted for the currently selected en passant option.
+    // Returns the en passant option at the given index.
     #[inline]
-    fn piece_set(&self, scratch: &IndexerScratch) -> &Vec<PieceSetElement> {
-        &self.ep_options[scratch.current_ep_idx].piece_set
+    fn ep_option(&self, ep_idx: usize) -> &EnpassantOption {
+        &self.ep_options[ep_idx]
     }
 
-    // Returns the currently selected en passant option.
+    // Builds a `CoordBuf` pre-filled with `(0, 0)` for `n` pieces.
     #[inline]
-    fn current_ep_option(&self, scratch: &IndexerScratch) -> &EnpassantOption {
-        &self.ep_options[scratch.current_ep_idx]
+    fn filled_coord(n: usize) -> CoordBuf {
+        (0..n).map(|_| (0, 0)).collect()
+    }
+
+    // Builds a `PidxBuf` pre-filled with `0` for `n` pieces.
+    #[inline]
+    fn filled_pidx(n: usize) -> PidxBuf {
+        (0..n).map(|_| 0).collect()
     }
 
     fn compute_piece_squares(piece_set: &mut[PieceSetElement]) {
@@ -358,142 +359,144 @@ impl Indexer {
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
-    pub fn position_to_index(&self, scratch: &mut IndexerScratch, position: &Chess) -> usize {
+    pub fn position_to_index(&self, position: &Chess) -> usize {
         //println!("position_to_index: {}", position);
         //println!("en passant: {:?}", position.en_passant());
         let ep_file = position.legal_ep_square().map(|sq| sq.file());
-        let index_offset = self.adjust_ep_from_position(scratch, ep_file);
+        let (index_offset, ep_idx) = self.adjust_ep_from_position(ep_file);
         // Now the en passant option reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
 
-        self.position_to_coord(scratch, position);
+        let mut buffer_coord = Self::filled_coord(self.n_pieces);
+        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+
+        self.position_to_coord(ep_idx, &mut buffer_coord, position);
         // Now `buffer_coord` has the coordinates (rank, file) of the pieces.
-        //println!("buffer_coord: {:?}", scratch.buffer_coord);
+        //println!("buffer_coord: {:?}", buffer_coord);
 
         if self.n_pawns == 0 {
-            self.reduce_symmetries(scratch);
+            self.reduce_symmetries(&mut buffer_coord);
             // Now the first item in `buffer_coord` has coordinates restricted to 10 squares.
-            //println!("buffer_coord: {:?}", scratch.buffer_coord);
+            //println!("buffer_coord: {:?}", buffer_coord);
         }
 
-        self.sort_coord_repeated_pieces(scratch);
+        self.sort_coord_repeated_pieces(ep_idx, &mut buffer_coord);
         // Now `buffer_coord` has the sorted coordinates for repeated pieces.
-        //println!("buffer_coord: {:?}", scratch.buffer_coord);
+        //println!("buffer_coord: {:?}", buffer_coord);
 
-        self.coord_to_pidx(scratch);
+        self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
         // Now `buffer_pidx` has the position indexes, with
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
-        //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+        //println!("buffer_pidx: {:?}", buffer_pidx);
 
-        Self::compact_pidx(&mut scratch.buffer_pidx);
+        Self::compact_pidx(&mut buffer_pidx);
         // Now `buffer_pidx` has compact positions indexes, with
         // values in [0..64, 0..63, 0..62, 0..61, ...].
-        //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+        //println!("buffer_pidx: {:?}", buffer_pidx);
 
         if self.n_pawns > 0 {
-            self.pawn_pidx_to_cpidx(scratch);
+            self.pawn_pidx_to_cpidx(ep_idx, &buffer_coord, &mut buffer_pidx);
             // Now the first `n_pawns` elements of `buffer_pidx` have
             // the pawn positions encoded in 0..6 (or 0..3), so the value
             // ranges look like [0..6, 0..6, 0..62, 0..61, ...].
             // The positions of pawns on the same file are non-overlapping.
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
 
             for i in 1..self.n_unique_pawns {
-                let piece_set = self.piece_set(scratch);
+                let piece_set = self.piece_set(ep_idx);
                 if piece_set[i-1].role == piece_set[i].role {
                     let span = (piece_set[i-1].span.0, piece_set[i].span.1);
-                    Self::compact_pidx(&mut scratch.buffer_pidx[span.0..span.1]);
+                    Self::compact_pidx(&mut buffer_pidx[span.0..span.1]);
                 }
             }
             // Now the positions of pawns on the same file are compacted, so
             // the value ranges look like [0..6, 0..5, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
         } else {
-            self.map_kings(scratch);
+            self.map_kings(&mut buffer_pidx);
             // Now the first element in `buffer_pidx` has values in 0..462
             // and encodes the position of both kings.
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
         }
 
         // Now that we have all compact position indexes in `buffer_pidx`,
         // we can aggregate them into a single value.
-        index_offset + self.cpidx_to_index(scratch)
+        index_offset + self.cpidx_to_index(ep_idx, &buffer_pidx)
     }
 
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
     // If the index represents an invalid position, returns None.
-    pub fn position_from_index(&self, scratch: &mut IndexerScratch, index: usize, side_to_move: Color) -> Option<Chess> {
+    pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         //println!("position_from_index: {}", index);
         if index >= self.index_range {
             return None;
         }
         debug_assert!(index < self.index_range);
-        let index_offset = self.adjust_ep_from_index(scratch, index);
+        let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
         // Now the en passant option reflects the en passant status as encoded in the index.
         // If there are pawns on the en passant file (different from the en passant
         // pawn on the 5th rank), they will be decoded from indexes in 0..3 instead of 0..6.
 
-        self.index_to_cpidx(scratch, index - index_offset);
+        let mut buffer_coord = Self::filled_coord(self.n_pieces);
+        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+
+        self.index_to_cpidx(ep_idx, &mut buffer_pidx, index - index_offset);
 
         if self.n_pawns > 0 {
             // `buffer_pidx` has value ranges that look like [0..6, 0..5, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
             for i in 1..self.n_unique_pawns {
-                let piece_set = self.piece_set(scratch);
+                let piece_set = self.piece_set(ep_idx);
                 if piece_set[i-1].role == piece_set[i].role {
                     let span = (piece_set[i-1].span.0, piece_set[i].span.1);
-                    Self::uncompact_cpidx(&mut scratch.buffer_pidx[span.0..span.1]);
+                    Self::uncompact_cpidx(&mut buffer_pidx[span.0..span.1]);
                 }
             }
             // Now the positions of pawns on the same file are uncompacted, so
             // the value ranges look like [0..6, 0..6, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
 
-            self.pawn_cpidx_to_pidx(scratch);
-            Self::compact_pidx(&mut scratch.buffer_pidx[0..self.n_pawns]);
+            self.pawn_cpidx_to_pidx(ep_idx, &mut buffer_coord, &mut buffer_pidx);
+            Self::compact_pidx(&mut buffer_pidx[0..self.n_pawns]);
             // Now the first `n_pawns` elements of buffer_coord are correct, and `buffer_pidx`
             // has values in [0..64, 0..63, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
         } else {
             // `buffer_pidx` has values in [0..462, 0..1, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
-            self.unmap_kings(scratch);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
+            self.unmap_kings(&mut buffer_pidx);
             // Now `buffer_pidx` has values in [0..64, 0..63, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+            //println!("buffer_pidx: {:?}", buffer_pidx);
         }
 
-        Self::uncompact_cpidx(&mut scratch.buffer_pidx);
+        Self::uncompact_cpidx(&mut buffer_pidx);
         // Now `buffer_pidx` has the positions indexes, with
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
-        //println!("buffer_pidx: {:?}", scratch.buffer_pidx);
+        //println!("buffer_pidx: {:?}", buffer_pidx);
 
-        self.nonpawn_pidx_to_coord(scratch);
+        self.nonpawn_pidx_to_coord(&mut buffer_coord, &buffer_pidx);
         // Now the non-pawn part of `buffer_coord` is correct.
-        //println!("buffer_coord: {:?}", scratch.buffer_coord);
+        //println!("buffer_coord: {:?}", buffer_coord);
 
         // All coordinates are in `buffer_coord`, we can place the pieces to create a new position.
-        self.coord_to_position(scratch, side_to_move)
+        self.coord_to_position(ep_idx, &buffer_coord, side_to_move)
     }
 
     // Checks whether the position allows en passant and selects the corresponding
-    // en passant option. Returns the index offset to apply to the encoded value.
-    fn adjust_ep_from_position(&self, scratch: &mut IndexerScratch, ep_file: Option<File>) -> usize {
-        if self.ep_options[scratch.current_ep_idx].file != ep_file {
-            scratch.current_ep_idx = self.ep_options.iter().position(|opt| opt.file == ep_file).unwrap();
-        }
-        self.ep_options[scratch.current_ep_idx].range_start
+    // en passant option. Returns the index offset to apply to the encoded value
+    // and the index of the selected en passant option.
+    fn adjust_ep_from_position(&self, ep_file: Option<File>) -> (usize, usize) {
+        let ep_idx = self.ep_options.iter().position(|opt| opt.file == ep_file).unwrap();
+        (self.ep_options[ep_idx].range_start, ep_idx)
     }
 
     // Checks to which en passant option this index corresponds and selects it.
-    // Returns the index offset to apply to decode the value.
-    fn adjust_ep_from_index(&self, scratch: &mut IndexerScratch, index: usize) -> usize {
-        if index >= self.ep_options[scratch.current_ep_idx].range_end
-            || index < self.ep_options[scratch.current_ep_idx].range_start
-        {
-            scratch.current_ep_idx = self.ep_options.iter().position(|ep| index < ep.range_end).unwrap();
-        }
-        self.ep_options[scratch.current_ep_idx].range_start
+    // Returns the index offset to apply to decode the value and the index of the
+    // selected en passant option.
+    fn adjust_ep_from_index(&self, index: usize) -> (usize, usize) {
+        let ep_idx = self.ep_options.iter().position(|ep| index < ep.range_end).unwrap();
+        (self.ep_options[ep_idx].range_start, ep_idx)
     }
 
     // Pawnless positions are reduced to a canonical form through rotations and reflections
@@ -510,38 +513,41 @@ impl Indexer {
     //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
     //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
     //    for positions with all pieces on the diagonal.
-    pub fn diagonal_symmetric(&self, scratch: &mut IndexerScratch, index: usize) -> Option<usize> {
+    pub fn diagonal_symmetric(&self, index: usize) -> Option<usize> {
         if self.n_pawns != 0 {
             return None;
         }
 
-        self.index_to_cpidx(scratch, index);
-        self.unmap_kings(scratch);
-        Self::uncompact_cpidx(&mut scratch.buffer_pidx);
-        self.nonpawn_pidx_to_coord(scratch);
+        let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
 
-        let kings_on_diagonal = scratch.buffer_coord[0..2].iter().all(|(r, f)| *r == *f);
+        let mut buffer_coord = Self::filled_coord(self.n_pieces);
+        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+
+        self.index_to_cpidx(ep_idx, &mut buffer_pidx, index - index_offset);
+        self.unmap_kings(&mut buffer_pidx);
+        Self::uncompact_cpidx(&mut buffer_pidx);
+        self.nonpawn_pidx_to_coord(&mut buffer_coord, &buffer_pidx);
+
+        let kings_on_diagonal = buffer_coord[0..2].iter().all(|(r, f)| *r == *f);
         if kings_on_diagonal {
             // Swap coordinates and recode
-            for p in scratch.buffer_coord.iter_mut() { *p = (p.1, p.0); };
-            self.sort_coord_repeated_pieces(scratch);
-            self.coord_to_pidx(scratch);
-            Self::compact_pidx(&mut scratch.buffer_pidx);
-            self.map_kings(scratch);
-            Some(self.cpidx_to_index(scratch))
+            for p in buffer_coord.iter_mut() { *p = (p.1, p.0); };
+            self.sort_coord_repeated_pieces(ep_idx, &mut buffer_coord);
+            self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
+            Self::compact_pidx(&mut buffer_pidx);
+            self.map_kings(&mut buffer_pidx);
+            Some(self.cpidx_to_index(ep_idx, &buffer_pidx))
         } else {
             None
         }
-
-
     }
 
 
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
-    fn position_to_coord(&self, scratch: &mut IndexerScratch, position: &Chess) {
+    fn position_to_coord(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
         assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
-        for p in self.piece_set(scratch) {
+        for p in self.piece_set(ep_idx) {
             let mut bb = match p.role {
                 EgtRole::Pawn(f) => position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
                 EgtRole::King => position.board().by_role(Role::King),
@@ -556,7 +562,7 @@ impl Indexer {
             };
             assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
             for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
-                scratch.buffer_coord[i] = (square.rank().to_usize(), square.file().to_usize());
+                buffer_coord[i] = (square.rank().to_usize(), square.file().to_usize());
             }
         }
 
@@ -564,23 +570,28 @@ impl Indexer {
             // Switch the perspective so that the ranks are encoded from the
             // point of view of the side to move.
             for i in 0..self.n_pieces {
-                scratch.buffer_coord[i].0 = 7 - scratch.buffer_coord[i].0;
+                buffer_coord[i].0 = 7 - buffer_coord[i].0;
             }
         }
     }
 
     // Builds a position using the coordinates stored in `buffer_coord`.
-    fn coord_to_position(&self, scratch: &mut IndexerScratch, side_to_move: Color) -> Option<Chess> {
+    fn coord_to_position(&self, ep_idx: usize, buffer_coord: &CoordBuf, side_to_move: Color) -> Option<Chess> {
+        // We need a mutable copy of the coordinates because we may flip the ranks
+        // for the side-to-move perspective. The flip is undone before returning,
+        // but to avoid mutating the caller's buffer we operate on a local copy.
+        let mut coord: CoordBuf = buffer_coord.clone();
+
         if self.n_pawns > 0 && side_to_move == Color::Black {
             // The ranks are encoded from the point of view of the side to move. Switch them up.
             for i in 0..self.n_pieces {
-                scratch.buffer_coord[i].0 = 7 - scratch.buffer_coord[i].0;
+                coord[i].0 = 7 - coord[i].0;
             }
         }
 
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
-        for p in self.piece_set(scratch) {
+        for p in self.piece_set(ep_idx) {
             let role = p.role.to_role();
             let color = match p.side {
                 EgtSide::SideToMove => side_to_move,
@@ -588,13 +599,13 @@ impl Indexer {
             };
             let piece = Piece { color, role };
             for i in p.span.0..p.span.1 {
-                let (r, f) = scratch.buffer_coord[i];
+                let (r, f) = coord[i];
                 let square = Square::from_coords(File::new(f as u32), Rank::new(r as u32));
                 setup.board.set_piece_at(square, piece);
             }
         }
 
-        let ep_square = if let Some(file) = self.current_ep_option(scratch).file {
+        let ep_square = if let Some(file) = self.ep_option(ep_idx).file {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
@@ -618,44 +629,44 @@ impl Indexer {
 
     // For pawnless positions, this function applies symmetrical
     // transformations of the coordinates that keep the position unchanged.
-    fn reduce_symmetries(&self, scratch: &mut IndexerScratch) {
-        if scratch.buffer_coord[0].0 > 3 {
+    fn reduce_symmetries(&self, buffer_coord: &mut CoordBuf) {
+        if buffer_coord[0].0 > 3 {
             // flip around horizontal axis
-            for (r, _) in scratch.buffer_coord.iter_mut() { *r = 7 - *r; };
+            for (r, _) in buffer_coord.iter_mut() { *r = 7 - *r; };
         }
-        if scratch.buffer_coord[0].1 > 3 {
+        if buffer_coord[0].1 > 3 {
             // flip around vertical axis
-            for (_, f) in scratch.buffer_coord.iter_mut() { *f = 7 - *f; };
+            for (_, f) in buffer_coord.iter_mut() { *f = 7 - *f; };
         }
-        if scratch.buffer_coord[0].0 > scratch.buffer_coord[0].1 ||
-            (scratch.buffer_coord[0].0 == scratch.buffer_coord[0].1 &&
-            scratch.buffer_coord[1].0 > scratch.buffer_coord[1].1) {
+        if buffer_coord[0].0 > buffer_coord[0].1 ||
+            (buffer_coord[0].0 == buffer_coord[0].1 &&
+            buffer_coord[1].0 > buffer_coord[1].1) {
             // flip diagonally. If both kings are on the diagonal, we intentionally do not
             // diagonal-reflect based on the remaining pieces.
-            for p in scratch.buffer_coord.iter_mut() { *p = (p.1, p.0); };
+            for p in buffer_coord.iter_mut() { *p = (p.1, p.0); };
         }
     }
 
     // Sort coordinates for repeated pieces from highest to lowest.
-    fn sort_coord_repeated_pieces(&self, scratch: &mut IndexerScratch) {
-        for p in self.piece_set(scratch) {
+    fn sort_coord_repeated_pieces(&self, ep_idx: usize, buffer_coord: &mut CoordBuf) {
+        for p in self.piece_set(ep_idx) {
             if p.span.1 - p.span.0 > 1 {
-                scratch.buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
+                buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
             }
         }
     }
 
     // Converts the piece coordinates to indexes in 0..64.
-    fn coord_to_pidx(&self, scratch: &mut IndexerScratch) {
+    fn coord_to_pidx(&self, buffer_coord: &CoordBuf, buffer_pidx: &mut PidxBuf) {
         for i in 0..self.n_pieces {
-            scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 * 8 + scratch.buffer_coord[i].1;
+            buffer_pidx[i] = buffer_coord[i].0 * 8 + buffer_coord[i].1;
         }
     }
 
     // Converts indexes in 0..64 to piece coordinates for non-pawns.
-    fn nonpawn_pidx_to_coord(&self, scratch: &mut IndexerScratch) {
+    fn nonpawn_pidx_to_coord(&self, buffer_coord: &mut CoordBuf, buffer_pidx: &PidxBuf) {
         for i in self.n_pawns..self.n_pieces {
-            scratch.buffer_coord[i] = (scratch.buffer_pidx[i] / 8, scratch.buffer_pidx[i] % 8);
+            buffer_coord[i] = (buffer_pidx[i] / 8, buffer_pidx[i] % 8);
         }
     }
 
@@ -685,49 +696,49 @@ impl Indexer {
     // Converts pawn indexes (pidx) to compact position indexes (cpidx) in 0..6,
     // where 0 indicates that the pawn is on the 2nd rank, 5 indicates that
     // the pawn is on the 7th rank.
-    fn pawn_pidx_to_cpidx(&self, scratch: &mut IndexerScratch) {
-        for p in &self.piece_set(scratch)[0..self.n_unique_pawns] {
+    fn pawn_pidx_to_cpidx(&self, ep_idx: usize, buffer_coord: &CoordBuf, buffer_pidx: &mut PidxBuf) {
+        for p in &self.piece_set(ep_idx)[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
-                scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 - 1;
+                buffer_pidx[i] = buffer_coord[i].0 - 1;
             }
         }
     }
 
     // Converts compact position indexes (cpidx) for pawns (in 0..6) to indexes
     // in 0..64, and converts these indexes to piece coordinates.
-    fn pawn_cpidx_to_pidx(&self, scratch: &mut IndexerScratch) {
-        for p in &self.piece_set(scratch)[0..self.n_unique_pawns] {
+    fn pawn_cpidx_to_pidx(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, buffer_pidx: &mut PidxBuf) {
+        for p in &self.piece_set(ep_idx)[0..self.n_unique_pawns] {
             for i in p.span.0..p.span.1 {
-                scratch.buffer_coord[i] = (scratch.buffer_pidx[i] + 1, p.role.to_index());
-                scratch.buffer_pidx[i] = scratch.buffer_coord[i].0 * 8 + scratch.buffer_coord[i].1;
+                buffer_coord[i] = (buffer_pidx[i] + 1, p.role.to_index());
+                buffer_pidx[i] = buffer_coord[i].0 * 8 + buffer_coord[i].1;
             }
         }
     }
 
-    fn map_kings(&self, scratch: &mut IndexerScratch) {
-        scratch.buffer_pidx[0] = self.kings_map_to_index[scratch.buffer_pidx[0]][scratch.buffer_pidx[1]];
-        scratch.buffer_pidx[1] = 0;
+    fn map_kings(&self, buffer_pidx: &mut PidxBuf) {
+        buffer_pidx[0] = self.kings_map_to_index[buffer_pidx[0]][buffer_pidx[1]];
+        buffer_pidx[1] = 0;
     }
 
-    fn unmap_kings(&self, scratch: &mut IndexerScratch) {
-        (scratch.buffer_pidx[0], scratch.buffer_pidx[1]) = self.kings_map_from_index[scratch.buffer_pidx[0]];
+    fn unmap_kings(&self, buffer_pidx: &mut PidxBuf) {
+        (buffer_pidx[0], buffer_pidx[1]) = self.kings_map_from_index[buffer_pidx[0]];
     }
 
     // Computes the final index representing the position, by aggregating
     // the values of the compact position indexes (cpidx) into a single number.
-    fn cpidx_to_index(&self, scratch: &IndexerScratch) -> usize {
+    fn cpidx_to_index(&self, ep_idx: usize, buffer_pidx: &PidxBuf) -> usize {
         let mut index = 0;
-        for p in self.piece_set(scratch) {
+        for p in self.piece_set(ep_idx) {
             index *= p.combinations;
             let mut i = p.span.1;
             for k in 1..=p.multiplicity {
                 i -= 1;
-                debug_assert!(scratch.buffer_pidx[i] < p.n_squares); // valid cpidx
+                debug_assert!(buffer_pidx[i] < p.n_squares); // valid cpidx
                 if k == 1 {
-                    index += scratch.buffer_pidx[i];
+                    index += buffer_pidx[i];
                 } else {
-                    debug_assert!(scratch.buffer_pidx[i] > scratch.buffer_pidx[i+1]); // decreasing cpidx
-                    index += N_CHOOSE_K[k][scratch.buffer_pidx[i]];
+                    debug_assert!(buffer_pidx[i] > buffer_pidx[i+1]); // decreasing cpidx
+                    index += N_CHOOSE_K[k][buffer_pidx[i]];
                 }
             }
         }
@@ -739,19 +750,19 @@ impl Indexer {
     // - pawn positions encoded with an index in 0..6
     // - non-pawn positions encoded with an index representing the square to
     //   occupy among the set of non-already-occupied squares.
-    fn index_to_cpidx(&self, scratch: &mut IndexerScratch, index: usize) {
+    fn index_to_cpidx(&self, ep_idx: usize, buffer_pidx: &mut PidxBuf, index: usize) {
         let mut v = index;
-        for p in self.piece_set(scratch).iter().rev() {
+        for p in self.piece_set(ep_idx).iter().rev() {
             let mut x = v % p.combinations;
             v /= p.combinations;
             let mut n = p.n_squares;
             if p.span.1 - p.span.0 > p.multiplicity {
                 // There is a non-encoded en passant pawn.
-                scratch.buffer_pidx[p.span.0] = p.n_squares;
+                buffer_pidx[p.span.0] = p.n_squares;
             }
             for k in (1..=p.multiplicity).rev() {
                 if k == 1 {
-                    scratch.buffer_pidx[p.span.1-1] = x;
+                    buffer_pidx[p.span.1-1] = x;
                 } else {
                     // Search for the largest n such that N_CHOOSE_K[k][n] <= x
                     let row = &N_CHOOSE_K[k][0..n];
@@ -760,7 +771,7 @@ impl Indexer {
                         Err(insert_index) => insert_index - 1,
                     };
                     x -= N_CHOOSE_K[k][n];
-                    scratch.buffer_pidx[p.span.1-k] = n;
+                    buffer_pidx[p.span.1-k] = n;
                 }
             }
         }

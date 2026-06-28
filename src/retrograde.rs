@@ -123,11 +123,16 @@ impl EgtFileStatsBuilder {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EgtHandle {
-    pub name: String,
     pub file_idx: usize,
     pub egt_idx: usize,
+}
+
+// Returns the tablename of the sub-table referenced by `handle` within `solver`.
+// Used for logging; the name is not stored on the handle itself.
+fn table_name(solver: &RetrogradeSolver, handle: EgtHandle) -> &str {
+    solver.files[handle.file_idx].egts[handle.egt_idx].tablename()
 }
 
 struct DepthQueues {
@@ -232,13 +237,13 @@ impl RetrogradeSolver {
         }
     }
 
-    pub fn read_outcome(&mut self, handle: &EgtHandle, local_index: usize) -> MaybeDtcOutcome {
+    pub fn read_outcome(&mut self, handle: EgtHandle, local_index: usize) -> MaybeDtcOutcome {
         let file = &mut self.files[handle.file_idx];
         let global_index = file.get_global_index(handle.egt_idx, local_index);
         file.read_from_index(global_index).unwrap()
     }
 
-    pub fn write_outcome(&mut self, handle: &EgtHandle, local_index: usize, outcome: MaybeDtcOutcome) {
+    pub fn write_outcome(&mut self, handle: EgtHandle, local_index: usize, outcome: MaybeDtcOutcome) {
         let file = &mut self.files[handle.file_idx];
         let global_index = file.get_global_index(handle.egt_idx, local_index);
         file.write_to_index(global_index, outcome).unwrap();
@@ -275,17 +280,14 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
 
 pub fn quiet_unmoves<F>(
     solver: &mut RetrogradeSolver,
-    table: &EgtHandle,
-    twin: &EgtHandle,
+    table: EgtHandle,
+    twin: EgtHandle,
     local_index: usize,
     mut f: F,
 ) where
     F: FnMut(&mut RetrogradeSolver, usize),
 {
-    let position = {
-        let file = &mut solver.files[table.file_idx];
-        file.egts[table.egt_idx].position_from_index(local_index, Color::White)
-    };
+    let position = solver.files[table.file_idx].egts[table.egt_idx].position_from_index(local_index, Color::White);
     let position = match position {
         Some(s) => s,
         _ => return,
@@ -305,10 +307,7 @@ pub fn quiet_unmoves<F>(
                     .expect("mirrored predecessor position must be legal");
             }
 
-            let pred_idx = {
-                let twin_file = &mut solver.files[twin.file_idx];
-                twin_file.egts[twin.egt_idx].position_to_index(&pred_position)
-            };
+            let pred_idx = solver.files[twin.file_idx].egts[twin.egt_idx].position_to_index(&pred_position);
             f(solver, pred_idx);
 
             // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
@@ -320,10 +319,7 @@ pub fn quiet_unmoves<F>(
             // (since the symmetric move contributed to the counter for the reflection of `p`
             // but led to a non-canonical position).
             if !current_on_diagonal {
-                let maybe_reflected_idx = {
-                    let twin_file = &mut solver.files[twin.file_idx];
-                    twin_file.egts[twin.egt_idx].diagonal_symmetric(pred_idx)
-                };
+                let maybe_reflected_idx = solver.files[twin.file_idx].egts[twin.egt_idx].diagonal_symmetric(pred_idx);
                 if let Some(reflected_idx) = maybe_reflected_idx {
                     // The current index represents 8 positions, while the predecessor index
                     // represents 4 positions. Push the diagonal reflection of the predecessor.
@@ -438,8 +434,8 @@ impl DependencyCache {
 
 fn initialize_table(
     solver: &mut RetrogradeSolver,
-    table: &EgtHandle,
-    twin: &EgtHandle,
+    table: EgtHandle,
+    twin: EgtHandle,
     dep_cache: &mut DependencyCache,
     table_queues: &mut DepthQueues,
     twin_queues: &mut DepthQueues,
@@ -455,10 +451,7 @@ fn initialize_table(
 
     for idx in 0..size {
         // Decode position using Color::White as side-to-move
-        let position_opt = {
-            let file = &mut solver.files[table.file_idx];
-            file.egts[table.egt_idx].position_from_index(idx, Color::White)
-        };
+        let position_opt = solver.files[table.file_idx].egts[table.egt_idx].position_from_index(idx, Color::White);
 
         if (idx+1) % 10000000 == 0 {
             println!("Scanned {}/{} indexes...", idx+1, size);
@@ -529,8 +522,8 @@ fn initialize_table(
 
 fn propagate_loss_to_win(
     solver: &mut RetrogradeSolver,
-    table: &EgtHandle,
-    twin: &EgtHandle,
+    table: EgtHandle,
+    twin: EgtHandle,
     idx: usize,
     plies: u16,
     ct: ConversionType,
@@ -550,8 +543,8 @@ fn propagate_loss_to_win(
 
 fn propagate_win_to_loss(
     solver: &mut RetrogradeSolver,
-    table: &EgtHandle,
-    twin: &EgtHandle,
+    table: EgtHandle,
+    twin: EgtHandle,
     idx: usize,
     plies: u16,
     ct: ConversionType,
@@ -614,14 +607,14 @@ pub fn retrograde_analysis(
         };
         let twin_key = PawnKey::new(&twin_stm, &twin_sntm);
 
-        let (file_idx_b, egt_idx_b, name_b) = if solver.is_symmetric {
+        let (file_idx_b, egt_idx_b) = if solver.is_symmetric {
             let egt_idx_b = *solver.files[0].egt_map.get(&twin_key)
                 .expect("twin sub-table must exist in symmetric endgame");
-            (0, egt_idx_b, solver.files[0].egts[egt_idx_b].tablename().to_string())
+            (0, egt_idx_b)
         } else {
             let egt_idx_b = *solver.files[1].egt_map.get(&twin_key)
                 .expect("twin sub-table must exist in asymmetric endgame");
-            (1, egt_idx_b, solver.files[1].egts[egt_idx_b].tablename().to_string())
+            (1, egt_idx_b)
         };
 
         if solver.is_symmetric && egt_idx_a > egt_idx_b {
@@ -629,13 +622,11 @@ pub fn retrograde_analysis(
         }
 
         let table_a = EgtHandle {
-            name: egt_a.tablename().to_string(),
             file_idx: 0,
             egt_idx: egt_idx_a,
         };
 
         let table_b = EgtHandle {
-            name: name_b,
             file_idx: file_idx_b,
             egt_idx: egt_idx_b,
         };
@@ -662,7 +653,7 @@ pub fn retrograde_analysis(
         ))
     };
 
-    for (table_a, table_b) in &table_pairs {
+    for &(table_a, table_b) in &table_pairs {
         let mut queues_a = DepthQueues::new();
         let mut queues_b = DepthQueues::new();
         let mut next_queues_a = DepthQueues::new();
@@ -670,12 +661,12 @@ pub fn retrograde_analysis(
 
         let (checkmates, stalemates, _) =
             initialize_table(&mut solver, table_a, table_b, &mut dep_cache, &mut queues_a, &mut queues_b)?;
-        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_a.name, checkmates, stalemates);
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(&solver, table_a), checkmates, stalemates);
 
         if table_a != table_b {
             let (checkmates, stalemates, _) =
                 initialize_table(&mut solver, table_b, table_a, &mut dep_cache, &mut queues_b, &mut queues_a)?;
-            println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_b.name, checkmates, stalemates);
+            println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_name(&solver, table_b), checkmates, stalemates);
         } else {
             queues_a.merge(&mut queues_b);
         }
@@ -801,19 +792,19 @@ pub fn retrograde_analysis(
             let queues_capacity_mb = (next_queues_a.capacity() + next_queues_b.capacity()) as f64 / (1024.0 * 1024.0);
 
             if wins_found_a > 0 {
-                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_a.name, wins_found_a, plies, queues_capacity_mb);
+                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_name(&solver, table_a), wins_found_a, plies, queues_capacity_mb);
                 current_max_win_dtc_a = current_max_win_dtc_a.max(plies);
             }
             if losses_found_a > 0 {
-                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_a.name, losses_found_a, plies, queues_capacity_mb);
+                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_name(&solver, table_a), losses_found_a, plies, queues_capacity_mb);
                 current_max_loss_dtc_a = current_max_loss_dtc_a.max(plies);
             }
             if wins_found_b > 0 {
-                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, wins_found_b, plies, queues_capacity_mb);
+                println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_name(&solver, table_b), wins_found_b, plies, queues_capacity_mb);
                 current_max_win_dtc_b = current_max_win_dtc_b.max(plies);
             }
             if losses_found_b > 0 {
-                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_b.name, losses_found_b, plies, queues_capacity_mb);
+                println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_name(&solver, table_b), losses_found_b, plies, queues_capacity_mb);
                 current_max_loss_dtc_b = current_max_loss_dtc_b.max(plies);
             }
 
@@ -842,7 +833,7 @@ pub fn retrograde_analysis(
         }
 
         // Mark all remaining 'unknown' positions as draws
-        println!("{}: marking remaining positions as draws...", table_a.name);
+        println!("{}: marking remaining positions as draws...", table_name(&solver, table_a));
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
             let mut outcome = solver.read_outcome(table_a, idx);
@@ -861,7 +852,7 @@ pub fn retrograde_analysis(
         }
 
         if table_a != table_b {
-            println!("{}: marking remaining positions as draws...", table_b.name);
+            println!("{}: marking remaining positions as draws...", table_name(&solver, table_b));
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
                 let mut outcome = solver.read_outcome(table_b, idx);

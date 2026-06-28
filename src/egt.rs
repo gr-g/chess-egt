@@ -2,7 +2,7 @@ use shakmaty::{Color, File, Chess};
 mod indexer;
 use crate::piece_set::{EgtRole, EgtSide};
 use crate::error::EgtResult;
-use indexer::{Indexer, IndexerScratch};
+use indexer::Indexer;
 
 #[derive(Clone, Debug)]
 pub struct Egt {
@@ -12,9 +12,6 @@ pub struct Egt {
     // The helper object storing the piece set and the information required
     // to convert positions to table indexes.
     pub indexer: Indexer,
-
-    // A mutable scratch buffer used to encode/decode positions.
-    pub scratch: IndexerScratch,
 
     // The name of this table (e.g. "KQ_KPa").
     pub tablename: String,
@@ -53,24 +50,22 @@ impl Egt {
 
         let tablename = compute_tablename(&pieces);
         let indexer = Indexer::from_pieces(&pieces)?;
-        let scratch = indexer.create_scratch();
         Ok(Egt {
             pieces,
             indexer,
-            scratch,
             tablename,
         })
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
-    pub fn position_to_index(&mut self, position: &Chess) -> usize {
-        self.indexer.position_to_index(&mut self.scratch, position)
+    pub fn position_to_index(&self, position: &Chess) -> usize {
+        self.indexer.position_to_index(position)
     }
 
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
     // If the index represents an invalid position, returns None.
-    pub fn position_from_index(&mut self, index: usize, side_to_move: Color) -> Option<Chess> {
-        self.indexer.position_from_index(&mut self.scratch, index, side_to_move)
+    pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
+        self.indexer.position_from_index(index, side_to_move)
     }
 
     // Pawnless positions are reduced to a canonical form through rotations and reflections
@@ -87,8 +82,8 @@ impl Egt {
     //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
     //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
     //    for positions with all pieces on the diagonal.
-    pub fn diagonal_symmetric(&mut self, index: usize) -> Option<usize> {
-        self.indexer.diagonal_symmetric(&mut self.scratch, index)
+    pub fn diagonal_symmetric(&self, index: usize) -> Option<usize> {
+        self.indexer.diagonal_symmetric(index)
     }
 }
 
@@ -239,31 +234,30 @@ mod tests {
     }
 
     fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
-        let mut scratch = egt.indexer.create_scratch();
-        if let Some(position) = egt.indexer.position_from_index(&mut scratch, i, side_to_move) {
-            assert_eq!(i, egt.indexer.position_to_index(&mut scratch, &position));
+        if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
+            assert_eq!(i, egt.indexer.position_to_index(&position));
         }
     }
 
     #[test]
     fn test_diagonal_symmetric() {
-        let mut egt = from_tablename("KR_K").unwrap();
+        let egt = from_tablename("KR_K").unwrap();
 
         for i in [10, 100, 2100] {
-            println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, i, Color::White));
+            println!("{:?}", egt.indexer.position_from_index(i, Color::White));
             assert_eq!(egt.diagonal_symmetric(i), None);
         }
 
-        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 773, Color::White));
-        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 801, Color::White));
+        println!("{:?}", egt.indexer.position_from_index(773, Color::White));
+        println!("{:?}", egt.indexer.position_from_index(801, Color::White));
         assert_eq!(egt.diagonal_symmetric(773), Some(801));
         assert_eq!(egt.diagonal_symmetric(801), Some(773));
 
-        println!("{:?}", egt.indexer.position_from_index(&mut egt.scratch, 805, Color::White));
+        println!("{:?}", egt.indexer.position_from_index(805, Color::White));
         assert_eq!(egt.diagonal_symmetric(805), Some(805));
 
-        let mut egt_p = from_tablename("KPd_K").unwrap();
-        println!("{:?}", egt_p.indexer.position_from_index(&mut egt_p.scratch, 0, Color::White));
+        let egt_p = from_tablename("KPd_K").unwrap();
+        println!("{:?}", egt_p.indexer.position_from_index(0, Color::White));
         assert_eq!(egt_p.diagonal_symmetric(0), None);
     }
 
@@ -333,9 +327,8 @@ mod tests {
 
         for i in 0..egt.index_range() {
             if i == 1911601 {
-                let mut scratch = egt.indexer.create_scratch();
-                println!("{:?}", egt.indexer.position_from_index(&mut scratch, i, Color::White));
-                println!("{:?}", egt.indexer.position_from_index(&mut scratch, i, Color::Black));
+                println!("{:?}", egt.indexer.position_from_index(i, Color::White));
+                println!("{:?}", egt.indexer.position_from_index(i, Color::Black));
             }
             assert_round_trip(&egt, i, Color::White);
             assert_round_trip(&egt, i, Color::Black);
