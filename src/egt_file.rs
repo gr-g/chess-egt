@@ -11,6 +11,9 @@ use serde::{Serialize, Deserialize};
 // 256k positions per frame, corresponding to 512kiB per frame.
 const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 
+// The maximum number of pawns in an endgame.
+const MAX_PAWNS: usize = 8;
+
 // Compression level used when storing data on disk
 const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
 
@@ -120,7 +123,12 @@ impl MaybeDtcOutcome {
 }
 
 /// Represents the state of a single frame in an EgtFile.
+///
+/// The `Compressed` variant (and `ensure_compressed`) are not reached yet: they
+/// exist for the planned LRU eviction of in-memory frames, which is what will
+/// compress a dirty frame without going through a full `save_to_file()`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum FrameState {
     /// The frame is empty.
     Empty,
@@ -138,6 +146,10 @@ pub enum FrameState {
         dirty: bool,
     },
 }
+
+/// A short list of pawn files. Sized to `MAX_PAWNS`, so that the pawn-file
+/// bookkeeping done on every probe stays free of heap allocations.
+pub type FileVec = arrayvec::ArrayVec<File, MAX_PAWNS>;
 
 /// A stack-allocated, copyable key representing the pawn file assignments for both sides.
 /// This avoids all string formatting and heap allocations during tablebase probing.
@@ -180,6 +192,12 @@ pub struct EgtFile {
 
     /// Map from PawnKey to its index in the `egts` vector.
     pub egt_map: HashMap<PawnKey, usize>,
+
+    /// Prefix sums of the sub-table index ranges: `egt_offsets[i]` is the global
+    /// index at which `egts[i]` starts. Has `egts.len() + 1` entries, the last
+    /// one being `index_range`. Precomputed because translating a local index
+    /// into a global one happens on every single read and write.
+    egt_offsets: Vec<usize>,
 
     /// The frames of the file.
     frames: Vec<FrameState>,
@@ -230,7 +248,15 @@ impl EgtFile {
             egts.push(egt);
         }
 
-        let index_range: usize = egts.iter().map(|egt| egt.index_range()).sum();
+        let mut egt_offsets = Vec::with_capacity(egts.len() + 1);
+        let mut acc = 0;
+        for egt in &egts {
+            egt_offsets.push(acc);
+            acc += egt.index_range();
+        }
+        egt_offsets.push(acc);
+        let index_range = acc;
+
         let frame_size = DEFAULT_FRAME_SIZE;
         let num_frames = index_range.div_ceil(frame_size);
 
@@ -244,6 +270,7 @@ impl EgtFile {
             path,
             egts,
             egt_map,
+            egt_offsets,
             frames,
             frame_size,
             index_range,
@@ -278,7 +305,9 @@ impl EgtFile {
     }
 
     /// Save the entire EgtFile using seekable Zstd compression.
-    /// Leaves the data in a compressed state in memory afterwards.
+    ///
+    /// Afterwards all frames are left in the `CompressedOnFile` state: the
+    /// in-memory data is released and re-read from `self.path` on demand.
     pub fn save_to_file(&mut self) -> EgtResult<u64> {
         use std::fs::File;
         use std::io::BufWriter;
@@ -304,12 +333,12 @@ impl EgtFile {
                 // Compress the transposed frame
                 encoder.compress(&transposed)?;
                 encoder.end_frame()?;
-
-                // Drop the uncompressed data from memory
-                self.ensure_compressed(frame_idx)?;
             } else {
                 return Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"));
             }
+
+            // Drop the uncompressed data from memory.
+            self.frames[frame_idx] = FrameState::CompressedOnFile;
         }
 
         // Finish the seekable Zstd file (writes the seek table)
@@ -336,8 +365,8 @@ impl EgtFile {
         let stm_pawns_bb = position.board().pawns() & position.board().by_color(stm_color);
         let sntm_pawns_bb = position.board().pawns() & position.board().by_color(sntm_color);
 
-        let mut stm_files: Vec<File> = stm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
-        let mut sntm_files: Vec<File> = sntm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
+        let mut stm_files: FileVec = stm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
+        let mut sntm_files: FileVec = sntm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
 
         stm_files.sort_by_key(|f| f.to_usize());
         sntm_files.sort_by_key(|f| f.to_usize());
@@ -366,9 +395,9 @@ impl EgtFile {
     }
 
     /// Computes the global index in the file given an Egt index and local index.
+    #[inline]
     pub fn get_global_index(&self, egt_idx: usize, local_index: usize) -> usize {
-        let offset: usize = self.egts[0..egt_idx].iter().map(|egt| egt.index_range()).sum();
-        offset + local_index
+        self.egt_offsets[egt_idx] + local_index
     }
 
     /// Converts a global index to a position.
@@ -377,18 +406,10 @@ impl EgtFile {
             return None;
         }
 
-        let mut remaining_idx = index;
-        let mut target_egt_idx = None;
-        for (egt_idx, egt) in self.egts.iter().enumerate() {
-            let range = egt.index_range();
-            if remaining_idx < range {
-                target_egt_idx = Some(egt_idx);
-                break;
-            }
-            remaining_idx -= range;
-        }
-
-        let egt_idx = target_egt_idx?;
+        // `egt_offsets` is sorted, so the owning sub-table is the last one that
+        // starts at or before `index`.
+        let egt_idx = self.egt_offsets.partition_point(|&offset| offset <= index) - 1;
+        let remaining_idx = index - self.egt_offsets[egt_idx];
         self.egts[egt_idx].position_from_index(remaining_idx, side_to_move)
     }
 
@@ -497,6 +518,9 @@ impl EgtFile {
     }
 
     /// Ensures that the frame at `frame_idx` is in the `Compressed` state.
+    ///
+    /// Currently only exercised by tests; see the note on `FrameState`.
+    #[allow(dead_code)]
     fn ensure_compressed(&mut self, frame_idx: usize) -> EgtResult<()> {
         match &self.frames[frame_idx] {
             FrameState::Empty | FrameState::CompressedOnFile => {
@@ -655,24 +679,39 @@ fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
 }
 
 /// Reflects a list of files horizontally (file f becomes 7 - f).
-pub fn reflect_files(files: &[File]) -> Vec<File> {
-    let mut reflected: Vec<File> = files.iter().map(|f| File::new(7 - f.to_usize() as u32)).collect();
+///
+/// The result is sorted ascending, like the input is expected to be.
+pub fn reflect_files(files: &[File]) -> FileVec {
+    let mut reflected: FileVec = files.iter().map(|f| File::new(7 - f.to_usize() as u32)).collect();
     reflected.sort_by_key(|f| f.to_usize());
     reflected
 }
 
+/// Compares an ascending list of files with its own horizontal reflection.
+///
+/// The reflection of an ascending list is the reversed list with every file
+/// mapped to `7 - f`, so the comparison needs no intermediate allocation.
+fn cmp_with_reflection(files: &[File]) -> std::cmp::Ordering {
+    debug_assert!(files.windows(2).all(|w| w[0].to_usize() <= w[1].to_usize()));
+    files
+        .iter()
+        .map(|f| f.to_usize())
+        .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
+}
+
 /// Checks if a pawn configuration is canonical (lexicographically lower than or equal to its horizontal reflection).
+///
+/// Both slices must be sorted ascending.
 pub fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
-    let stm_ref = reflect_files(stm_files);
-    let sntm_ref = reflect_files(sntm_files);
+    use std::cmp::Ordering;
 
-    let stm_idx: Vec<usize> = stm_files.iter().map(|f| f.to_usize()).collect();
-    let sntm_idx: Vec<usize> = sntm_files.iter().map(|f| f.to_usize()).collect();
-
-    let stm_ref_idx: Vec<usize> = stm_ref.iter().map(|f| f.to_usize()).collect();
-    let sntm_ref_idx: Vec<usize> = sntm_ref.iter().map(|f| f.to_usize()).collect();
-
-    (stm_idx.clone(), sntm_idx.clone()) <= (stm_ref_idx, sntm_ref_idx)
+    // Equivalent to `(stm, sntm) <= (reflect(stm), reflect(sntm))`, evaluated
+    // lazily so that the second component is only inspected on a tie.
+    match cmp_with_reflection(stm_files) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => cmp_with_reflection(sntm_files) != Ordering::Greater,
+    }
 }
 
 /// Builds the pieces vector by combining pawn file assignments and non-pawn pieces.
@@ -898,10 +937,13 @@ mod tests {
         egt_file.save_to_file().unwrap();
         for f in 0..egt_file.frames.len() {
             match egt_file.frames[f] {
-                FrameState::Compressed(_) => {},
+                FrameState::CompressedOnFile => {},
                 _ => panic!("frame {} should be compressed on file", f),
             }
         }
+
+        // Probing the saved file re-reads the frame from disk.
+        assert_eq!(egt_file.probe(&position).unwrap(), outcome);
 
         // Probe again (triggers on-demand decompression from file)
         let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();

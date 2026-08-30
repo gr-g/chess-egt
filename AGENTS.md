@@ -1,21 +1,38 @@
 # AGENTS.md
 
 - The goal of the project is to produce chess endgame tablebases (EGTs). See below the current specifications.
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory) and no parallelization. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory). Endgames are generated in parallel across independent endgames (`EgtGenerator::generate_many()`), but a single endgame is still generated single-threaded. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
+
+## Performance notes (measured on all 4-piece endgames)
+
+- Profile with `cargo build --profile profiling`, which keeps debug symbols.
+  `valgrind --tool=callgrind --cache-sim=no --branch-sim=no` plus
+  `callgrind_annotate [--inclusive=yes]` gives deterministic instruction counts,
+  at roughly a 30x slowdown, so profile a single endgame rather than a full run.
+- The workload is **compute-bound, not memory-bound**: cachegrind reports a D1
+  miss rate of 0.2% for `KQ_KP`. Optimizing memory access patterns is therefore
+  not worthwhile at this size (this may change for 6+ pieces).
+- Remaining hotspots, in order: `shakmaty`'s `Chess::from_setup` (~19% of
+  instructions, i.e. re-validating positions that we know are legal because we
+  just decoded them from a valid index), `Indexer::position_to_index` (~7%),
+  and zstd compression in `save_to_file` (~5-24% depending on the endgame).
+- Zstd level 19 vs 9 on pawnless tables: 15% faster generation for 29% larger
+  files. Level 19 is kept, since the tables are the artifact.
 
 TODO:
 - Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
-- Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
 - Add stats without en passant positions to EgtFileStats and implement EgtProber::verify_with_syzygy() to check our stats against the Syzygy stats available on the internet.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle? Use something else instead of table_a == table_b?
 - Experiment with approach using capture/promotion unmoves for initialization.
-- Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
+- Distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
 - Internalize quiet_unmoves() and use stock shakmaty?
 - Frontend, cloning https://syzygy-tables.info/
+- Avoid the `from_setup` position revalidation when decoding an index (needs an unchecked construction path in shakmaty)?
+- Benchmarking with gungraun to catch instruction-count regressions in CI?
 
 # Design Specifications
 

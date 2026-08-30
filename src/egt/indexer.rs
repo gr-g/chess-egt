@@ -55,13 +55,34 @@ fn reduce_king_pair(wk: usize, bk: usize) -> (usize, usize) {
     (pos[0].0 * 8 + pos[0].1, pos[1].0 * 8 + pos[1].1)
 }
 
-// Initialize map to encode the possible king positions under pawnless symmetries.
+// The number of canonical king pairs in a pawnless endgame.
+const N_KING_PAIRS: usize = 462;
+
+// Map to encode the possible king positions under pawnless symmetries.
 // The second king breaks diagonal symmetry when the first king is on the diagonal,
 // but positions where both kings are on the a1-h8 diagonal are intentionally not
 // canonicalized using other pieces.
-fn initialize_kings_map() -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
-    let mut m = Vec::new();
-    let mut r = vec![vec![999; 64]; 64];
+//
+// This is a property of the board alone, so it is shared by all `Indexer`s rather
+// than rebuilt and stored per sub-table. The tables are flat to keep the lookups
+// down to a single indexed load.
+struct KingsMap {
+    // Canonical king pair index -> (first king square, compacted second king square).
+    from_index: [(usize, usize); N_KING_PAIRS],
+
+    // (first king square) * 64 + (compacted second king square) -> canonical
+    // king pair index. Invalid pairs are left as `u16::MAX`.
+    to_index: [u16; 64 * 64],
+
+    // Whether both kings of a canonical king pair stand on the a1-h8 diagonal,
+    // i.e. whether the pair index represents 4 equivalent positions rather than 8.
+    on_diagonal: [bool; N_KING_PAIRS],
+}
+
+static KINGS_MAP: std::sync::LazyLock<KingsMap> = std::sync::LazyLock::new(|| {
+    let mut from_index = [(0, 0); N_KING_PAIRS];
+    let mut to_index = [u16::MAX; 64 * 64];
+    let mut on_diagonal = [false; N_KING_PAIRS];
     let mut unique_pairs = std::collections::BTreeSet::new();
 
     for wk in 0..64 {
@@ -71,16 +92,17 @@ fn initialize_kings_map() -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
             }
         }
     }
+    assert_eq!(unique_pairs.len(), N_KING_PAIRS);
 
     for (i, &(wk, bk)) in unique_pairs.iter().enumerate() {
         let bk_compacted = if wk <= bk { bk - 1 } else { bk };
-        m.push((wk, bk_compacted));
-        r[wk][bk_compacted] = i;
+        from_index[i] = (wk, bk_compacted);
+        to_index[wk * 64 + bk_compacted] = i as u16;
+        on_diagonal[i] = wk / 8 == wk % 8 && bk / 8 == bk % 8;
     }
 
-    assert_eq!(m.len(), 462);
-    (m, r)
-}
+    KingsMap { from_index, to_index, on_diagonal }
+});
 
 // An element of the set of pieces appearing in an endgame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -163,9 +185,10 @@ pub struct Indexer {
     // The following field provides information on the en passant status.
     ep_options: Vec<EnpassantOption>,
 
-    // Precomputed maps for encoding kings positions.
-    kings_map_from_index: Vec<(usize, usize)>,
-    kings_map_to_index: Vec<Vec<usize>>,
+    // For pawnless endgames, the number of combinations of all pieces after the
+    // two kings. The king pair index is the quotient of the index by this value,
+    // which makes it cheap to recover without a full decode.
+    nonking_combinations: usize,
 }
 
 impl Indexer {
@@ -202,7 +225,14 @@ impl Indexer {
 
         let index_range = ep_options.last().unwrap().range_end;
 
-        let (kings_map_from_index, kings_map_to_index) = initialize_kings_map();
+        // In a pawnless endgame the kings occupy the first two piece set entries
+        // and contribute a factor of 462 * 1 to the mixed-radix encoding, so the
+        // remaining factor identifies the king pair.
+        let nonking_combinations = if n_pawns == 0 {
+            piece_set[2..].iter().map(|p| p.combinations).product()
+        } else {
+            0
+        };
 
         Ok(Indexer {
             n_pieces,
@@ -210,8 +240,7 @@ impl Indexer {
             n_unique_pawns,
             index_range,
             ep_options,
-            kings_map_from_index,
-            kings_map_to_index,
+            nonking_combinations,
         })
     }
 
@@ -414,7 +443,7 @@ impl Indexer {
             // the value ranges look like [0..6, 0..5, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", buffer_pidx);
         } else {
-            self.map_kings(&mut buffer_pidx);
+            Self::map_kings(&mut buffer_pidx);
             // Now the first element in `buffer_pidx` has values in 0..462
             // and encodes the position of both kings.
             //println!("buffer_pidx: {:?}", buffer_pidx);
@@ -465,7 +494,7 @@ impl Indexer {
         } else {
             // `buffer_pidx` has values in [0..462, 0..1, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", buffer_pidx);
-            self.unmap_kings(&mut buffer_pidx);
+            Self::unmap_kings(&mut buffer_pidx);
             // Now `buffer_pidx` has values in [0..64, 0..63, 0..62, 0..61, ...].
             //println!("buffer_pidx: {:?}", buffer_pidx);
         }
@@ -518,24 +547,34 @@ impl Indexer {
             return None;
         }
 
+        // Whether both kings are on the diagonal depends only on the king pair,
+        // which is the leading factor of the mixed-radix encoding. Recovering it
+        // with a single division rejects the common case without paying for a
+        // full decode of the index.
+        debug_assert_eq!(self.ep_options.len(), 1, "a pawnless endgame has no en passant options");
+        if !KINGS_MAP.on_diagonal[index / self.nonking_combinations] {
+            return None;
+        }
+
         let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
 
         let mut buffer_coord = Self::filled_coord(self.n_pieces);
         let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
 
         self.index_to_cpidx(ep_idx, &mut buffer_pidx, index - index_offset);
-        self.unmap_kings(&mut buffer_pidx);
+        Self::unmap_kings(&mut buffer_pidx);
         Self::uncompact_cpidx(&mut buffer_pidx);
         self.nonpawn_pidx_to_coord(&mut buffer_coord, &buffer_pidx);
 
         let kings_on_diagonal = buffer_coord[0..2].iter().all(|(r, f)| *r == *f);
+        debug_assert!(kings_on_diagonal, "the fast path must agree with the decoded position");
         if kings_on_diagonal {
             // Swap coordinates and recode
             for p in buffer_coord.iter_mut() { *p = (p.1, p.0); };
             self.sort_coord_repeated_pieces(ep_idx, &mut buffer_coord);
             self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
             Self::compact_pidx(&mut buffer_pidx);
-            self.map_kings(&mut buffer_pidx);
+            Self::map_kings(&mut buffer_pidx);
             Some(self.cpidx_to_index(ep_idx, &buffer_pidx))
         } else {
             None
@@ -715,13 +754,14 @@ impl Indexer {
         }
     }
 
-    fn map_kings(&self, buffer_pidx: &mut PidxBuf) {
-        buffer_pidx[0] = self.kings_map_to_index[buffer_pidx[0]][buffer_pidx[1]];
+    fn map_kings(buffer_pidx: &mut PidxBuf) {
+        buffer_pidx[0] = KINGS_MAP.to_index[buffer_pidx[0] * 64 + buffer_pidx[1]] as usize;
+        debug_assert!(buffer_pidx[0] < N_KING_PAIRS, "kings on an invalid pair of squares");
         buffer_pidx[1] = 0;
     }
 
-    fn unmap_kings(&self, buffer_pidx: &mut PidxBuf) {
-        (buffer_pidx[0], buffer_pidx[1]) = self.kings_map_from_index[buffer_pidx[0]];
+    fn unmap_kings(buffer_pidx: &mut PidxBuf) {
+        (buffer_pidx[0], buffer_pidx[1]) = KINGS_MAP.from_index[buffer_pidx[0]];
     }
 
     // Computes the final index representing the position, by aggregating

@@ -12,7 +12,22 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
+rayon = "1.12.0"
 
 [[bin]]
 name = "chess-egt"
 path = "src/bin/main.rs"
+
+[profile.release]
+# Tablebase generation is dominated by small hot functions spread across this
+# crate and shakmaty, so cross-crate inlining is worth the longer build.
+lto = "fat"
+codegen-units = 1
+
+# Same codegen as release, but keeps symbols so that callgrind / cachegrind /
+# perf can attribute samples. For perf, also build with
+# RUSTFLAGS="-C force-frame-pointers=yes".
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = false
