@@ -79,7 +79,7 @@ An `EgtFile` represents a physical file on disk, storing the outcomes for a spec
 
 ## 4. File Format & Compression
 On disk, an `EgtFile` is compressed using a seekable Zstd format (via the `zeekstd` library).
-- The file is divided into **frames**, each containing a fixed number of positions (default: 16384).
+- The file is divided into **frames**, each containing a fixed number of positions (default: 256k).
 - Each frame is compressed independently, allowing seekable random access.
 
 Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
