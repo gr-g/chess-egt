@@ -58,7 +58,8 @@ fn run() -> Result<(), EgtError> {
         configure_generator(&mut g, &cli);
         g.generate(endgame)?;
     } else if cli.generate_all_3 {
-        let g = EgtGenerator::new(&cli.path);
+        let mut g = EgtGenerator::new(&cli.path);
+        configure_generator(&mut g, &cli);
         g.generate("K_K")?;
         generate_all(3, &cli);
     } else if cli.generate_all_4 {
