@@ -6,7 +6,7 @@ mod retrograde;
 
 pub use error::{EgtError, EgtResult};
 pub use egt_file::{EgtFile, EgtFileStats, LongestDtcPosition};
-use shakmaty::{Role, Chess, Color, Position};
+use shakmaty::{Role, Chess, Color, Move, MoveList, Position};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -271,6 +271,8 @@ impl EgtProber {
         outcome.to_outcome_at(idx)
     }
 
+    /// Verifies the internal consistency of an endgame file, one constituent
+    /// `Egt` sub-table at a time.
     pub fn verify_internal_consistency(&mut self, endgame: &str) -> EgtResult<()> {
         // Ensure the main file is in the cache
         if !self.cache.contains_key(endgame) {
@@ -278,142 +280,190 @@ impl EgtProber {
             self.cache.insert(endgame.to_string(), file);
         }
 
-        let index_range = self.cache.get(endgame)
-            .ok_or(EgtError::Internal("cache entry missing after insert"))?.index_range;
+        let (n_egts, index_range, sum_of_ranges) = {
+            let file = self.cache.get(endgame)
+                .ok_or(EgtError::Internal("cache entry missing after insert"))?;
+            let sum: usize = file.egts.iter().map(|egt| egt.index_range()).sum();
+            (file.egts.len(), file.index_range, sum)
+        };
 
-        println!("Verifying internal consistency of endgame {} ({} indexes)...", endgame, index_range);
+        if sum_of_ranges != index_range {
+            return Err(EgtError::Internal(
+                "sum of Egt index ranges does not match the EgtFile index range",
+            ));
+        }
 
-        for idx in 0..index_range {
-            // Retrieve the setup and the outcome for this index
+        println!(
+            "Verifying internal consistency of endgame {} ({} indexes, {} tables)...",
+            endgame, index_range, n_egts
+        );
+
+        for egt_idx in 0..n_egts {
+            self.verify_egt(endgame, egt_idx)?;
+        }
+
+        println!("Successfully verified internal consistency of endgame {}.", endgame);
+        Ok(())
+    }
+
+    /// Verifies the internal consistency of a single `Egt` sub-table of a file.
+    ///
+    /// Indexes are enumerated locally within the sub-table and translated to
+    /// global file indexes by adding the sub-table offset, which avoids the
+    /// per-index sub-table lookup done by `EgtFile::index_to_position`.
+    fn verify_egt(&mut self, endgame: &str, egt_idx: usize) -> EgtResult<()> {
+        let (tablename, local_range, egt_offset) = {
+            let file = self.cache.get(endgame)
+                .ok_or(EgtError::Internal("cache entry missing after insert"))?;
+            let egt = file.egts.get(egt_idx)
+                .ok_or(EgtError::Internal("egt_idx out of range for this file"))?;
+            (egt.tablename().to_string(), egt.index_range(), file.get_global_index(egt_idx, 0))
+        };
+
+        println!(
+            "{}: verifying {} indexes (offset {})...",
+            tablename, local_range, egt_offset
+        );
+
+        // Builds the error for a failure at `local_idx`, tagging the reason with
+        // the sub-table name and local index. The reported index is the global
+        // one, so that it can be fed back to `read_from_index` for debugging.
+        let fail = |local_idx: usize, reason: &str| EgtError::ConsistencyCheckFailed {
+            endgame: endgame.to_string(),
+            index: egt_offset + local_idx,
+            reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
+        };
+
+        for local_idx in 0..local_range {
+            if (local_idx + 1) % 10000000 == 0 {
+                println!("{}: verified {}/{} indexes...", tablename, local_idx + 1, local_range);
+            }
+
+            let global_idx = egt_offset + local_idx;
+
+            // Retrieve the setup and the outcome for this index. The borrow of
+            // the cached file must end before probing successors below.
             let (position_opt, outcome_maybe) = {
                 let file = self.cache.get_mut(endgame)
                     .ok_or(EgtError::Internal("cache entry missing after insert"))?;
-                let position_opt = file.index_to_position(idx, Color::White);
-                let outcome_maybe = file.read_from_index(idx)?;
+                let position_opt = file.egts[egt_idx].position_from_index(local_idx, Color::White);
+                let outcome_maybe = file.read_from_index(global_idx)?;
                 (position_opt, outcome_maybe)
             };
 
             if position_opt.is_none() {
                 if !outcome_maybe.is_invalid() {
-                    return Err(EgtError::ConsistencyCheckFailed {
-                        endgame: endgame.to_string(),
-                        index: idx,
-                        reason: "index is invalid but outcome is not invalid".to_string(),
-                    });
+                    return Err(fail(local_idx, "index is invalid but outcome is not invalid"));
                 }
                 continue;
             }
 
             if outcome_maybe.is_invalid() {
-                return Err(EgtError::ConsistencyCheckFailed {
-                    endgame: endgame.to_string(),
-                    index: idx,
-                    reason: "index is valid but outcome is invalid".to_string(),
-                });
+                return Err(fail(local_idx, "index is valid but outcome is invalid"));
             }
 
             let position = position_opt
                 .ok_or(EgtError::Internal("position_opt should be Some after the None check"))?;
-            let outcome = outcome_maybe.to_outcome_at(idx)?;
+            let outcome = outcome_maybe.to_outcome_at(global_idx)?;
             let legals = position.legal_moves();
 
             if legals.is_empty() {
                 if position.is_check() {
                     if outcome != DtcOutcome::Loss(ConversionType::Checkmate, 0) {
-                        return Err(EgtError::ConsistencyCheckFailed {
-                            endgame: endgame.to_string(),
-                            index: idx,
-                            reason: format!("checkmate position has outcome {:?}", outcome),
-                        });
+                        return Err(fail(
+                            local_idx,
+                            &format!("checkmate position has outcome {:?}", outcome),
+                        ));
                     }
-                } else {
-                    if outcome != DtcOutcome::Draw {
-                        return Err(EgtError::ConsistencyCheckFailed {
-                            endgame: endgame.to_string(),
-                            index: idx,
-                            reason: format!("stalemate position has outcome {:?}", outcome),
-                        });
-                    }
+                } else if outcome != DtcOutcome::Draw {
+                    return Err(fail(
+                        local_idx,
+                        &format!("stalemate position has outcome {:?}", outcome),
+                    ));
                 }
             } else {
-                let mut best_value: Option<DtcOutcome> = None;
-
-                for m in legals {
-                    let mut successor_position = position.clone();
-                    successor_position.play_unchecked(m);
-
-                    // Use self.probe() to get the successor outcome
-                    let successor_outcome = self.probe(&successor_position)?;
-
-                    let is_capture = m.is_capture();
-                    let is_promotion = m.is_promotion();
-                    let v_m = if is_capture || is_promotion {
-                        let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
-                        match successor_outcome {
-                            DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
-                            DtcOutcome::Draw => DtcOutcome::Draw,
-                            DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
-                        }
-                    } else {
-                        match successor_outcome {
-                            DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
-                            DtcOutcome::Draw => DtcOutcome::Draw,
-                            DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
-                        }
-                    };
-
-                    if let Some(ref mut best) = best_value {
-                        if v_m > *best {
-                            *best = v_m;
-                        }
-                    } else {
-                        best_value = Some(v_m);
-                    }
-                }
-
-                let best = best_value
-                    .ok_or(EgtError::Internal("best_value should be Some when legals is non-empty"))?;
+                let best = self.best_outcome(&position, &legals)?;
                 if outcome != best {
-                    let mut reason = format!(
-                        "consistency check failed.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
-                        position, outcome, best
-                    );
-                    reason.push_str("\nLegal moves and their outcomes:");
-                    for m in position.legal_moves() {
-                        let mut successor_position = position.clone();
-                        successor_position.play_unchecked(m);
-                        // Best-effort diagnostic: skip moves whose successor cannot be probed.
-                        if let Ok(successor_outcome) = self.probe(&successor_position) {
-                            let is_capture = m.is_capture();
-                            let is_promotion = m.is_promotion();
-                            let v_m = if is_capture || is_promotion {
-                                let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
-                                match successor_outcome {
-                                    DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
-                                    DtcOutcome::Draw => DtcOutcome::Draw,
-                                    DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
-                                }
-                            } else {
-                                match successor_outcome {
-                                    DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
-                                    DtcOutcome::Draw => DtcOutcome::Draw,
-                                    DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
-                                }
-                            };
-                            reason.push_str(&format!("\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}", m, successor_outcome, v_m));
-                        }
-                    }
-                    return Err(EgtError::ConsistencyCheckFailed {
-                        endgame: endgame.to_string(),
-                        index: idx,
-                        reason,
-                    });
+                    let details = self.describe_mismatch(&position, &legals, outcome, best);
+                    return Err(fail(local_idx, &details));
                 }
             }
         }
 
-        println!("Successfully verified internal consistency of endgame {}.", endgame);
         Ok(())
+    }
+
+    /// Computes the best outcome reachable from `position` by playing one of
+    /// `legals`, probing each successor in the tablebases.
+    fn best_outcome(&mut self, position: &Chess, legals: &MoveList) -> EgtResult<DtcOutcome> {
+        let mut best_value: Option<DtcOutcome> = None;
+
+        for m in legals {
+            let mut successor_position = position.clone();
+            successor_position.play_unchecked(*m);
+
+            let successor_outcome = self.probe(&successor_position)?;
+            let v_m = move_value(m, successor_outcome);
+
+            if let Some(ref mut best) = best_value {
+                if v_m > *best {
+                    *best = v_m;
+                }
+            } else {
+                best_value = Some(v_m);
+            }
+        }
+
+        best_value.ok_or(EgtError::Internal("best_value should be Some when legals is non-empty"))
+    }
+
+    /// Builds a human-readable diagnostic for a mismatch between the outcome
+    /// stored in the file and the best outcome computed from the legal moves.
+    fn describe_mismatch(
+        &mut self,
+        position: &Chess,
+        legals: &MoveList,
+        outcome: DtcOutcome,
+        best: DtcOutcome,
+    ) -> String {
+        let mut reason = format!(
+            "consistency check failed.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
+            position, outcome, best
+        );
+        reason.push_str("\nLegal moves and their outcomes:");
+        for m in legals {
+            let mut successor_position = position.clone();
+            successor_position.play_unchecked(*m);
+            // Best-effort diagnostic: skip moves whose successor cannot be probed.
+            if let Ok(successor_outcome) = self.probe(&successor_position) {
+                let v_m = move_value(m, successor_outcome);
+                reason.push_str(&format!(
+                    "\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}",
+                    m, successor_outcome, v_m
+                ));
+            }
+        }
+        reason
+    }
+}
+
+/// The value of a position for the side to move after playing `m`, given the
+/// outcome of the successor position. Conversions (captures and promotions)
+/// reset the distance to conversion to 1.
+fn move_value(m: &Move, successor_outcome: DtcOutcome) -> DtcOutcome {
+    if m.is_capture() || m.is_promotion() {
+        let ct = if m.is_capture() { ConversionType::Capture } else { ConversionType::Promotion };
+        match successor_outcome {
+            DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
+            DtcOutcome::Draw => DtcOutcome::Draw,
+            DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
+        }
+    } else {
+        match successor_outcome {
+            DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
+            DtcOutcome::Draw => DtcOutcome::Draw,
+            DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
+        }
     }
 }
 
@@ -562,6 +612,24 @@ mod tests {
 
         let mut prober = EgtProber::new(&temp_dir);
         prober.verify_internal_consistency("KR_K").unwrap();
+    }
+
+    // Unlike the pawnless cases above, KP_K / K_KP are composed of several
+    // `Egt` sub-tables (one per pawn file), which exercises the loop over
+    // sub-tables in `verify_internal_consistency()`.
+    #[test]
+    fn test_verify_internal_consistency_kp_k() {
+        let temp_dir = std::env::temp_dir();
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&temp_dir, "KP_K", None, true).unwrap();
+        assert!(file_a.egts.len() > 1, "expected KP_K to be composed of several Egts");
+        file_a.save_to_file().unwrap();
+        if let Some(ref mut fb) = file_b {
+            fb.save_to_file().unwrap();
+        }
+
+        let mut prober = EgtProber::new(&temp_dir);
+        prober.verify_internal_consistency("KP_K").unwrap();
+        prober.verify_internal_consistency("K_KP").unwrap();
     }
 
     #[test]

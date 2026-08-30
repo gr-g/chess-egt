@@ -1,6 +1,6 @@
 # AGENTS.md
 
-- The goal of the project is to produce chess endgame tablebases (EGTs).
+- The goal of the project is to produce chess endgame tablebases (EGTs). See below the current specifications.
 - The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory) and no parallelization. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
@@ -10,7 +10,6 @@ TODO:
 - Profiling with gungraun/valgrind. Benchmarking.
 - Visibility and public interface.
 - Add stats without en passant positions to EgtFileStats and implement EgtProber::verify_with_syzygy() to check our stats against the Syzygy stats available on the internet.
-- Verify index_ranges table-by-table. Print counter during verification.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle? Use something else instead of table_a == table_b?
 - Experiment with approach using capture/promotion unmoves for initialization.
