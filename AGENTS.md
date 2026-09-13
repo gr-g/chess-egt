@@ -1,7 +1,7 @@
 # AGENTS.md
 
 - The goal of the project is to produce chess endgame tablebases (EGTs). See below the current specifications.
-- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory). Endgames are generated in parallel across independent endgames (`EgtGenerator::generate_many()`), but a single endgame is still generated single-threaded. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
+- The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory) and no parallelization. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 
 ## Performance notes (measured on all 4-piece endgames)
@@ -20,7 +20,26 @@
 - Zstd level 19 vs 9 on pawnless tables: 15% faster generation for 29% larger
   files. Level 19 is kept, since the tables are the artifact.
 
-TODO:
+Current generation results (single-threaded generation, with --noverify):
+=============================================================================================
+Generated all 3-pieces endgames, corresponding to 367868 unique positions.
+Time: 00h00m01s.
+Size on disk: 0.03MiB (0.77 bits/pos on average, lowest compression for KQ_K: 2.07 bits/pos).
+=============================================================================================
+
+=============================================================================================
+Generated all 4-pieces endgames, corresponding to 125544710 unique positions.
+Time: 00h03m14s.
+Size on disk: 13.25MiB (0.89 bits/pos on average, lowest compression for KQ_KR: 3.61 bits/pos).
+=============================================================================================
+
+=============================================================================================
+Generated all 5-pieces endgames, corresponding to 26040612459 unique positions.
+Time: 26h01m51s.
+Size on disk: 3593.31MiB (1.16 bits/pos on average, lowest compression for KBB_KQ: 4.23 bits/pos).
+=============================================================================================
+
+## TODO
 - Use object_store crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Visibility and public interface.
@@ -28,7 +47,7 @@ TODO:
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle? Use something else instead of table_a == table_b?
 - Experiment with approach using capture/promotion unmoves for initialization.
-- Distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
+- Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
 - Internalize quiet_unmoves() and use stock shakmaty?
 - Frontend, cloning https://syzygy-tables.info/
 - Avoid the `from_setup` position revalidation when decoding an index (needs an unchecked construction path in shakmaty)?

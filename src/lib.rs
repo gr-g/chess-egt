@@ -47,10 +47,6 @@ impl PartialOrd for DtcOutcome {
     }
 }
 
-/// The statistics produced by generating one endgame: the endgame itself, plus
-/// its twin (e.g. `KQ_KP` and `KP_KQ`) when the endgame is not symmetric.
-pub type GeneratedStats = (EgtFileStats, Option<EgtFileStats>);
-
 pub struct EgtGenerator {
     base_path: PathBuf,
     assigned_memory: Option<usize>,
@@ -154,52 +150,7 @@ impl EgtGenerator {
         Ok(endgames)
     }
 
-    /// Generates every endgame in `endgames`, running mutually independent ones
-    /// in parallel, and returns the results paired with their endgame name.
-    ///
-    /// A capture reduces the piece count and a promotion reduces the pawn count
-    /// while keeping the piece count, so an endgame can only ever depend on
-    /// endgames with fewer pieces, or with the same number of pieces and fewer
-    /// pawns. Endgames sharing both counts are therefore mutually independent.
-    /// The list is processed as successive waves of equal (pieces, pawns), each
-    /// wave completed before the next one starts.
-    ///
-    /// Tasks in a wave re-read the tables of earlier waves from disk, so this
-    /// requires `generate_deps == false`. With `generate_deps == true` the
-    /// recursive on-the-fly generation is inherently sequential and the whole
-    /// list is generated sequentially instead.
-    pub fn generate_many(&self, endgames: &[String]) -> Vec<(String, EgtResult<GeneratedStats>)> {
-        use rayon::prelude::*;
-
-        // Groups an endgame by the counts that define its dependency level.
-        fn level(endgame: &str) -> (usize, usize) {
-            let pieces = endgame.chars().filter(|&c| c != '_').count();
-            let pawns = endgame.chars().filter(|&c| c == 'P').count();
-            (pieces, pawns)
-        }
-
-        if self.generate_deps {
-            return endgames
-                .iter()
-                .map(|e| (e.clone(), self.generate(e)))
-                .collect();
-        }
-
-        let mut ordered: Vec<&String> = endgames.iter().collect();
-        ordered.sort_by_key(|e| level(e));
-
-        let mut results = Vec::with_capacity(endgames.len());
-        for wave in ordered.chunk_by(|a, b| level(a) == level(b)) {
-            let mut wave_results: Vec<(String, EgtResult<GeneratedStats>)> = wave
-                .par_iter()
-                .map(|e| ((*e).clone(), self.generate(e)))
-                .collect();
-            results.append(&mut wave_results);
-        }
-        results
-    }
-
-    pub fn generate(&self, endgame: &str) -> EgtResult<GeneratedStats> {
+    pub fn generate(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
 

@@ -40,11 +40,6 @@ struct Cli {
     #[arg(long)]
     noverify: bool,
 
-    /// Number of endgames to generate concurrently. Defaults to the number of
-    /// available cores; use 1 to generate strictly sequentially.
-    #[arg(long)]
-    jobs: Option<usize>,
-
     position: Option<String>,
 }
 
@@ -57,12 +52,6 @@ fn main() {
 
 fn run() -> Result<(), EgtError> {
     let cli = Cli::parse();
-
-    if let Some(jobs) = cli.jobs
-        && rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global().is_err()
-    {
-        return Err(EgtError::Internal("failed to configure the thread pool"));
-    }
 
     if let Some(ref endgame) = cli.generate {
         let mut g = EgtGenerator::new(&cli.path);
@@ -152,8 +141,8 @@ fn generate_all(n: usize, cli: &Cli) {
     let mut worst_compression_endgame = String::new();
     let mut worst_bits_per_pos = 0.0;
 
-    for (endgame, result) in g.generate_many(&endgames) {
-        match result {
+    for endgame in endgames {
+        match g.generate(&endgame) {
             Ok((stats_a, stats_b_opt)) => {
                 let mut process_stats = |stats: chess_egt::EgtFileStats| {
                     let unique_pos = stats.win + stats.draw + stats.loss;
