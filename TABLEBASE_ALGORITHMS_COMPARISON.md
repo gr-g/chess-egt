@@ -35,7 +35,7 @@ This is the **single most fundamental algorithmic difference**:
    - When the counter reaches 0, all legal moves have been proven losing, so the position is marked as a Loss.
    - *Challenges*:
      - **Symmetry hazards**: With diagonal reflections in pawnless tables, moves transitioning between 8-way and 4-way orbits require artificial $+2$ counter weighting, mirror decrements, and unmove deduplication. If a single unmove is duplicated or missed, the counter never reaches 0 (turning a loss into a draw) or drops too fast (false loss).
-     - **Parallelism contention**: Decrementing shared counters from multiple worker threads requires atomic fetch-and-sub or spinlocks, causing severe memory bus cache-line bouncing.
+     - **Parallelism contention**: Decrementing shared counters is inherently non-idempotent. Every unmove reaching a predecessor $P$ must execute an atomic read-modify-write (`fetch_sub` or CAS loop). If multiple worker threads hit positions on the same cache line, the line is constantly invalidated and bounced across CPU cores.
      - **Queue memory spikes**: Depth queues holding millions of `usize` indices can consume gigabytes of heap memory at peak iteration depths.
 
 2. **Syzygy (`tb`), Prophet, and `chesstb` (Candidate Flag + Forward Verification)**:
@@ -43,12 +43,18 @@ This is the **single most fundamental algorithmic difference**:
    - Instead, they use a two-phase loop per ply:
      - **Step 1 (Loss $\to$ Win)**: For every position confirmed as a loss at ply $p-1$, generate unmoves and mark all predecessor positions as a Win at ply $p$.
      - **Step 2 (Win $\to$ Candidate Loss)**: For every position confirmed as a Win at ply $p$, generate unmoves and set a candidate flag on the predecessors:
-       - Syzygy marks: `SET_CHANGED(table[idx])` (using an idempotent atomic CAS: if `UNKNOWN`, set to `CHANGED`).
+       - Syzygy marks: `SET_CHANGED(table[idx])` (using an idempotent CAS or TTAS: if `UNKNOWN`, set to `CHANGED`).
        - Prophet marks: `LOSS_EGTB->TB[idx] = MAYBELOSS_IN(p+1)`.
        - chesstb marks: `add_flags(pred, DTC_FLAG_CHANGE)`.
-     - **Step 3 (Forward Verification of Candidate Losses)**: Sweep the candidate positions. For each marked position, generate its legal forward moves and check if *all* moves land on confirmed wins for the opponent:
-       - **Crucial optimization (Early Exit)**: In forward `check_loss`, as soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`. Most candidate positions are refuted on their 1st or 2nd legal move!
+       - *Why candidate flags avoid contention*: Marking `CHANGED` is **idempotent**. Threads use Test-and-Test-and-Set (TTAS): if the flag is already set, no write occurs, keeping the cache line in Shared (`S`) state and avoiding bus bouncing.
+     - **Step 3 (Forward Verification of Candidate Losses)**: Sweep the candidate positions across non-overlapping index chunks (e.g. `par_chunks_mut`, completely lock-free with zero inter-thread contention).
+       - Crucially, this sweep does **not** evaluate all `UNKNOWN` positions every ply: it inspects **only** positions tagged as `CHANGED` in Step 2.
+       - For each marked position, generate its legal forward moves and check if *all* moves land on confirmed wins for the opponent.
+       - **Crucial optimization (Early Exit)**: As soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`. In practice, the vast majority of non-losing candidates are refuted on their 1st or 2nd legal move.
        - If and only if **all** legal forward moves lead to opponent wins in $\le p$, the position is promoted to confirmed `LOSS_IN(p)`.
+
+> **Note on BFS Queues vs. Table Sweeps**:
+> The divergence between **queue-driven BFS** (tracking explicit predecessor index lists per ply) and **table array sweeps** (flat memory chunk iterations over flags) is a fundamental architectural choice. Table sweeps eliminate BFS queue memory overhead and enable simple chunk-parallel loops in shared memory, while BFS queues only touch reachable indices. This trade-off will be analyzed in detail in a future design discussion focusing on parallelization paradigms: multi-threading on shared memory (e.g., Rayon flat chunk sweeps) versus distributed/message-passing computing (e.g., MPI/alltoallv exchanging index queues across nodes owning disjoint memory blocks).
 
 ---
 
@@ -97,6 +103,7 @@ This is the **single most fundamental algorithmic difference**:
   - An endgame table has two sides to move (e.g., White to move and Black to move).
   - For asymmetric endgames, you do not need to store both sides on disk! At probe time, the missing color can be reconstructed in **1 ply of minimax**: generate all legal moves; quiet moves stay in the stored table of the same material, while captures reach smaller sub-tables.
   - `chesstb`'s `shrink` tool drops the larger compressed STM color automatically, cutting disk footprint almost in half.
+  - **Important distinction for generation vs. storage**: Retrograde solving inherently alternates between WTM and BTM, so **both sides must remain actively resident in memory during generation**. Dropping one side saves no RAM or cache pressure during active solving; the ~50% savings apply strictly to **final disk storage** and **prober memory footprint**.
 - **Relaxed Bounds (chesstb)**:
   - If a position has a winning capture leading to an already-won sub-table, its exact stored value doesn't matter for game-theoretic correctness—the engine can see the winning capture at depth 1. `chesstb` treats these as "don't cares" during compression, allowing LZ algorithms to achieve significantly higher compression ratios.
 
@@ -132,4 +139,5 @@ In `chess-egt`'s `TODO`, there is an item: *"Experiment with approach using capt
 - **Insight**: Both Syzygy and Prophet validate this approach. By iterating over the (much smaller) dependency tables and unmoving captures/promotions into the target table, you eliminate the overhead of forward legality checking and sub-table probe searching for the vast majority of non-capture positions during initialization.
 
 ### 5. Probing and Storage Footprint (STM Dropping)
-- **Insight**: In `chess-egt`, an `EgtFile` currently stores all positions for both sides. For 5-piece and upcoming 6-piece tables, dropping one side-to-move for asymmetric endgames (reconstructing via 1-ply search in the prober) will immediately reduce disk storage and generation cache pressure by roughly 40–50%.
+- **Insight**: In `chess-egt`, an `EgtFile` currently stores all positions for both sides. For 5-piece and upcoming 6-piece tables, dropping one side-to-move for asymmetric endgames (reconstructing via 1-ply search in the prober) will immediately reduce **final disk storage and prober memory footprint** by roughly 40–50%.
+- Note that during the retrograde generation process itself, both sides must remain active in memory to propagate alternating plies, so this optimization does not reduce generation-time memory pressure.
