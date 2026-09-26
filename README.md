@@ -84,11 +84,6 @@ Each frame in an `EgtFile` can be in one of three states:
 2. **Compressed**: Only the compressed representation of the frame is stored in memory.
 3. **Uncompressed**: The frame is fully uncompressed in memory as a contiguous array of `u16` values.
 
-When a frame needs to be written to or read, its uncompressed buffer is allocated.
-If the memory used reaches an assigned limit, the Least Recently Used (LRU) uncompressed frames are evicted:
-- **If `dirty == true`**: The frame is bit-sliced, compressed using Zstd, and its state transitions to `Compressed`. The uncompressed memory is returned to the `Arena`.
-- **If `dirty == false`**: The uncompressed memory is immediately freed without re-compression (using the cached `compressed` bytes).
-
 ## 6. Retrograde Analysis
 Retrograde analysis is the recursive algorithm used to generate endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.
 
@@ -140,7 +135,7 @@ The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
    * Do the same for newly marked 'loss' positions in Table B, propagating them to Table A (unless A and B are the same table).
 2. **Propagate Wins to Losses (decrement counters):**
    * For each position in Table A newly marked as 'win (conversion_type, n)':
-     * Call `quiet_unmoves` .
+     * Call `quiet_unmoves`.
      * Deduplicate the list of predecessor indices.
      * For each 'unknown' predecessor, decrement its move counter by 1.
      * If the counter reaches 0, mark the predecessor as 'loss (conversion_type, n+1)'.
