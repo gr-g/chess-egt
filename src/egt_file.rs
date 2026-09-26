@@ -356,6 +356,23 @@ impl EgtFile {
         }
     }
 
+    /// Returns the in-memory outcomes for the global indexes `[start, end)`,
+    /// allocating or decompressing the frame if needed. The range must lie
+    /// within a single frame. This gives table sweeps direct slice access,
+    /// avoiding the per-element overhead of `read_from_index`.
+    pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[MaybeDtcOutcome]> {
+        if start > end || end > self.index_range {
+            return Err(EgtError::IndexOutOfRange { index: end, range: self.index_range });
+        }
+        let frame_idx = start / self.frame_size;
+        let offset = start % self.frame_size;
+        if end - start > self.frame_size - offset {
+            return Err(EgtError::Internal("frame_chunk range crosses a frame boundary"));
+        }
+        let data = self.get_frame_data(frame_idx)?;
+        Ok(&data[offset..offset + (end - start)])
+    }
+
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
@@ -922,7 +939,8 @@ mod tests {
 
     #[test]
     fn egt_file_compression_decompression() {
-        let base_path = PathBuf::from(".");
+        let test_dir = crate::TestDir::new("egt_file_compression_decompression");
+        let base_path = test_dir.0.clone();
         let mut egt_file = EgtFile::new(&base_path, "KP_K").unwrap();
 
         // Sample a position
@@ -949,14 +967,12 @@ mod tests {
         let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();
         let loaded_outcome = another_egt_file.probe(&position).unwrap();
         assert_eq!(loaded_outcome, outcome);
-
-        // Clean up
-        let _ = std::fs::remove_file(&egt_file.path);
     }
 
     #[test]
     fn egt_memory_compression_decompression() {
-        let path = PathBuf::from(".");
+        let test_dir = crate::TestDir::new("egt_memory_compression_decompression");
+        let path = test_dir.0.clone();
         let mut egt_file = EgtFile::new(&path, "KP_K").unwrap();
 
         // Sample a position
@@ -978,8 +994,5 @@ mod tests {
         // Probe again (triggers decompression from memory)
         let loaded_outcome = egt_file.probe(&position).unwrap();
         assert_eq!(loaded_outcome, outcome);
-
-        // Clean up
-        let _ = std::fs::remove_file(&path);
     }
 }

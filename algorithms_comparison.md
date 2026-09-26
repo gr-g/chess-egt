@@ -50,8 +50,37 @@ This is the **single most fundamental algorithmic difference**:
      - **Step 3 (Forward Verification of Candidate Losses)**: Sweep the candidate positions across non-overlapping index chunks (e.g. `par_chunks_mut`, completely lock-free with zero inter-thread contention).
        - Crucially, this sweep does **not** evaluate all `UNKNOWN` positions every ply: it inspects **only** positions tagged as `CHANGED` in Step 2.
        - For each marked position, generate its legal forward moves and check if *all* moves land on confirmed wins for the opponent.
-       - **Crucial optimization (Early Exit)**: As soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`. In practice, the vast majority of non-losing candidates are refuted on their 1st or 2nd legal move.
+       - **Early Exit**: As soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`.
        - If and only if **all** legal forward moves lead to opponent wins in $\le p$, the position is promoted to confirmed `LOSS_IN(p)`.
+
+#### Measured comparison in `chess-egt` (single-threaded)
+
+To get hard numbers, the Changed-Flag approach was re-implemented in `chess-egt` (`src/retrograde_sweep.rs`, selected with `--algorithm sweep`), sharing everything else with the counter implementation: indexing, `quiet_unmoves`, dependency probing, statistics and file output.
+
+*Implementation notes:*
+- The 13 spare bits of an `UNKNOWN` value hold a `CHANGED` flag, a `NO_LOSS` flag and two 2-bit conversion types. Initialization probes captures/promotions once (as the counter version does): if any conversion move does not lose, the position gets `NO_LOSS` and can never become a candidate; otherwise all conversions are known to lose, so forward verification only plays **quiet** moves against the pair tables and never probes dependency tables.
+- Each ply runs a verification sweep (candidates flagged at the previous ply) followed by a propagation sweep (wins flag predecessors as `CHANGED`, losses mark predecessors as wins), frame by frame via `EgtFile::frame_chunk`.
+- Output is **byte-identical** to the counter version (sha256-checked on all 3/4-piece tables and a 5-piece sample). This requires an order-independent tie-break for conversion types among moves realizing the distance: wins prefer Checkmate > Capture > Promotion, losses prefer Promotion > Capture > Checkmate (which is also what the prober's `move_value` ordering checks).
+- Diagonal symmetry still requires marking the diagonal mirror of predecessors, but the `+2` counter adjustments disappear (marking is idempotent).
+
+*Results* (one run each, dependencies read from existing tables, init + propagation time):
+
+| Set / Endgame | Profile | Counters | Sweep | Δ time | Peak RSS counters | Peak RSS sweep |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| All 30 4-piece | mixed | 312 s | 351 s | +13% | 191 MiB | 152 MiB |
+| `KBB_KN` | deep, pawnless (131 plies) | 169 s | 227 s | +34% | 822 MiB | 292 MiB |
+| `KQB_KQ` | shallow, pawnless | 382 s | 430 s | +13% | 7495 MiB | 497 MiB |
+| `KRB_KR` | shallow + long tail, pawnless | 241 s | 274 s | +14% | 3509 MiB | 498 MiB |
+| `KNN_KP` | deep, thin frontier (228 plies, median 99) | 360 s | 551 s | +53% | 1629 MiB | 1092 MiB |
+| `KRP_KQ` | shallow (92% of wins at ply 1) | 2181 s | 2612 s | +20% | 8427 MiB | 2059 MiB |
+| `KQP_KQ` | shallow + long tail (227 plies) | 1477 s | 1840 s | +25% | 7506 MiB | 2059 MiB |
+| **5-piece sample total** | | **4811 s** | **5934 s** | **+23%** | **8427 MiB** | **2059 MiB** |
+
+*Findings:*
+- **Speed:** the sweep was slower on every non-trivial endgame (propagation alone: +18% on 4-piece, +31% on the 5-piece sample). The worst case is as predicted by theory: deep tables with a thin frontier (`KNN_KP` +53%), where every ply scans the whole table. Shallow tables narrow the gap but never close it.
+- **Early exit is weaker than claimed** ("refuted on the 1st or 2nd move"): in winning endgames 20–65% of candidates are confirmed losses and each candidate checks 3–5.3 quiet moves on average (`KRP_KQ`: 637M candidates, 19% confirmed, 5.29 moves). The claim holds only in drawish tables (`KQB_KQ`, `KRB_KR`, `KR_KR`: ~1.3–1.7 moves, 1–6% confirmed). Every candidate also pays a full decode (`from_setup`) before the first move.
+- **Memory is the real advantage of the sweep**: its footprint is essentially the two tables (2 bytes/pos), while the counter version's queues (8-byte `usize` indices, with duplicates) peak at 3.5–8.4 GiB on shallow 5-piece tables, i.e. several times the tables themselves. This is prohibitive for 6-piece tables. Storing indices as `u32` would halve it.
+- **Caveats**: the sweep is a first, unoptimized version (re-decodes every candidate, two passes per ply), while the counter version has been profiled. Parallel scalability, the sweep's main theoretical advantage, is not measured yet.
 
 > **Note on BFS Queues vs. Table Sweeps**:
 > The divergence between **queue-driven BFS** (tracking explicit predecessor index lists per ply) and **table array sweeps** (flat memory chunk iterations over flags) is a fundamental architectural choice. Table sweeps eliminate BFS queue memory overhead and enable simple chunk-parallel loops in shared memory, while BFS queues only touch reachable indices. This trade-off will be analyzed in detail in a future design discussion focusing on parallelization paradigms: multi-threading on shared memory (e.g., Rayon flat chunk sweeps) versus distributed/message-passing computing (e.g., MPI/alltoallv exchanging index queues across nodes owning disjoint memory blocks).
@@ -117,9 +146,10 @@ Studying these three mature projects offers several high-value insights directly
 In `chess-egt`'s `AGENTS.md`, the complex interaction between move counters and diagonal symmetries is noted as a tricky area requiring special counter doubling ($+2$) and mirror decrements.
 - **Insight**: If `chess-egt` replaces decremental counters with a `CHANGED` flag + forward `check_loss` (or uses candidate flags alongside counters):
   - Symmetry handling becomes trivial and robust: marking `CHANGED` or `WIN` is idempotent (multiple identical or symmetric reverse moves can mark the same cell without causing corruption).
-  - Eliminates the need for large heap queues (`DepthQueues` vectors).
+  - Eliminates the need for large heap queues (`DepthQueues` vectors): measured 4x lower peak memory on 5-piece tables.
   - Enables effortless multi-threading without lock contention or atomic subtracts.
-  - Forward `check_loss` refutes non-losses almost instantaneously with 1–2 legal move evaluations.
+- **Measured trade-off** (see Section 2.A): single-threaded, the sweep is 13% (4-piece) to 23% (5-piece sample) slower, up to +53% on deep thin-frontier tables. The decision therefore hinges on parallel scaling and on memory for 6-piece tables, not on single-threaded speed.
+- **Possible middle ground not yet measured**: candidate flags + forward verification, but with a queue (e.g. of `u32` indices) instead of full sweeps, which would remove the per-ply scans on deep tables while keeping idempotent marking.
 
 ### 2. Multi-Threading & Rayon Parallelization
 Currently, `chess-egt` is single-threaded.

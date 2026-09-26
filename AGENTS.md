@@ -3,6 +3,7 @@
 - The goal of the project is to produce chess endgame tablebases (EGTs). See below the current specifications.
 - The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory) and no parallelization. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
+- Two interchangeable core loops exist, selected with `--algorithm` (`Algorithm` enum, `EgtGenerator::with_algorithm`): `counters` (default, decremental move counters + BFS queues, `solve_pair_counters` in `retrograde.rs`) and `sweep` (Syzygy-style `CHANGED` candidate flags + forward verification + full table sweeps per ply, `retrograde_sweep.rs`). Both must produce **byte-identical** files; any change to either must preserve this (compare sha256 against a reference set of tables). The unit tests run both.
 
 ## Performance notes (measured on all 4-piece endgames)
 
@@ -19,6 +20,12 @@
   and zstd compression in `save_to_file` (~5-24% depending on the endgame).
 - Zstd level 19 vs 9 on pawnless tables: 15% faster generation for 29% larger
   files. Level 19 is kept, since the tables are the artifact.
+- Counters vs sweep (single-threaded, see `algorithms_comparison.md` 2.A for
+  details): sweep is 13% slower on all 4-piece tables and 23% slower on a
+  5-piece sample (up to +53% on deep, thin-frontier tables like `KNN_KP`), but
+  peak memory is ~4x lower (2.0 vs 8.4 GiB on `KRP_KQ`), because the counters'
+  `usize` queues peak at several times the size of the tables on shallow
+  endgames. The choice will depend on parallel scaling and 6-piece memory.
 
 Current generation results (single-threaded generation, with --noverify):
 =============================================================================================
@@ -46,6 +53,7 @@ Size on disk: 3593.31MiB (1.16 bits/pos on average, lowest compression for KBB_K
 - Add stats without en passant positions to EgtFileStats and implement EgtProber::verify_with_syzygy() to check our stats against the Syzygy stats available on the internet.
 - Use compressed frames to generate compressed file (with zeekstd RawEncoder?).
 - Put queues inside EgtHandle? Use something else instead of table_a == table_b?
+- Counters vs sweep follow-ups: store queue indices as `u32`; try a hybrid (candidate flags + forward verification, but queue-driven instead of full sweeps); compare parallel scaling of both approaches.
 - Experiment with approach using capture/promotion unmoves for initialization.
 - Parallelization (rayon), distributed computing - mpi (e.g. ferrompi). alltoallv to exchange queues across workers. Run on EC2 cluster with S3 storage?
 - Internalize quiet_unmoves() and use stock shakmaty?
