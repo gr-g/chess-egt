@@ -36,7 +36,7 @@ Size on disk: 0.03MiB (0.77 bits/pos on average, lowest compression for KQ_K: 2.
 
 =============================================================================================
 Generated all 4-pieces endgames, corresponding to 125544710 unique positions.
-Time: 00h03m14s.
+Time: 00h05m39s.
 Size on disk: 13.25MiB (0.89 bits/pos on average, lowest compression for KQ_KR: 3.61 bits/pos).
 =============================================================================================
 
