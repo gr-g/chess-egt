@@ -241,10 +241,10 @@ Scan cost:
 - Each phase is a vectorizable linear scan: ~1 s for a 25 GB 6-piece pair on a
   multi-core node, which is negligible.
 - At 7 pieces (1.4 TB × up to ~1,000 plies) scans add up to hours. A per-block
-  summary (one byte per block of ~4K positions: "last ply at which this block
-  received a resolved value") lets scans skip untouched blocks. It also fixes
-  the case where the sweep does worst: deep tables where each ply resolves only
-  a few positions (`KNN_KP`: +53% for the sweep).
+  summary (one `u16` per block of 4K positions: "last ply at which this block
+  received a resolved value") lets scans skip untouched blocks (implemented,
+  see Step 2). It also fixes the case where the sweep does worst: deep tables
+  where each ply resolves only a few positions (`KNN_KP`: +53% for the sweep).
 
 What this means for the existing implementations:
 - **Counters + queues** become redundant once the hybrid is verified. Its
@@ -437,6 +437,30 @@ the 5-piece sample).
 - **Acceptance:** check if there are meaningful advantages of this approach on
   deep tables where each ply resolves few positions (`KNN_KP`, `KBB_KN`). If
   yes we keep it, otherwise we go ahead without any changes.
+- **Status: done, kept.** `PlySummary` in `retrograde.rs`: one `u16` per block
+  of 4096 positions (aligned on global indices, so a block never crosses a
+  frame), created per pair in `solve_pair`. Every block starts at ply 1, which
+  covers initialization. A block is stamped when `mark_win` or `decrement`
+  resolves a position in it. A scan for values at `p - 1` visits the blocks
+  stamped at `p - 1` or later: this is conservative (blocks stamped at `p` are
+  visited too), which keeps the output byte-identical. The list of blocks is
+  taken before each scan, which is correct because a scan only writes values at
+  `p`. Measurements (single-threaded, baseline and new binaries run
+  concurrently on the same machine):
+
+  | Set / Endgame | Blocks visited | Propagation before | After | Δ |
+  |---|---:|---:|---:|---:|
+  | `KNN_KP` (run 1 / run 2) | 20% | 247.0 s / 245.0 s | 227.1 s / 221.8 s | **-8% / -9%** |
+  | `KBB_KN` | 65% | 132.2 s | 131.4 s | -1% |
+  | All 4-piece | 54% | 248.0 s | 247.9 s | 0% |
+
+  Output is byte-identical (`.ggegt` and `.json`) on all 4-piece tables,
+  `KNN_KP` and `KBB_KN`. The gain matches the scan overhead measured in
+  Step 1 on `KNN_KP` (+10%), which is now almost gone. `KBB_KN` gains little
+  because the positions resolved at a ply are spread over most blocks. The
+  summary pays off only when the frontier is thin in blocks, not just in
+  positions. Separate win/loss summaries or smaller blocks might tighten
+  this, but were not tried.
 
 ### Step 3: flat working table, per-pair output
 
@@ -511,7 +535,8 @@ graph TD
    partitioning, per endgame. This decides between range and hash assignment of
    blocks.
 3. The cost of the scan per ply, with and without the block summary, on deep
-   tables where each ply resolves few positions.
+   tables where each ply resolves few positions. Answered for 5 pieces in
+   Step 2: -8-9% propagation time on `KNN_KP`, -1% on `KBB_KN`.
 4. The distribution of maximum DTC for 6-piece tables. This sets the number of
    phases, and hence of barriers, in the swarm model.
 5. Whether the conversion-type sub-phases (3 per ply) or a forward pass on new

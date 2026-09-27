@@ -127,7 +127,7 @@ Before starting the main retrograde loop, both tables in the pair are initialize
        - K_KB (when the P promotes to N capturing the Q)
 
 ### 6.4 The Propagation Loop
-Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
+Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**
    * Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For each of them:
      * Call `quiet_unmoves`.

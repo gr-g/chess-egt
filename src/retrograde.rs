@@ -4,7 +4,9 @@
 //! Every unknown position stores the number of its moves not yet known to
 //! lose (see `README.md`, 6.2). Every resolved position stores its distance, so
 //! the positions to propagate at ply `p` are exactly the values at ply `p - 1`,
-//! found by scanning the tables. Per ply `p`, the loop runs:
+//! found by scanning the tables. A per-block summary (`PlySummary`) lets the
+//! scans skip the blocks that cannot contain values of the scanned ply. Per
+//! ply `p`, the loop runs:
 //! 1. Phase W(p): unmoves from losses at ply `p - 1` mark their unknown
 //!    predecessors as wins at ply `p`.
 //! 2. Phase L(p), in three sub-phases for Checkmate, Capture and Promotion (in
@@ -270,12 +272,70 @@ fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionTyp
     }
 }
 
-/// Visits all indexes of `table` whose value satisfies `select`, frame by
-/// frame through `EgtFile::frame_chunk`. Matching indexes of a frame are
-/// collected first, so `process` may freely read and write the tables.
+/// Number of positions per block of a `PlySummary`. Blocks are aligned on
+/// global file indexes, and the size divides the frame size, so a block never
+/// crosses a frame.
+const SUMMARY_BLOCK_SIZE: usize = 4096;
+
+/// Per block of a table: an upper bound on the plies of the win and loss
+/// values it contains, so that scans for the values of a given ply can skip
+/// the blocks that cannot contain any (`scaling_and_parallelization.md`,
+/// Step 2). Blocks at the ends of the table may overlap neighbouring `Egt`s.
+struct PlySummary {
+    /// Global index of the first position of the table.
+    offset: usize,
+    /// Global index one past the last position of the table.
+    end: usize,
+    /// Global block number of the first block of the table.
+    first_block: usize,
+    last_ply: Vec<u16>,
+}
+
+impl PlySummary {
+    /// Every block starts at ply 1, the highest ply given by initialization,
+    /// so only the values resolved by propagation (ply >= 2) need recording.
+    fn new(solver: &RetrogradeSolver, table: EgtHandle) -> Self {
+        let file = &solver.files[table.file_idx];
+        debug_assert_eq!(file.frame_size % SUMMARY_BLOCK_SIZE, 0);
+        let offset = file.get_global_index(table.egt_idx, 0);
+        let end = offset + file.egts[table.egt_idx].index_range();
+        let first_block = offset / SUMMARY_BLOCK_SIZE;
+        let num_blocks = end.div_ceil(SUMMARY_BLOCK_SIZE) - first_block;
+        Self { offset, end, first_block, last_ply: vec![1; num_blocks] }
+    }
+
+    /// Records that the position at `local_index` was resolved at `plies`.
+    fn record(&mut self, local_index: usize, plies: u16) {
+        let block = (self.offset + local_index) / SUMMARY_BLOCK_SIZE - self.first_block;
+        let last = &mut self.last_ply[block];
+        *last = (*last).max(plies);
+    }
+
+    /// The global index ranges of the blocks that may contain values at
+    /// `plies`, clamped to the table.
+    fn blocks_with(&self, plies: u16) -> Vec<(usize, usize)> {
+        self.last_ply.iter().enumerate()
+            .filter(|&(_, &last)| last >= plies)
+            .map(|(b, _)| {
+                let start = (self.first_block + b) * SUMMARY_BLOCK_SIZE;
+                (start.max(self.offset), (start + SUMMARY_BLOCK_SIZE).min(self.end))
+            })
+            .collect()
+    }
+
+    fn num_blocks(&self) -> usize {
+        self.last_ply.len()
+    }
+}
+
+/// Visits all indexes of `table` within `blocks` (global index ranges, each
+/// within a single frame, see `PlySummary::blocks_with`) whose value satisfies
+/// `select`. Matching indexes of a block are collected first, so `process` may
+/// freely read and write the tables.
 fn scan_table<S, F>(
     solver: &mut RetrogradeSolver,
     table: EgtHandle,
+    blocks: &[(usize, usize)],
     select: S,
     mut process: F,
 ) -> EgtResult<()>
@@ -283,17 +343,11 @@ where
     S: Fn(MaybeDtcOutcome) -> bool,
     F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome),
 {
-    let (offset, end, frame_size) = {
-        let file = &solver.files[table.file_idx];
-        let offset = file.get_global_index(table.egt_idx, 0);
-        (offset, offset + file.egts[table.egt_idx].index_range(), file.frame_size)
-    };
+    let offset = solver.files[table.file_idx].get_global_index(table.egt_idx, 0);
     let mut matches = Vec::new();
-    let mut start = offset;
-    while start < end {
-        let chunk_end = ((start / frame_size + 1) * frame_size).min(end);
+    for &(start, end) in blocks {
         matches.clear();
-        let chunk = solver.files[table.file_idx].frame_chunk(start, chunk_end)?;
+        let chunk = solver.files[table.file_idx].frame_chunk(start, end)?;
         for (i, &v) in chunk.iter().enumerate() {
             if select(v) {
                 matches.push((start - offset + i, v));
@@ -302,7 +356,6 @@ where
         for &(idx, v) in &matches {
             process(solver, idx, v);
         }
-        start = chunk_end;
     }
     Ok(())
 }
@@ -659,6 +712,13 @@ fn solve_pair(
     let mut max_win = [0u16; 2];
     let mut max_loss = [0u16; 2];
 
+    // Indexed by slot. A symmetric pair has a single table and summary.
+    let mut summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(solver, table)).collect();
+    // Blocks visited by the scans, and blocks the same scans would visit
+    // without the summaries.
+    let mut blocks_scanned = 0usize;
+    let mut blocks_total = 0usize;
+
     let mut plies: u16 = 1;
     loop {
         // Positions resolved at `plies`. The scans of a table are skipped
@@ -670,11 +730,17 @@ fn solve_pair(
             if previous[slot].losses == 0 {
                 continue;
             }
-            scan_table(solver, table, |v| v.is_loss() && ply(v) == plies - 1, |solver, idx, v| {
+            // Blocks written during the scan only receive values at `plies`,
+            // which the scan does not look for, so the snapshot is complete.
+            let blocks = summaries[slot].blocks_with(plies - 1);
+            blocks_scanned += blocks.len();
+            blocks_total += summaries[slot].num_blocks();
+            scan_table(solver, table, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |solver, idx, v| {
                 let ct = outcome_ct(v);
                 quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
                     if solver.mark_win(twin, pred_idx, ct, plies) {
                         found[twin_slot].wins += 1;
+                        summaries[twin_slot].record(pred_idx, plies);
                     }
                 });
             })?;
@@ -688,10 +754,14 @@ fn solve_pair(
                 if previous[slot].wins == 0 {
                     continue;
                 }
-                scan_table(solver, table, |v| v == target, |solver, idx, _| {
+                let blocks = summaries[slot].blocks_with(plies - 1);
+                blocks_scanned += blocks.len();
+                blocks_total += summaries[slot].num_blocks();
+                scan_table(solver, table, &blocks, |v| v == target, |solver, idx, _| {
                     quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
                         if solver.decrement(twin, pred_idx, ct, plies) {
                             found[twin_slot].losses += 1;
+                            summaries[twin_slot].record(pred_idx, plies);
                         }
                     });
                 })?;
@@ -714,6 +784,16 @@ fn solve_pair(
         }
         previous = found;
         plies += 1;
+    }
+
+    if blocks_total > 0 {
+        println!(
+            "{}: scans visited {} of {} blocks ({:.1}%)",
+            table_name(solver, table_a),
+            blocks_scanned,
+            blocks_total,
+            100.0 * blocks_scanned as f64 / blocks_total as f64,
+        );
     }
 
     Ok(PairResult {
