@@ -428,30 +428,15 @@ the 5-piece sample).
   remain in the git history). The update sink is two methods on
   `RetrogradeSolver` (`mark_win`, `decrement`). The loop is not generic over it
   yet, because `quiet_unmoves` passes the whole solver to its callback; this
-  split belongs to Steps 3-4. Results (init + propagation, single-threaded):
-
-  | Set / Endgame | Counters | Scan | Δ time | Peak RSS counters | Peak RSS scan |
-  | :--- | ---: | ---: | ---: | ---: | ---: |
-  | All 30 4-piece | 312 s | 306 s | -2% | 191 MiB | 152 MiB |
-  | `KBB_KN` | 169 s | 174 s | +3% | 822 MiB | 291 MiB |
-  | `KQB_KQ` | 382 s | 417 s | +9% | 7495 MiB | 497 MiB |
-  | `KRB_KR` | 241 s | 238 s | -1% | 3509 MiB | 497 MiB |
-  | `KNN_KP` | 360 s | 395 s | +10% | 1629 MiB | 1091 MiB |
-  | `KRP_KQ` | 2181 s | 2134 s | -2% | 8427 MiB | 2059 MiB |
-  | `KQP_KQ` | 1477 s | 1495 s | +1% | 7506 MiB | 2058 MiB |
-  | **5-piece sample total** | **4811 s** | **4854 s** | **+0.9%** | **8427 MiB** | **2059 MiB** |
-
-  The loop skips the scans of a table that resolved nothing at the previous
-  ply, but does not skip empty conversion-type sub-phases. The remaining gap on
-  `KNN_KP` and `KQB_KQ` comes from full-table scans on plies that resolve few
-  positions, which is what Step 2 addresses.
+  split belongs to Steps 3-4.
 
 ### Step 2: per-block ply summary
 
 - One byte per block recording the last ply at which a value was resolved in
   it. Scans skip blocks that cannot contain values of the scanned ply.
-- **Acceptance:** closes the gap on deep tables where each ply resolves few
-  positions (`KNN_KP`, `KBB_KN`).
+- **Acceptance:** check if there are meaningful advantages of this approach on
+  deep tables where each ply resolves few positions (`KNN_KP`, `KBB_KN`). If
+  yes we keep it, otherwise we go ahead without any changes.
 
 ### Step 3: flat working table, per-pair output
 
