@@ -127,26 +127,27 @@ Before starting the main retrograde loop, both tables in the pair are initialize
        - K_KB (when the P promotes to N capturing the Q)
 
 ### 6.4 The Propagation Loop
-The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
+Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**
-   * For each position in Table A newly marked as 'loss (conversion_type, n)':
+   * Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For each of them:
      * Call `quiet_unmoves`.
-     * Mark the predecessors in Table B as 'win (conversion_type, n+1)' if they are currently 'unknown'.
-   * Do the same for newly marked 'loss' positions in Table B, propagating them to Table A (unless A and B are the same table).
-2. **Propagate Wins to Losses (decrement counters):**
-   * For each position in Table A newly marked as 'win (conversion_type, n)':
+     * Mark the predecessors in Table B as 'win (conversion_type, n)' if they are currently 'unknown'. A predecessor reached by several losses keeps the preferred conversion type (Checkmate > Capture > Promotion).
+   * Do the same for Table B, propagating to Table A (unless A and B are the same table).
+2. **Propagate Wins to Losses (decrement counters):** for each conversion type, in the order Checkmate, Capture, Promotion:
+   * Scan Table A for positions marked as 'win (conversion_type, n-1)'. For each of them:
      * Call `quiet_unmoves`.
-     * Deduplicate the list of predecessor indices.
      * For each 'unknown' predecessor, decrement its move counter by 1.
-     * If the counter reaches 0, mark the predecessor as 'loss (conversion_type, n+1)'.
-   * Do the same for newly marked 'win' positions in Table B, propagating them to Table A (unless A and B are the same table).
+     * If the counter reaches 0, mark the predecessor as 'loss (conversion_type, n)'.
+   * Do the same for Table B, propagating to Table A (unless A and B are the same table).
 3. If no new positions were marked in this iteration, stop.
 4. Increment $n$.
 5. At the end of the process mark all 'unknown' positions as draws.
 
-### 6.5 Use of reverse move generation for transitions from a different endgame
-The current approach relies only on `quiet_unmoves()`: a function that lists reverse moves without considering captures or promotions. This is enough during initialization, when we can scan all indexes and list the legal moves and consider transitions to simpler endgames. During this phase, for each capture/promotion move, we compute the index in the dependency and lookup the tablebase result, then use it for populating the queue of indexes to update.
+A phase only scans values at ply `n-1` and only writes values at ply `n` (or counters), so the result does not depend on the order in which positions are visited. Running the three conversion types separately makes the conversion type of a loss deterministic (the last one to decrement its counter, i.e. Promotion > Capture > Checkmate).
 
-In principle another approach is possible, which consists in scanning all indexes of simpler endgames, generating reverse capture/promotion moves from there (with unmove functions such as `capture_unmoves()`, `promotion_unmoves()`, or `promotion_capture_unmoves()`) and using these for populating the queue of indexes to update.
+### 6.5 Use of reverse move generation for transitions from a different endgame
+The current approach relies only on `quiet_unmoves()`: a function that lists reverse moves without considering captures or promotions. This is enough during initialization, when we can scan all indexes and list the legal moves and consider transitions to simpler endgames. During this phase, for each capture/promotion move, we compute the index in the dependency and lookup the tablebase result: a losing successor makes the position a win at ply 1, and a winning successor decrements the position's own counter (a counter reaching zero makes it a loss at ply 1).
+
+In principle another approach is possible, which consists in scanning all indexes of simpler endgames, generating reverse capture/promotion moves from there (with unmove functions such as `capture_unmoves()`, `promotion_unmoves()`, or `promotion_capture_unmoves()`) and using these to update the predecessors.
 
 If this approach was used, note that special care should be given to unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry). The process would be to reconstruct the 4 rotations of the canonical pawnless board, then call the retrograde unmove function on each of the 4 rotations. For each resulting predecessor board, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.

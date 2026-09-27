@@ -58,7 +58,7 @@ This is the **single most fundamental algorithmic difference**:
 
 #### Measured comparison in `chess-egt` (single-threaded)
 
-To get hard numbers, the Changed-Flag approach was re-implemented in `chess-egt` (`src/retrograde_sweep.rs`, selected with `--algorithm sweep`), sharing everything else with the counter implementation: indexing, `quiet_unmoves`, dependency probing, statistics and file output.
+To get hard numbers, the Changed-Flag approach was re-implemented in `chess-egt` (`src/retrograde_sweep.rs`, selected with `--algorithm sweep`; since removed, together with the queue-based counters, in favor of the scan-driven counters, see the follow-up below and the git history), sharing everything else with the counter implementation: indexing, `quiet_unmoves`, dependency probing, statistics and file output.
 
 *Implementation notes:*
 - The 13 spare bits of an `UNKNOWN` value hold a `CHANGED` flag, a `NO_LOSS` flag and two 2-bit conversion types. Initialization probes captures/promotions once (as the counter version does): if any conversion move does not lose, the position gets `NO_LOSS` and can never become a candidate; otherwise all conversions are known to lose, so forward verification only plays **quiet** moves against the pair tables and never probes dependency tables.

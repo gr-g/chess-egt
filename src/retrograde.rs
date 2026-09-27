@@ -1,11 +1,38 @@
+//! Retrograde analysis: decremental move counters driven by per-ply table
+//! scans (see `scaling_and_parallelization.md`, Section 4.2).
+//!
+//! Every unknown position stores the number of its moves not yet known to
+//! lose (see `README.md`, 6.2). Every resolved position stores its distance, so
+//! the positions to propagate at ply `p` are exactly the values at ply `p - 1`,
+//! found by scanning the tables. Per ply `p`, the loop runs:
+//! 1. Phase W(p): unmoves from losses at ply `p - 1` mark their unknown
+//!    predecessors as wins at ply `p`.
+//! 2. Phase L(p), in three sub-phases for Checkmate, Capture and Promotion (in
+//!    this order): unmoves from wins of that conversion type at ply `p - 1`
+//!    decrement the counters of their unknown predecessors. A counter reaching
+//!    zero gives a loss at ply `p`, with the conversion type of the sub-phase.
+//!
+//! The output does not depend on the order in which a phase visits positions:
+//! - A phase only scans values at ply `p - 1` and only writes values at ply
+//!   `p` (or counters), so it never sees its own writes.
+//! - A win keeps the preferred conversion type among the losses at `p - 1`
+//!   reaching it (Checkmate > Capture > Promotion, see
+//!   `RetrogradeSolver::mark_win`).
+//! - A loss gets the conversion type of the last sub-phase that decrements its
+//!   counter, i.e. the preference Promotion > Capture > Checkmate among the
+//!   wins at `p - 1` reaching it.
+//!
+//! Conversions are resolved during initialization, where a position only
+//! updates itself: a winning conversion gives a win at ply 1, and losing
+//! conversions are subtracted from the position's own counter directly (a
+//! counter reaching zero gives a loss at ply 1).
+
 use shakmaty::{Bitboard, Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
 use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
-use crate::retrograde_scan as scan;
-use crate::retrograde_sweep as sweep;
 use std::collections::{HashMap, BTreeMap};
 
 struct EgtFileStatsBuilder {
@@ -133,93 +160,8 @@ pub struct EgtHandle {
 
 // Returns the tablename of the sub-table referenced by `handle` within `solver`.
 // Used for logging; the name is not stored on the handle itself.
-pub(crate) fn table_name(solver: &RetrogradeSolver, handle: EgtHandle) -> &str {
+fn table_name(solver: &RetrogradeSolver, handle: EgtHandle) -> &str {
     solver.files[handle.file_idx].egts[handle.egt_idx].tablename()
-}
-
-struct DepthQueues {
-    win_checkmate: Vec<usize>,
-    win_capture: Vec<usize>,
-    win_promotion: Vec<usize>,
-
-    loss_checkmate: Vec<usize>,
-    loss_capture: Vec<usize>,
-    loss_promotion: Vec<usize>,
-}
-
-impl DepthQueues {
-    fn new() -> Self {
-        Self {
-            win_checkmate: Vec::new(),
-            win_capture: Vec::new(),
-            win_promotion: Vec::new(),
-            loss_checkmate: Vec::new(),
-            loss_capture: Vec::new(),
-            loss_promotion: Vec::new(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.win_checkmate.is_empty()
-            && self.win_capture.is_empty()
-            && self.win_promotion.is_empty()
-            && self.loss_checkmate.is_empty()
-            && self.loss_capture.is_empty()
-            && self.loss_promotion.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.win_checkmate.clear();
-        self.win_capture.clear();
-        self.win_promotion.clear();
-        self.loss_checkmate.clear();
-        self.loss_capture.clear();
-        self.loss_promotion.clear();
-    }
-
-    fn sort(&mut self) {
-        self.win_checkmate.sort_unstable();
-        self.win_capture.sort_unstable();
-        self.win_promotion.sort_unstable();
-        self.loss_checkmate.sort_unstable();
-        self.loss_capture.sort_unstable();
-        self.loss_promotion.sort_unstable();
-    }
-
-    fn push_win(&mut self, idx: usize, ct: ConversionType) {
-        match ct {
-            ConversionType::Checkmate => self.win_checkmate.push(idx),
-            ConversionType::Capture => self.win_capture.push(idx),
-            ConversionType::Promotion => self.win_promotion.push(idx),
-        }
-    }
-
-    fn push_loss(&mut self, idx: usize, ct: ConversionType) {
-        match ct {
-            ConversionType::Checkmate => self.loss_checkmate.push(idx),
-            ConversionType::Capture => self.loss_capture.push(idx),
-            ConversionType::Promotion => self.loss_promotion.push(idx),
-        }
-    }
-
-    fn merge(&mut self, other: &mut Self) {
-        self.win_checkmate.append(&mut other.win_checkmate);
-        self.win_capture.append(&mut other.win_capture);
-        self.win_promotion.append(&mut other.win_promotion);
-        self.loss_checkmate.append(&mut other.loss_checkmate);
-        self.loss_capture.append(&mut other.loss_capture);
-        self.loss_promotion.append(&mut other.loss_promotion);
-    }
-
-    /// Heap memory allocated by the queues, in bytes.
-    fn capacity_bytes(&self) -> usize {
-        std::mem::size_of::<usize>() * (self.win_checkmate.capacity() +
-            self.win_capture.capacity() +
-            self.win_promotion.capacity() +
-            self.loss_checkmate.capacity() +
-            self.loss_capture.capacity() +
-            self.loss_promotion.capacity())
-    }
 }
 
 pub struct RetrogradeSolver {
@@ -262,7 +204,7 @@ impl RetrogradeSolver {
     /// at this same ply, keeps the preferred conversion type (Checkmate >
     /// Capture > Promotion), so the result does not depend on the order of the
     /// updates. Returns whether the position was newly resolved.
-    pub(crate) fn mark_win(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
+    fn mark_win(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
         let v = self.read_outcome(table, idx);
         if v.is_unknown() {
             self.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
@@ -279,7 +221,7 @@ impl RetrogradeSolver {
     /// successors is a win (conversion type `ct`) at ply `plies - 1`. When the
     /// counter reaches zero, the position becomes a loss at `plies`. Returns
     /// whether the position was newly resolved.
-    pub(crate) fn decrement(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
+    fn decrement(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
         let v = self.read_outcome(table, idx);
         if !v.is_unknown() {
             return false;
@@ -297,12 +239,12 @@ impl RetrogradeSolver {
 }
 
 /// Distance (ply) of a win or loss value.
-pub(crate) fn ply(v: MaybeDtcOutcome) -> u16 {
+fn ply(v: MaybeDtcOutcome) -> u16 {
     v.to_u16() >> 3
 }
 
 /// Conversion type of a win or loss value.
-pub(crate) fn outcome_ct(v: MaybeDtcOutcome) -> ConversionType {
+fn outcome_ct(v: MaybeDtcOutcome) -> ConversionType {
     match v.to_u16() & 0b110 {
         0b010 => ConversionType::Checkmate,
         0b100 => ConversionType::Capture,
@@ -321,7 +263,7 @@ fn loss_rank(ct: ConversionType) -> u8 {
 }
 
 /// The preferred conversion type for a loss among `a` (if any) and `b`.
-pub(crate) fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionType {
+fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionType {
     match a {
         Some(a) if loss_rank(a) >= loss_rank(b) => a,
         _ => b,
@@ -331,34 +273,34 @@ pub(crate) fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> Co
 /// Visits all indexes of `table` whose value satisfies `select`, frame by
 /// frame through `EgtFile::frame_chunk`. Matching indexes of a frame are
 /// collected first, so `process` may freely read and write the tables.
-pub(crate) fn scan_table<S, F>(
+fn scan_table<S, F>(
     solver: &mut RetrogradeSolver,
     table: EgtHandle,
-    buf: &mut Vec<(usize, MaybeDtcOutcome)>,
     select: S,
     mut process: F,
 ) -> EgtResult<()>
 where
     S: Fn(MaybeDtcOutcome) -> bool,
-    F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome) -> EgtResult<()>,
+    F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome),
 {
     let (offset, end, frame_size) = {
         let file = &solver.files[table.file_idx];
         let offset = file.get_global_index(table.egt_idx, 0);
         (offset, offset + file.egts[table.egt_idx].index_range(), file.frame_size)
     };
+    let mut matches = Vec::new();
     let mut start = offset;
     while start < end {
         let chunk_end = ((start / frame_size + 1) * frame_size).min(end);
-        buf.clear();
+        matches.clear();
         let chunk = solver.files[table.file_idx].frame_chunk(start, chunk_end)?;
         for (i, &v) in chunk.iter().enumerate() {
             if select(v) {
-                buf.push((start - offset + i, v));
+                matches.push((start - offset + i, v));
             }
         }
-        for &(idx, v) in buf.iter() {
-            process(solver, idx, v)?;
+        for &(idx, v) in &matches {
+            process(solver, idx, v);
         }
         start = chunk_end;
     }
@@ -398,7 +340,7 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
 // Whether predecessors generated from `table` have to be mirrored horizontally
 // before being indexed in `twin`. This depends only on the pawn files of the two
 // sub-tables, so it is computed once per table pair rather than per unmove.
-pub(crate) fn is_mirrored(solver: &RetrogradeSolver, table: EgtHandle, twin: EgtHandle) -> bool {
+fn is_mirrored(solver: &RetrogradeSolver, table: EgtHandle, twin: EgtHandle) -> bool {
     let (stm_files_a, sntm_files_a) = get_pawn_files(solver.files[table.file_idx].egts[table.egt_idx].pieces());
     let (stm_files_b, sntm_files_b) = get_pawn_files(solver.files[twin.file_idx].egts[twin.egt_idx].pieces());
     stm_files_b != sntm_files_a || sntm_files_b != stm_files_a
@@ -457,7 +399,7 @@ pub fn quiet_unmoves<F>(
         });
 }
 
-pub(crate) fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
+fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
     let legals = position.legal_moves();
     let kings = position.board().by_role(Role::King);
 
@@ -567,357 +509,218 @@ impl DependencyCache {
     }
 }
 
+/// Number of positions of a table resolved at a given ply.
+#[derive(Clone, Copy, Default)]
+struct Found {
+    wins: usize,
+    losses: usize,
+}
+
+impl Found {
+    fn is_empty(self) -> bool {
+        self.wins == 0 && self.losses == 0
+    }
+}
+
+struct InitCounts {
+    checkmates: usize,
+    stalemates: usize,
+    /// Wins and losses at ply 1, resolved by conversions.
+    found: Found,
+}
+
+/// Writes the initial value of every position of `table`: invalid, checkmate
+/// (loss at ply 0), stalemate, win or loss at ply 1 by conversion, or unknown
+/// with its move counter.
 fn initialize_table(
     solver: &mut RetrogradeSolver,
     table: EgtHandle,
-    twin: EgtHandle,
-    mirrored: bool,
     dep_cache: &mut DependencyCache,
-    table_queues: &mut DepthQueues,
-    twin_queues: &mut DepthQueues,
-) -> EgtResult<(usize, usize, usize)> {
+) -> EgtResult<InitCounts> {
     let (size, pawnless) = {
         let egt = &solver.files[table.file_idx].egts[table.egt_idx];
         (egt.index_range(), egt.is_pawnless())
     };
-
-    let mut checkmate_count = 0;
-    let mut stalemate_count = 0;
-    let mut unknown_count = 0;
+    let mut counts = InitCounts { checkmates: 0, stalemates: 0, found: Found::default() };
 
     for idx in 0..size {
-        // Decode position using Color::White as side-to-move
         let position_opt = solver.files[table.file_idx].egts[table.egt_idx].position_from_index(idx, Color::White);
 
         if (idx+1) % 10000000 == 0 {
             println!("Scanned {}/{} indexes...", idx+1, size);
         }
 
-        if position_opt.is_none() {
+        let Some(position) = position_opt else {
             solver.write_outcome(table, idx, MaybeDtcOutcome::INVALID);
             continue;
-        }
-
-        let position = position_opt.unwrap();
+        };
         let legals = position.legal_moves();
 
         if legals.is_empty() {
             if position.is_check() {
-                // Checkmate!
                 solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0));
-                checkmate_count += 1;
-                // Add predecessors to twin's loss-to-win queue (depth 1)
-                quiet_unmoves(solver, table, twin, idx, mirrored, |_solver, pred_idx| {
-                    twin_queues.push_win(pred_idx, ConversionType::Checkmate);
-                });
+                counts.checkmates += 1;
             } else {
-                // Stalemate!
                 solver.write_outcome(table, idx, MaybeDtcOutcome::DRAW);
-                stalemate_count += 1;
+                counts.stalemates += 1;
             }
+            continue;
+        }
+
+        let mut counter = if pawnless {
+            symmetry_adjusted_move_counter(&position)
         } else {
-            // Unknown position, initialize move counter and probe dependencies
-            let counter = if pawnless {
-                symmetry_adjusted_move_counter(&position)
-            } else {
-                legals.len() as u16
-            };
+            legals.len() as u16
+        };
+        let mut win_conv: Option<ConversionType> = None;
+        let mut loss_conv: Option<ConversionType> = None;
 
-            solver.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter));
-            unknown_count += 1;
+        for m in legals {
+            if m.is_capture() || m.is_promotion() {
+                let mut successor_position = position.clone();
+                successor_position.play_unchecked(m);
+                let dep_endgame = crate::get_endgame(&successor_position);
+                let dep_outcome = dep_cache.get_or_load(&dep_endgame)?.probe(&successor_position)?;
 
-            for m in legals {
-                let is_capture = m.is_capture();
-                let is_promotion = m.is_promotion();
-
-                if is_capture || is_promotion {
-                    let mut successor_position = position.clone();
-                    successor_position.play_unchecked(m);
-                    let dep_endgame = crate::get_endgame(&successor_position);
-
-                    // Probe the dependency table
-                    let dep_outcome = dep_cache.get_or_load(&dep_endgame)?.probe(&successor_position)?;
-
-                    let ct = if is_capture { ConversionType::Capture } else { ConversionType::Promotion };
-                    if dep_outcome.is_loss() {
-                        // Successor is a loss, so this is a win-in-1.
-                        // Add to loss-to-win queue (depth 1)
-                        table_queues.push_win(idx, ct);
-                    } else if dep_outcome.is_win() {
-                        // Successor is a win, so we must decrement the counter.
-                        // Add to win-to-loss queue (depth 1)
-                        table_queues.push_loss(idx, ct);
-                    }
+                let ct = if m.is_capture() { ConversionType::Capture } else { ConversionType::Promotion };
+                if dep_outcome.is_loss() {
+                    win_conv = Some(win_conv.map_or(ct, |w| w.max(ct)));
+                } else if dep_outcome.is_win() {
+                    // Conversion moves always count 1 in the counter (the
+                    // symmetry adjustment only applies to quiet king moves).
+                    counter -= 1;
+                    loss_conv = Some(better_loss_ct(loss_conv, ct));
                 }
             }
         }
+
+        let outcome = if let Some(ct) = win_conv {
+            // A checkmate in 1 found by phase W(1) may still upgrade the
+            // conversion type.
+            counts.found.wins += 1;
+            MaybeDtcOutcome::new_win(ct, 1)
+        } else if counter == 0 {
+            // All moves are conversions to won positions.
+            counts.found.losses += 1;
+            MaybeDtcOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
+        } else {
+            MaybeDtcOutcome::new_unknown(counter)
+        };
+        solver.write_outcome(table, idx, outcome);
     }
 
-    Ok((checkmate_count, stalemate_count, unknown_count))
+    Ok(counts)
 }
 
-fn propagate_loss_to_win(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
-    mirrored: bool,
-    idx: usize,
-    plies: u16,
-    ct: ConversionType,
-    twin_next_queues: &mut DepthQueues,
-) -> bool {
-    let outcome = solver.read_outcome(table, idx);
-    if outcome.is_unknown() {
-        solver.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
-        quiet_unmoves(solver, table, twin, idx, mirrored, |_solver, pred_idx| {
-            twin_next_queues.push_loss(pred_idx, ct);
-        });
-        true
-    } else {
-        false
-    }
+/// Per-pair output of `solve_pair`.
+struct PairResult {
+    max_win_dtc_a: u16,
+    max_loss_dtc_a: u16,
+    max_win_dtc_b: u16,
+    max_loss_dtc_b: u16,
+    init_time: std::time::Duration,
+    propagation_time: std::time::Duration,
 }
 
-fn propagate_win_to_loss(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
-    mirrored: bool,
-    idx: usize,
-    plies: u16,
-    ct: ConversionType,
-    twin_next_queues: &mut DepthQueues,
-) -> bool {
-    if solver.decrement(table, idx, ct, plies) {
-        quiet_unmoves(solver, table, twin, idx, mirrored, |_solver, pred_idx| {
-            twin_next_queues.push_win(pred_idx, ct);
-        });
-        true
-    } else {
-        false
-    }
-}
-
-/// The core loop used to resolve losses during retrograde analysis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Algorithm {
-    /// Decremental move counters with BFS queues (see `AGENTS.md`, 6.2-6.4).
-    #[default]
-    Counters,
-    /// `CHANGED` candidate flags with forward loss verification and full
-    /// table sweeps each ply, Syzygy-style (see `retrograde_sweep.rs`).
-    Sweep,
-    /// Decremental move counters driven by per-ply table scans instead of
-    /// queues (see `retrograde_scan.rs`).
-    Scan,
-}
-
-/// Per-pair output of the core solving loop.
-pub(crate) struct PairResult {
-    pub max_win_dtc_a: u16,
-    pub max_loss_dtc_a: u16,
-    pub max_win_dtc_b: u16,
-    pub max_loss_dtc_b: u16,
-    pub init_time: std::time::Duration,
-    pub propagation_time: std::time::Duration,
-}
-
-fn solve_pair_counters(
+/// Solves the pair of sub-tables `table_a` and `table_b` (the same sub-table
+/// with the other side to move), leaving the draws as unknown.
+fn solve_pair(
     solver: &mut RetrogradeSolver,
     table_a: EgtHandle,
     table_b: EgtHandle,
     dep_cache: &mut DependencyCache,
 ) -> EgtResult<PairResult> {
     let init_start = std::time::Instant::now();
-    // Whether unmoves crossing between the two sub-tables of this pair need a
-    // horizontal mirror. Constant for the whole pair, so hoisted out of the
-    // initialization and propagation loops.
-    let mirrored_ab = is_mirrored(solver, table_a, table_b);
-    let mirrored_ba = is_mirrored(solver, table_b, table_a);
 
-    let mut queues_a = DepthQueues::new();
-    let mut queues_b = DepthQueues::new();
-    let mut next_queues_a = DepthQueues::new();
-    let mut next_queues_b = DepthQueues::new();
-
-    let (checkmates, stalemates, _) =
-        initialize_table(solver, table_a, table_b, mirrored_ab, dep_cache, &mut queues_a, &mut queues_b)?;
-    println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table_a), checkmates, stalemates);
-
-    if table_a != table_b {
-        let (checkmates, stalemates, _) =
-            initialize_table(solver, table_b, table_a, mirrored_ba, dep_cache, &mut queues_b, &mut queues_a)?;
-        println!("{}: Initialized with {} checkmated positions and {} stalemated positions.", table_name(solver, table_b), checkmates, stalemates);
+    // (table, twin, mirrored, slot of the table, slot of the twin), where the
+    // slot indexes the per-table counts (0 for A, 1 for B).
+    let tables: Vec<(EgtHandle, EgtHandle, bool, usize, usize)> = if table_a == table_b {
+        vec![(table_a, table_a, is_mirrored(solver, table_a, table_a), 0, 0)]
     } else {
-        queues_a.merge(&mut queues_b);
+        vec![
+            (table_a, table_b, is_mirrored(solver, table_a, table_b), 0, 1),
+            (table_b, table_a, is_mirrored(solver, table_b, table_a), 1, 0),
+        ]
+    };
+
+    // Checkmates count as losses at ply 0, so that phase W(1) scans them.
+    let mut previous = [Found::default(); 2];
+    let mut found_by_conversion = [Found::default(); 2];
+    for &(table, _, _, slot, _) in &tables {
+        let counts = initialize_table(solver, table, dep_cache)?;
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
+        previous[slot].losses = counts.checkmates;
+        found_by_conversion[slot] = counts.found;
     }
 
     let init_time = init_start.elapsed();
     let propagation_start = std::time::Instant::now();
 
-    let mut current_max_win_dtc_a = 0;
-    let mut current_max_loss_dtc_a = 0;
-    let mut current_max_win_dtc_b = 0;
-    let mut current_max_loss_dtc_b = 0;
+    let mut max_win = [0u16; 2];
+    let mut max_loss = [0u16; 2];
 
-    let mut plies = 1;
-    while !queues_a.is_empty() || !queues_b.is_empty() {
-        let mut wins_found_a = 0;
-        let mut losses_found_a = 0;
-        let mut wins_found_b = 0;
-        let mut losses_found_b = 0;
+    let mut plies: u16 = 1;
+    loop {
+        // Positions resolved at `plies`. The scans of a table are skipped
+        // when it resolved nothing at `plies - 1`.
+        let mut found = if plies == 1 { found_by_conversion } else { [Found::default(); 2] };
 
-        // 1. Process loss-to-win queues (marking wins at depth `plies`)
-        if table_a == table_b {
-            for &idx in &queues_a.win_checkmate {
-                if propagate_loss_to_win(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
-                    wins_found_a += 1;
-                }
+        // Phase W: losses at `plies - 1` make their predecessors wins.
+        for &(table, twin, mirrored, slot, twin_slot) in &tables {
+            if previous[slot].losses == 0 {
+                continue;
             }
-            for &idx in &queues_a.win_capture {
-                if propagate_loss_to_win(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Capture, &mut next_queues_a) {
-                    wins_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.win_promotion {
-                if propagate_loss_to_win(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
-                    wins_found_a += 1;
-                }
-            }
-        } else {
-            // Table A wins propagate to Table B losses
-            for &idx in &queues_a.win_checkmate {
-                if propagate_loss_to_win(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Checkmate, &mut next_queues_b) {
-                    wins_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.win_capture {
-                if propagate_loss_to_win(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Capture, &mut next_queues_b) {
-                    wins_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.win_promotion {
-                if propagate_loss_to_win(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Promotion, &mut next_queues_b) {
-                    wins_found_a += 1;
-                }
-            }
+            scan_table(solver, table, |v| v.is_loss() && ply(v) == plies - 1, |solver, idx, v| {
+                let ct = outcome_ct(v);
+                quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
+                    if solver.mark_win(twin, pred_idx, ct, plies) {
+                        found[twin_slot].wins += 1;
+                    }
+                });
+            })?;
+        }
 
-            // Table B wins propagate to Table A losses
-            for &idx in &queues_b.win_checkmate {
-                if propagate_loss_to_win(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
-                    wins_found_b += 1;
+        // Phase L: wins at `plies - 1` decrement the counters of their
+        // predecessors, one conversion type after the other.
+        for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
+            let target = MaybeDtcOutcome::new_win(ct, plies - 1);
+            for &(table, twin, mirrored, slot, twin_slot) in &tables {
+                if previous[slot].wins == 0 {
+                    continue;
                 }
-            }
-            for &idx in &queues_b.win_capture {
-                if propagate_loss_to_win(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Capture, &mut next_queues_a) {
-                    wins_found_b += 1;
-                }
-            }
-            for &idx in &queues_b.win_promotion {
-                if propagate_loss_to_win(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
-                    wins_found_b += 1;
-                }
+                scan_table(solver, table, |v| v == target, |solver, idx, _| {
+                    quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
+                        if solver.decrement(twin, pred_idx, ct, plies) {
+                            found[twin_slot].losses += 1;
+                        }
+                    });
+                })?;
             }
         }
 
-        // 2. Process win-to-loss queues (decrementing counters and marking losses at depth `plies`)
-        if table_a == table_b {
-            for &idx in &queues_a.loss_checkmate {
-                if propagate_win_to_loss(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
-                    losses_found_a += 1;
-                }
+        for &(table, _, _, slot, _) in &tables {
+            if found[slot].wins > 0 {
+                println!("{}: Found {} winning positions at depth {}", table_name(solver, table), found[slot].wins, plies);
+                max_win[slot] = plies;
             }
-            for &idx in &queues_a.loss_capture {
-                if propagate_win_to_loss(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Capture, &mut next_queues_a) {
-                    losses_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.loss_promotion {
-                if propagate_win_to_loss(solver, table_a, table_a, mirrored_ab, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
-                    losses_found_a += 1;
-                }
-            }
-        } else {
-            // Table A losses propagate to Table B wins
-            for &idx in &queues_a.loss_checkmate {
-                if propagate_win_to_loss(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Checkmate, &mut next_queues_b) {
-                    losses_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.loss_capture {
-                if propagate_win_to_loss(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Capture, &mut next_queues_b) {
-                    losses_found_a += 1;
-                }
-            }
-            for &idx in &queues_a.loss_promotion {
-                if propagate_win_to_loss(solver, table_a, table_b, mirrored_ab, idx, plies, ConversionType::Promotion, &mut next_queues_b) {
-                    losses_found_a += 1;
-                }
-            }
-
-            // Table B losses propagate to Table A wins
-            for &idx in &queues_b.loss_checkmate {
-                if propagate_win_to_loss(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Checkmate, &mut next_queues_a) {
-                    losses_found_b += 1;
-                }
-            }
-            for &idx in &queues_b.loss_capture {
-                if propagate_win_to_loss(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Capture, &mut next_queues_a) {
-                    losses_found_b += 1;
-                }
-            }
-            for &idx in &queues_b.loss_promotion {
-                if propagate_win_to_loss(solver, table_b, table_a, mirrored_ba, idx, plies, ConversionType::Promotion, &mut next_queues_a) {
-                    losses_found_b += 1;
-                }
+            if found[slot].losses > 0 {
+                println!("{}: Found {} losing positions at depth {}", table_name(solver, table), found[slot].losses, plies);
+                max_loss[slot] = plies;
             }
         }
 
-        let queues_capacity_mb = (queues_a.capacity_bytes() + queues_b.capacity_bytes() + next_queues_a.capacity_bytes() + next_queues_b.capacity_bytes()) as f64 / (1024.0 * 1024.0);
-
-        if wins_found_a > 0 {
-            println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_name(solver, table_a), wins_found_a, plies, queues_capacity_mb);
-            current_max_win_dtc_a = current_max_win_dtc_a.max(plies);
+        if found.iter().all(|f| f.is_empty()) {
+            break;
         }
-        if losses_found_a > 0 {
-            println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_name(solver, table_a), losses_found_a, plies, queues_capacity_mb);
-            current_max_loss_dtc_a = current_max_loss_dtc_a.max(plies);
-        }
-        if wins_found_b > 0 {
-            println!("{}: Found {} winning positions at depth {} (memory used by queues: {:.0}MiB)", table_name(solver, table_b), wins_found_b, plies, queues_capacity_mb);
-            current_max_win_dtc_b = current_max_win_dtc_b.max(plies);
-        }
-        if losses_found_b > 0 {
-            println!("{}: Found {} losing positions at depth {} (memory used by queues: {:.0}MiB)", table_name(solver, table_b), losses_found_b, plies, queues_capacity_mb);
-            current_max_loss_dtc_b = current_max_loss_dtc_b.max(plies);
-        }
-
-
-        queues_a.clear();
-        queues_b.clear();
-
-        // Sort the queues to update the indexes in a more linear order in
-        // memory, compared to random access.
-        //
-        // Measured to be performance-neutral for 4-piece endgames: the
-        // working set is small enough that cachegrind reports a D1 miss rate
-        // of only 0.2%, so there is nothing for better locality to recover.
-        // Kept because it should start paying off once tables no longer fit
-        // in cache (and because it makes the traversal order deterministic),
-        // but worth re-measuring for 6+ pieces.
-        next_queues_a.sort();
-        next_queues_b.sort();
-
-        std::mem::swap(&mut queues_a, &mut next_queues_a);
-        std::mem::swap(&mut queues_b, &mut next_queues_b);
+        previous = found;
         plies += 1;
     }
 
     Ok(PairResult {
-        max_win_dtc_a: current_max_win_dtc_a,
-        max_loss_dtc_a: current_max_loss_dtc_a,
-        max_win_dtc_b: current_max_win_dtc_b,
-        max_loss_dtc_b: current_max_loss_dtc_b,
+        max_win_dtc_a: max_win[0],
+        max_loss_dtc_a: max_loss[0],
+        max_win_dtc_b: max_win[1],
+        max_loss_dtc_b: max_loss[1],
         init_time,
         propagation_time: propagation_start.elapsed(),
     })
@@ -928,7 +731,6 @@ pub fn retrograde_analysis(
     endgame: &str,
     input_path: Option<&std::path::Path>,
     generate_deps: bool,
-    algorithm: Algorithm,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
     let parts: Vec<&str> = endgame.split('_').collect();
     if parts.len() != 2 {
@@ -1013,11 +815,7 @@ pub fn retrograde_analysis(
     let mut finalize_time = std::time::Duration::ZERO;
 
     for &(table_a, table_b) in &table_pairs {
-        let pair = match algorithm {
-            Algorithm::Counters => solve_pair_counters(&mut solver, table_a, table_b, &mut dep_cache)?,
-            Algorithm::Sweep => sweep::solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?,
-            Algorithm::Scan => scan::solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?,
-        };
+        let pair = solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?;
         init_time += pair.init_time;
         propagation_time += pair.propagation_time;
         let current_max_win_dtc_a = pair.max_win_dtc_a;
@@ -1090,9 +888,8 @@ pub fn retrograde_analysis(
     }
 
     println!(
-        "{} ({:?}): phase timings: init {:.3}s, propagation {:.3}s, finalize {:.3}s",
+        "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize {:.3}s",
         endgame,
-        algorithm,
         init_time.as_secs_f64(),
         propagation_time.as_secs_f64(),
         finalize_time.as_secs_f64(),
@@ -1127,9 +924,8 @@ mod tests {
         expected_losses_b: Option<usize>,
         expected_invalid_b: Option<usize>,
     ) {
-        for algorithm in [Algorithm::Counters, Algorithm::Sweep, Algorithm::Scan] {
-        let test_dir = crate::TestDir::new(&format!("generation_{}_{:?}", endgame, algorithm));
-        let (file_a, file_b) = retrograde_analysis(&test_dir.0, endgame, None, true, algorithm).unwrap();
+        let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
+        let (file_a, file_b) = retrograde_analysis(&test_dir.0, endgame, None, true).unwrap();
 
         let stats_a = file_a.stats.as_ref().expect("file_a should have stats");
         println!("{} stats:", file_a.endgame);
@@ -1160,7 +956,6 @@ mod tests {
             assert_eq!(stats_b.invalid_or_redundant, expected_invalid_b.unwrap());
         } else {
             assert!(file_b.is_none());
-        }
         }
     }
 

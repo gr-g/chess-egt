@@ -2,8 +2,9 @@
 
 - The goal of the project is to produce chess endgame tablebases (EGTs).
 - The current status of the project is: there is an implementation of the file and table indexing (`EgtFile`, `Egt` and `Indexer` classes). There is an implementation of compression/decompression. There is no memory management yet (LRU-eviction of frames from memory) and no parallelization. The generation of tablebase outcomes through retrograde analysis of chess position is implemented (`RetrogradeSolver`) and looks pretty solid. Tablebases for all 3-piece, 4-piece and 5-piece endgames were generated and verified successfully. The exact library interface to expose and the command line interface are still to be defined.
-- The details of the retrograde analysis implementation differ from the design specifications, as this part is in flux. Currently two interchangeable core loops exist, selected with `--algorithm` (`Algorithm` enum, `EgtGenerator::with_algorithm`): `counters` (default, decremental move counters + BFS queues, `solve_pair_counters` in `retrograde.rs`) and `sweep` (Syzygy-style `CHANGED` candidate flags + forward verification + full table sweeps per ply, `retrograde_sweep.rs`). Both must produce **byte-identical** files; any change to either must preserve this (compare sha256 against a reference set of tables). The unit tests run both.
+- The core loop of the retrograde analysis (`solve_pair` in `retrograde.rs`) uses decremental move counters driven by per-ply table scans (see the module doc and `scaling_and_parallelization.md` 4.2). Two earlier alternatives (counters + BFS queues, and Syzygy-style candidate flags + forward verification) were removed after producing byte-identical output (see `algorithms_comparison.md` 2.A and the git history). Changes to the core loop that are not meant to change the output must keep the generated files **byte-identical**: compare sha256 against the reference set of tables in `~/tablebases`.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
+- Update the documentation after a change if appropriate, but always leave AGENTS.md untouched.
 
 ## Performance notes (measured on all 4-piece endgames)
 
@@ -20,12 +21,11 @@
   and zstd compression in `save_to_file` (~5-24% depending on the endgame).
 - Zstd level 19 vs 9 on pawnless tables: 15% faster generation for 29% larger
   files. Level 19 is kept, since the tables are the artifact.
-- Counters vs sweep (single-threaded, see `algorithms_comparison.md` 2.A for
-  details): sweep is 13% slower on all 4-piece tables and 23% slower on a
-  5-piece sample (up to +53% on deep, thin-frontier tables like `KNN_KP`), but
-  peak memory is ~4x lower (2.0 vs 8.4 GiB on `KRP_KQ`), because the counters'
-  `usize` queues peak at several times the size of the tables on shallow
-  endgames. The choice will depend on parallel scaling and 6-piece memory.
+- Table scans vs the former BFS queues (single-threaded, 5-piece sample of
+  `algorithms_comparison.md` 2.A): +0.9% time overall, with peak memory reduced
+  to about the tables themselves (2.0 vs 8.4 GiB on `KRP_KQ`). The worst cases
+  are deep tables where each ply resolves few positions (`KNN_KP`, +10%), where
+  the full-table scans dominate (Step 2 of the roadmap).
 
 Current generation results (single-threaded generation, with --noverify):
 =============================================================================================
@@ -47,7 +47,7 @@ Size on disk: 3593.31MiB (1.16 bits/pos on average, lowest compression for KBB_K
 =============================================================================================
 
 ## TODO
-- Counters vs sweep follow-up, parallelization: see `scaling_and_parallelization.md`.
+- Parallelization: see the roadmap in `scaling_and_parallelization.md` (Step 1 is done).
 - Use `object_store` crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Visibility and public interface.

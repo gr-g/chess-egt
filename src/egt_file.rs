@@ -358,7 +358,7 @@ impl EgtFile {
 
     /// Returns the in-memory outcomes for the global indexes `[start, end)`,
     /// allocating or decompressing the frame if needed. The range must lie
-    /// within a single frame. This gives table sweeps direct slice access,
+    /// within a single frame. This gives table scans direct slice access,
     /// avoiding the per-element overhead of `read_from_index`.
     pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[MaybeDtcOutcome]> {
         if start > end || end > self.index_range {

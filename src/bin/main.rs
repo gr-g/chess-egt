@@ -1,5 +1,5 @@
 use clap::Parser;
-use chess_egt::{Algorithm, DtcOutcome, ConversionType, EgtGenerator, EgtProber, EgtError};
+use chess_egt::{DtcOutcome, ConversionType, EgtGenerator, EgtProber, EgtError};
 use shakmaty::{CastlingMode, Position};
 use shakmaty::fen::Fen;
 use std::path::PathBuf;
@@ -40,21 +40,7 @@ struct Cli {
     #[arg(long)]
     noverify: bool,
 
-    /// Core retrograde analysis loop: `counters` (decremental move counters
-    /// with BFS queues), `sweep` (candidate flags with forward verification
-    /// and full table sweeps) or `scan` (decremental move counters driven by
-    /// per-ply table scans).
-    #[arg(long, value_enum, default_value_t = AlgorithmArg::Counters)]
-    algorithm: AlgorithmArg,
-
     position: Option<String>,
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum AlgorithmArg {
-    Counters,
-    Sweep,
-    Scan,
 }
 
 fn main() {
@@ -135,11 +121,6 @@ fn configure_generator(g: &mut EgtGenerator, cli: &Cli) {
     }
     g.with_generate_deps(cli.generate_deps);
     g.with_verify(!cli.noverify);
-    g.with_algorithm(match cli.algorithm {
-        AlgorithmArg::Counters => Algorithm::Counters,
-        AlgorithmArg::Sweep => Algorithm::Sweep,
-        AlgorithmArg::Scan => Algorithm::Scan,
-    });
 }
 
 fn generate_all(n: usize, cli: &Cli) {

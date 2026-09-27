@@ -215,7 +215,7 @@ Why this gives exactly today's output:
   Values written in a phase are never scanned in the same phase.
 - **Wins.** Phase W's "mark if unknown" gives the same result in any order,
   provided a win's conversion type is resolved by preference (Checkmate >
-  Capture > Promotion), as `mark_win` in `retrograde_sweep.rs` already does. The
+  Capture > Promotion), as `mark_win` in the sweep implementation does. The
   serial counter loop reaches the same result by processing the Checkmate queue
   first.
 - **Losses.** The only order-dependent part of the counters is the conversion
@@ -421,10 +421,12 @@ the 5-piece sample).
   sample of `algorithms_comparison.md` Section 2.A.
 - Then: make `scan` the default and decide whether to keep `counters` (the
   queues) or retire it. Keep `sweep` as the reference.
-- **Status: implemented** (`retrograde_scan.rs`, `--algorithm scan`). Output is
+- **Status: done.** Implemented as `--algorithm scan`. Output is
   byte-identical (`.ggegt` and `.json`) on all 3/4-piece tables and the 5-piece
-  sample. The update sink is two methods on `RetrogradeSolver` (`mark_win`,
-  `decrement`), shared with the other loops. The loop is not generic over it
+  sample. It is now the only core loop (`solve_pair` in `retrograde.rs`): the
+  `counters` and `sweep` loops were removed to keep the code simple (they
+  remain in the git history). The update sink is two methods on
+  `RetrogradeSolver` (`mark_win`, `decrement`). The loop is not generic over it
   yet, because `quiet_unmoves` passes the whole solver to its callback; this
   split belongs to Steps 3-4. Results (init + propagation, single-threaded):
 
