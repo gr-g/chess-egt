@@ -478,8 +478,9 @@ the 5-piece sample).
 - Parallel initialization (embarrassingly parallel; the dependency cache must
   become shareable or be per thread).
 - **Acceptance:** byte-identical output. Measure scaling on a large 5-piece
-  table and the first 6-piece tables (e.g. 1, 2, 4, ..., N threads). Compare with
-  a parallel sweep only if the hybrid scales poorly.
+  table (e.g. 1, 2, 4 threads). Note that the local environment runs under
+  Xen virtualization and CPUs are virtual, so multithreaded measurements might
+  not be very reliable beyond 2 threads.
 
 ### Step 5: pawn-rank slicing
 
