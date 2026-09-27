@@ -4,6 +4,7 @@ use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
 use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtRole, EgtSide};
+use crate::retrograde_scan as scan;
 use crate::retrograde_sweep as sweep;
 use std::collections::{HashMap, BTreeMap};
 
@@ -250,6 +251,118 @@ impl RetrogradeSolver {
         let global_index = file.get_global_index(handle.egt_idx, local_index);
         file.write_to_index(global_index, outcome).unwrap();
     }
+
+    // The two updates below are the only writes that retrograde propagation
+    // makes to a position other than the one being visited (the "update sink"
+    // of `scaling_and_parallelization.md`, Section 4.3). Neither reads the
+    // state of any other position, so they can later become atomic updates or
+    // messages to the owner of `idx`.
+
+    /// Marks `idx` as a win at `plies` if unknown. If it already is a win found
+    /// at this same ply, keeps the preferred conversion type (Checkmate >
+    /// Capture > Promotion), so the result does not depend on the order of the
+    /// updates. Returns whether the position was newly resolved.
+    pub(crate) fn mark_win(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let v = self.read_outcome(table, idx);
+        if v.is_unknown() {
+            self.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
+            true
+        } else {
+            if v.is_win() && ply(v) == plies && ct > outcome_ct(v) {
+                self.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
+            }
+            false
+        }
+    }
+
+    /// Decrements the move counter of `idx` if unknown, because one of its
+    /// successors is a win (conversion type `ct`) at ply `plies - 1`. When the
+    /// counter reaches zero, the position becomes a loss at `plies`. Returns
+    /// whether the position was newly resolved.
+    pub(crate) fn decrement(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let v = self.read_outcome(table, idx);
+        if !v.is_unknown() {
+            return false;
+        }
+        let counter = v.get_unknown_counter();
+        debug_assert!(counter > 0);
+        if counter == 1 {
+            self.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, plies));
+            true
+        } else {
+            self.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter - 1));
+            false
+        }
+    }
+}
+
+/// Distance (ply) of a win or loss value.
+pub(crate) fn ply(v: MaybeDtcOutcome) -> u16 {
+    v.to_u16() >> 3
+}
+
+/// Conversion type of a win or loss value.
+pub(crate) fn outcome_ct(v: MaybeDtcOutcome) -> ConversionType {
+    match v.to_u16() & 0b110 {
+        0b010 => ConversionType::Checkmate,
+        0b100 => ConversionType::Capture,
+        _ => ConversionType::Promotion,
+    }
+}
+
+// Preference among conversion types for a loss (Promotion > Capture > Checkmate),
+// the reverse of the win preference given by `ConversionType`'s `Ord`.
+fn loss_rank(ct: ConversionType) -> u8 {
+    match ct {
+        ConversionType::Checkmate => 0,
+        ConversionType::Capture => 1,
+        ConversionType::Promotion => 2,
+    }
+}
+
+/// The preferred conversion type for a loss among `a` (if any) and `b`.
+pub(crate) fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionType {
+    match a {
+        Some(a) if loss_rank(a) >= loss_rank(b) => a,
+        _ => b,
+    }
+}
+
+/// Visits all indexes of `table` whose value satisfies `select`, frame by
+/// frame through `EgtFile::frame_chunk`. Matching indexes of a frame are
+/// collected first, so `process` may freely read and write the tables.
+pub(crate) fn scan_table<S, F>(
+    solver: &mut RetrogradeSolver,
+    table: EgtHandle,
+    buf: &mut Vec<(usize, MaybeDtcOutcome)>,
+    select: S,
+    mut process: F,
+) -> EgtResult<()>
+where
+    S: Fn(MaybeDtcOutcome) -> bool,
+    F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome) -> EgtResult<()>,
+{
+    let (offset, end, frame_size) = {
+        let file = &solver.files[table.file_idx];
+        let offset = file.get_global_index(table.egt_idx, 0);
+        (offset, offset + file.egts[table.egt_idx].index_range(), file.frame_size)
+    };
+    let mut start = offset;
+    while start < end {
+        let chunk_end = ((start / frame_size + 1) * frame_size).min(end);
+        buf.clear();
+        let chunk = solver.files[table.file_idx].frame_chunk(start, chunk_end)?;
+        for (i, &v) in chunk.iter().enumerate() {
+            if select(v) {
+                buf.push((start - offset + i, v));
+            }
+        }
+        for &(idx, v) in buf.iter() {
+            process(solver, idx, v)?;
+        }
+        start = chunk_end;
+    }
+    Ok(())
 }
 
 fn get_pawn_files(pieces: &[(EgtRole, EgtSide, usize)]) -> (FileVec, FileVec) {
@@ -344,7 +457,7 @@ pub fn quiet_unmoves<F>(
         });
 }
 
-fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
+pub(crate) fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
     let legals = position.legal_moves();
     let kings = position.board().by_role(Role::King);
 
@@ -575,20 +688,11 @@ fn propagate_win_to_loss(
     ct: ConversionType,
     twin_next_queues: &mut DepthQueues,
 ) -> bool {
-    let outcome = solver.read_outcome(table, idx);
-    if outcome.is_unknown() {
-        let counter = outcome.get_unknown_counter();
-        debug_assert!(counter > 0);
-        if counter == 1 {
-            solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, plies));
-            quiet_unmoves(solver, table, twin, idx, mirrored, |_solver, pred_idx| {
-                twin_next_queues.push_win(pred_idx, ct);
-            });
-            true
-        } else {
-            solver.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter - 1));
-            false
-        }
+    if solver.decrement(table, idx, ct, plies) {
+        quiet_unmoves(solver, table, twin, idx, mirrored, |_solver, pred_idx| {
+            twin_next_queues.push_win(pred_idx, ct);
+        });
+        true
     } else {
         false
     }
@@ -603,6 +707,9 @@ pub enum Algorithm {
     /// `CHANGED` candidate flags with forward loss verification and full
     /// table sweeps each ply, Syzygy-style (see `retrograde_sweep.rs`).
     Sweep,
+    /// Decremental move counters driven by per-ply table scans instead of
+    /// queues (see `retrograde_scan.rs`).
+    Scan,
 }
 
 /// Per-pair output of the core solving loop.
@@ -909,6 +1016,7 @@ pub fn retrograde_analysis(
         let pair = match algorithm {
             Algorithm::Counters => solve_pair_counters(&mut solver, table_a, table_b, &mut dep_cache)?,
             Algorithm::Sweep => sweep::solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?,
+            Algorithm::Scan => scan::solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?,
         };
         init_time += pair.init_time;
         propagation_time += pair.propagation_time;
@@ -1019,7 +1127,7 @@ mod tests {
         expected_losses_b: Option<usize>,
         expected_invalid_b: Option<usize>,
     ) {
-        for algorithm in [Algorithm::Counters, Algorithm::Sweep] {
+        for algorithm in [Algorithm::Counters, Algorithm::Sweep, Algorithm::Scan] {
         let test_dir = crate::TestDir::new(&format!("generation_{}_{:?}", endgame, algorithm));
         let (file_a, file_b) = retrograde_analysis(&test_dir.0, endgame, None, true, algorithm).unwrap();
 

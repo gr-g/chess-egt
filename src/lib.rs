@@ -3,6 +3,7 @@ pub mod piece_set;
 mod egt;
 mod egt_file;
 mod retrograde;
+mod retrograde_scan;
 mod retrograde_sweep;
 
 pub use error::{EgtError, EgtResult};
@@ -70,7 +71,8 @@ impl EgtGenerator {
         }
     }
 
-    /// Selects the core retrograde analysis loop. Defaults to `Algorithm::Counters`.
+    /// Selects the core retrograde analysis loop (`Counters`, `Sweep` or
+    /// `Scan`, which produce byte-identical files). Defaults to `Algorithm::Counters`.
     pub fn with_algorithm(&mut self, algorithm: Algorithm) {
         self.algorithm = algorithm;
     }
@@ -626,32 +628,43 @@ impl Drop for TestDir {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_verify_internal_consistency_k_k() {
-        let test_dir = TestDir::new("verify_internal_consistency_k_k");
-        let temp_dir = &test_dir.0;
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(temp_dir, "K_K", None, true, Algorithm::Counters).unwrap();
+    const ALGORITHMS: [Algorithm; 3] = [Algorithm::Counters, Algorithm::Sweep, Algorithm::Scan];
+
+    // Generates and saves `endgame` (and its twin) in `dir` with `algorithm`.
+    // Returns the sha256 of the generated files.
+    fn generate_and_save(dir: &std::path::Path, endgame: &str, algorithm: Algorithm) -> Vec<String> {
+        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(dir, endgame, None, true, algorithm).unwrap();
         file_a.save_to_file().unwrap();
+        let mut hashes = vec![compute_sha256(&file_a.path).unwrap()];
         if let Some(ref mut fb) = file_b {
             fb.save_to_file().unwrap();
+            hashes.push(compute_sha256(&fb.path).unwrap());
         }
+        hashes
+    }
 
-        let mut prober = EgtProber::new(temp_dir);
-        prober.verify_internal_consistency("K_K").unwrap();
+    fn verify_internal_consistency(endgame: &str) {
+        for algorithm in ALGORITHMS {
+            let test_dir = TestDir::new(&format!("verify_internal_consistency_{}_{:?}", endgame, algorithm));
+            generate_and_save(&test_dir.0, endgame, algorithm);
+
+            let mut prober = EgtProber::new(&test_dir.0);
+            prober.verify_internal_consistency(endgame).unwrap();
+            let (a, b) = endgame.split_once('_').unwrap();
+            if a != b {
+                prober.verify_internal_consistency(&format!("{}_{}", b, a)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_internal_consistency_k_k() {
+        verify_internal_consistency("K_K");
     }
 
     #[test]
     fn test_verify_internal_consistency_kr_k() {
-        let test_dir = TestDir::new("verify_internal_consistency_kr_k");
-        let temp_dir = &test_dir.0;
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(temp_dir, "KR_K", None, true, Algorithm::Counters).unwrap();
-        file_a.save_to_file().unwrap();
-        if let Some(ref mut fb) = file_b {
-            fb.save_to_file().unwrap();
-        }
-
-        let mut prober = EgtProber::new(temp_dir);
-        prober.verify_internal_consistency("KR_K").unwrap();
+        verify_internal_consistency("KR_K");
     }
 
     // Unlike the pawnless cases above, KP_K / K_KP are composed of several
@@ -659,18 +672,24 @@ mod tests {
     // sub-tables in `verify_internal_consistency()`.
     #[test]
     fn test_verify_internal_consistency_kp_k() {
-        let test_dir = TestDir::new("verify_internal_consistency_kp_k");
-        let temp_dir = &test_dir.0;
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(temp_dir, "KP_K", None, true, Algorithm::Counters).unwrap();
+        let test_dir = TestDir::new("verify_internal_consistency_kp_k_egts");
+        let (file_a, _) = crate::retrograde::retrograde_analysis(&test_dir.0, "KP_K", None, true, Algorithm::Counters).unwrap();
         assert!(file_a.egts.len() > 1, "expected KP_K to be composed of several Egts");
-        file_a.save_to_file().unwrap();
-        if let Some(ref mut fb) = file_b {
-            fb.save_to_file().unwrap();
-        }
+        verify_internal_consistency("KP_K");
+    }
 
-        let mut prober = EgtProber::new(temp_dir);
-        prober.verify_internal_consistency("KP_K").unwrap();
-        prober.verify_internal_consistency("K_KP").unwrap();
+    // All algorithms must produce byte-identical files.
+    #[test]
+    fn test_algorithms_byte_identical() {
+        for endgame in ["KQ_K", "KR_K", "KP_K"] {
+            let hashes: Vec<Vec<String>> = ALGORITHMS.iter().map(|&algorithm| {
+                let test_dir = TestDir::new(&format!("byte_identical_{}_{:?}", endgame, algorithm));
+                generate_and_save(&test_dir.0, endgame, algorithm)
+            }).collect();
+            for (algorithm, h) in ALGORITHMS.iter().zip(&hashes) {
+                assert_eq!(h, &hashes[0], "{} generated with {:?} differs from {:?}", endgame, algorithm, ALGORITHMS[0]);
+            }
+        }
     }
 
     #[test]

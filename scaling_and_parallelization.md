@@ -421,6 +421,28 @@ the 5-piece sample).
   sample of `algorithms_comparison.md` Section 2.A.
 - Then: make `scan` the default and decide whether to keep `counters` (the
   queues) or retire it. Keep `sweep` as the reference.
+- **Status: implemented** (`retrograde_scan.rs`, `--algorithm scan`). Output is
+  byte-identical (`.ggegt` and `.json`) on all 3/4-piece tables and the 5-piece
+  sample. The update sink is two methods on `RetrogradeSolver` (`mark_win`,
+  `decrement`), shared with the other loops. The loop is not generic over it
+  yet, because `quiet_unmoves` passes the whole solver to its callback; this
+  split belongs to Steps 3-4. Results (init + propagation, single-threaded):
+
+  | Set / Endgame | Counters | Scan | Δ time | Peak RSS counters | Peak RSS scan |
+  | :--- | ---: | ---: | ---: | ---: | ---: |
+  | All 30 4-piece | 312 s | 306 s | -2% | 191 MiB | 152 MiB |
+  | `KBB_KN` | 169 s | 174 s | +3% | 822 MiB | 291 MiB |
+  | `KQB_KQ` | 382 s | 417 s | +9% | 7495 MiB | 497 MiB |
+  | `KRB_KR` | 241 s | 238 s | -1% | 3509 MiB | 497 MiB |
+  | `KNN_KP` | 360 s | 395 s | +10% | 1629 MiB | 1091 MiB |
+  | `KRP_KQ` | 2181 s | 2134 s | -2% | 8427 MiB | 2059 MiB |
+  | `KQP_KQ` | 1477 s | 1495 s | +1% | 7506 MiB | 2058 MiB |
+  | **5-piece sample total** | **4811 s** | **4854 s** | **+0.9%** | **8427 MiB** | **2059 MiB** |
+
+  The loop skips the scans of a table that resolved nothing at the previous
+  ply, but does not skip empty conversion-type sub-phases. The remaining gap on
+  `KNN_KP` and `KQB_KQ` comes from full-table scans on plies that resolve few
+  positions, which is what Step 2 addresses.
 
 ### Step 2: per-block ply summary
 

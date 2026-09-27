@@ -27,7 +27,8 @@ use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, mirror_horizontally};
 use crate::error::{EgtError, EgtResult};
 use crate::retrograde::{
-    DependencyCache, EgtHandle, PairResult, RetrogradeSolver, is_mirrored, quiet_unmoves, table_name,
+    DependencyCache, EgtHandle, PairResult, RetrogradeSolver, better_loss_ct, is_mirrored, outcome_ct, ply,
+    quiet_unmoves, scan_table as sweep, table_name,
 };
 
 // Layout of the 13 upper bits of an 'unknown' value (the low 3 bits are 0b000).
@@ -62,35 +63,6 @@ fn decode_ct(bits: u16) -> Option<ConversionType> {
     }
 }
 
-fn ply(v: MaybeDtcOutcome) -> u16 {
-    v.to_u16() >> 3
-}
-
-// Conversion type of a win or loss value.
-fn outcome_ct(v: MaybeDtcOutcome) -> ConversionType {
-    match v.to_u16() & 0b110 {
-        0b010 => ConversionType::Checkmate,
-        0b100 => ConversionType::Capture,
-        _ => ConversionType::Promotion,
-    }
-}
-
-// Preference among conversion types for a loss (Promotion > Capture > Checkmate),
-// the reverse of the win preference given by `ConversionType`'s `Ord`.
-fn loss_rank(ct: ConversionType) -> u8 {
-    match ct {
-        ConversionType::Checkmate => 0,
-        ConversionType::Capture => 1,
-        ConversionType::Promotion => 2,
-    }
-}
-
-fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionType {
-    match a {
-        Some(a) if loss_rank(a) >= loss_rank(b) => a,
-        _ => b,
-    }
-}
 
 #[derive(Default)]
 struct SweepCounters {
@@ -100,58 +72,6 @@ struct SweepCounters {
     moves_checked: usize,
 }
 
-/// Visits all indexes of `table` whose value satisfies `select`, frame by
-/// frame through `EgtFile::frame_chunk`. Matching indexes of a frame are
-/// collected first, so `process` may freely read and write the tables.
-fn sweep<S, F>(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    buf: &mut Vec<(usize, MaybeDtcOutcome)>,
-    select: S,
-    mut process: F,
-) -> EgtResult<()>
-where
-    S: Fn(MaybeDtcOutcome) -> bool,
-    F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome) -> EgtResult<()>,
-{
-    let (offset, end, frame_size) = {
-        let file = &solver.files[table.file_idx];
-        let offset = file.get_global_index(table.egt_idx, 0);
-        (offset, offset + file.egts[table.egt_idx].index_range(), file.frame_size)
-    };
-    let mut start = offset;
-    while start < end {
-        let chunk_end = ((start / frame_size + 1) * frame_size).min(end);
-        buf.clear();
-        let chunk = solver.files[table.file_idx].frame_chunk(start, chunk_end)?;
-        for (i, &v) in chunk.iter().enumerate() {
-            if select(v) {
-                buf.push((start - offset + i, v));
-            }
-        }
-        for &(idx, v) in buf.iter() {
-            process(solver, idx, v)?;
-        }
-        start = chunk_end;
-    }
-    Ok(())
-}
-
-// Marks `idx` as a win at `plies` if unknown. If it already is a win found at
-// this same ply, keeps the preferred conversion type. Returns whether the
-// position was newly resolved.
-fn mark_win(solver: &mut RetrogradeSolver, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
-    let v = solver.read_outcome(table, idx);
-    if v.is_unknown() {
-        solver.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
-        true
-    } else {
-        if v.is_win() && ply(v) == plies && ct > outcome_ct(v) {
-            solver.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
-        }
-        false
-    }
-}
 
 fn initialize_table(
     solver: &mut RetrogradeSolver,
@@ -328,14 +248,14 @@ fn propagate(
             } else if v.is_loss() {
                 let ct = outcome_ct(v);
                 quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
-                    if mark_win(solver, twin, pred_idx, ct, plies + 1) {
+                    if solver.mark_win(twin, pred_idx, ct, plies + 1) {
                         wins_twin += 1;
                     }
                 });
             } else {
                 let ct = decode_ct(v.to_u16() >> WIN_CONV_SHIFT)
                     .ok_or(EgtError::Internal("missing conversion type for win by conversion"))?;
-                if mark_win(solver, table, idx, ct, 1) {
+                if solver.mark_win(table, idx, ct, 1) {
                     wins_table += 1;
                 }
             }

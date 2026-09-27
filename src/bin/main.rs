@@ -41,8 +41,9 @@ struct Cli {
     noverify: bool,
 
     /// Core retrograde analysis loop: `counters` (decremental move counters
-    /// with BFS queues) or `sweep` (candidate flags with forward verification
-    /// and full table sweeps).
+    /// with BFS queues), `sweep` (candidate flags with forward verification
+    /// and full table sweeps) or `scan` (decremental move counters driven by
+    /// per-ply table scans).
     #[arg(long, value_enum, default_value_t = AlgorithmArg::Counters)]
     algorithm: AlgorithmArg,
 
@@ -53,6 +54,7 @@ struct Cli {
 enum AlgorithmArg {
     Counters,
     Sweep,
+    Scan,
 }
 
 fn main() {
@@ -136,6 +138,7 @@ fn configure_generator(g: &mut EgtGenerator, cli: &Cli) {
     g.with_algorithm(match cli.algorithm {
         AlgorithmArg::Counters => Algorithm::Counters,
         AlgorithmArg::Sweep => Algorithm::Sweep,
+        AlgorithmArg::Scan => Algorithm::Scan,
     });
 }
 
