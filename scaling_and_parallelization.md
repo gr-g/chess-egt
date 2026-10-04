@@ -9,10 +9,11 @@ It builds on [`algorithms_comparison.md`](algorithms_comparison.md), in
 particular the single-threaded measurements of the counters and sweep core
 loops in its Section 2.A.
 
-**Status:** conceptual. No experiments were run for this document. Sizes are
-computed from the current indexing scheme. Compute estimates are extrapolated
-from the measured 4- and 5-piece generation times in `AGENTS.md` and should be
-treated as orders of magnitude.
+**Status:** Steps 1-3 are implemented; later steps remain a roadmap. Historical
+Step 1/2 validation and measurements are recorded below. Step 3 reference
+validation and performance measurements remain open. Sizes are computed from
+the current indexing scheme. Compute estimates are extrapolated from the
+measured 4- and 5-piece generation times in `AGENTS.md` and should be treated as orders of magnitude.
 
 ---
 
@@ -27,8 +28,7 @@ treated as orders of magnitude.
   Pawnless tables and one-pawn tables without rank slicing need ~1.2-1.4 TB
   per pair. Pawnful tables split into small independent slices. 8-piece
   tables need distributed memory everywhere.
-- **Neither current core loop is the right long-term engine.** The proposed
-  direction is a hybrid: **decremental counters driven by per-ply table scans**
+- **The implemented core loop is a hybrid:** **decremental counters driven by per-ply table scans**
   (no queues). It has the counters' low work per retrograde edge and the
   sweep's zero extra memory. Its updates are pushed to the position being
   updated and never require reading remote data. It therefore runs unchanged on
@@ -347,25 +347,24 @@ else it adds complexity without reducing cost.
 
 ## 6. Other design choices to revisit
 
-### 6.1 Separate the working table from `EgtFile`
+### 6.1 Separate the working table from `EgtFile` (implemented in Step 3)
 
 `EgtFile`'s frame model (Unallocated / Compressed / Uncompressed, with LRU
 eviction planned) suits **dependency tables and probing**, whose accesses are
-sparse and repeated. It does not suit **the tables being solved**:
+sparse and repeated. Retrograde unmoves instead hit the whole working set at
+scattered locations, making frame-cache lookup and eviction inappropriate for
+**the tables being solved**.
 
-- retrograde unmoves hit the whole working set at scattered locations, so an
-  LRU cache over compressed frames would constantly evict and reload frames;
-- every `read_outcome` / `write_outcome` currently goes through frame lookup
-  and state checks;
-- `retrograde_analysis` keeps all pairs of both files in memory until
-  `save_to_file` at the very end, so peak memory is the whole endgame rather
-  than one pair.
+The solver now uses flat `Vec<MaybeDtcOutcome>` arrays for the active pair,
+separate from `EgtFile`. Finalized tables are compressed into one spool per
+output file, so solved pairs do not accumulate as uncompressed file frames.
+Working memory is one pair plus the dependency cache, index metadata, local
+summaries, statistics, and compression/I/O buffers. Recursive dependency
+generation is an exception: a parent pair can remain allocated while a
+dependency is solved.
 
-Proposal:
-- a flat working array per pair (`Vec<AtomicU16>`, or memory-mapped for
-  out-of-core runs), divided into chunks;
-- write each pair (or slice) out when it is solved;
-- `EgtFile` becomes the storage and probing layer only.
+Atomic working values for shared-memory parallelism and memory-mapped arrays
+for out-of-core runs remain future options.
 
 ### 6.2 A generation-specific index layout (larger lever, needs measurement)
 
@@ -403,9 +402,12 @@ enough. Worth revisiting together with the object-storage work.
 
 ## 7. Implementation roadmap
 
-Each step is independently useful and keeps the existing guarantee: output
-**byte-identical** to the reference tables (sha256 on all 3/4-piece tables and
-the 5-piece sample).
+Each step is independently useful. Changes that preserve the storage layout
+retain the **byte-identical** output guarantee (sha256 comparisons against the
+appropriate reference baseline). Step 3 changes the frame layout and instead
+requires per-index outcome/DTC equality and logical statistics equality,
+excluding `bytes`, `sha256`, and `num_frames`. Historical Step 1/2 results below
+remain unchanged; they do not establish Step 3 validation.
 
 ### Step 1: scan-driven counter loop (single-threaded)
 
@@ -464,12 +466,42 @@ the 5-piece sample).
 
 ### Step 3: flat working table, per-pair output
 
-- A dedicated working structure for the pair being solved, separate from
-  `EgtFile` (Section 6.1). Write each pair out when it is solved, so peak memory
-  is one pair.
-- Requires writing a file pair by pair, or assembling it from per-pair frames
-  (this relates to the TODO on reusing compressed frames with a raw zstd
-  encoder).
+- **Status: implemented and reference-validated on all 3/4-piece endgames,
+  `KNN_KP`, and `KBB_KN`.**
+  The active pair uses flat `Vec<MaybeDtcOutcome>` arrays separate from
+  `EgtFile`. `quiet_unmoves` takes immutable source/twin `Egt` metadata and
+  calls back with predecessor local indices, rather than passing the solver.
+- `PlySummary` retains the Step 2 conservative scan logic, but its 4096-position
+  blocks are now aligned on each table's local indices, independent of storage
+  frames. The global alignment described in Step 2 is historical.
+- Each finalized table is compressed into **one spool per output file** and its
+  working array is released after staging the pair. Frames are table-aligned,
+  contain at most `256 * 1024` positions, and end in short, unpadded tails.
+  The transposition is unchanged: exactly `2 * N` bytes for a frame of `N`
+  positions, including the unused zero tail after packed high bytes.
+- Final assembly copies compressed segments in stable table order, without
+  recompression, and writes **one final seek table**. The encoder is flushed
+  before `into_seek_table`, which does not flush its output buffer. No
+  `RawEncoder` is needed.
+- The reader constructs the table-aligned frame layout from the `Egt` lengths
+  and validates frame counts and decompressed lengths against the seek table.
+- `retrograde_analysis` finishes and publishes the output files before
+  returning. Each rename is atomic, but the two-file publication is
+  **nontransactional**: a failure between renames can update only one file.
+- Working memory is one pair plus dependency cache, index metadata, summaries,
+  statistics, and compression/I/O buffers. Recursive dependency generation can
+  retain a parent pair while solving a dependency (Section 6.1).
+- **Acceptance:** per-index outcome/DTC equality and logical statistics
+  equality, excluding `bytes`, `sha256`, and `num_frames`. Exact outcome values (including conversion type
+  and DTC) and semantic statistics matched the reference tables in
+  `~/tablebases` for every logical index in both orientations of the validated
+  endgames.
+- **Validation:** `cargo test --release` covers full/short frames, disk-backed
+  resaving, reverse-order staging, invalid layouts, missing/duplicate
+  submissions, and temporary-file cleanup. The reference comparisons above
+  were performed during Step 3 implementation. The remaining four endgames
+  in the 5-piece sample and generation-only elapsed-time, peak-RSS, and
+  output-size comparisons have not been measured.
 
 ### Step 4: multi-threading (`rayon`)
 

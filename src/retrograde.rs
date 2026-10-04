@@ -19,7 +19,7 @@
 //!   `p` (or counters), so it never sees its own writes.
 //! - A win keeps the preferred conversion type among the losses at `p - 1`
 //!   reaching it (Checkmate > Capture > Promotion, see
-//!   `RetrogradeSolver::mark_win`).
+//!   `WorkingPair::mark_win`).
 //! - A loss gets the conversion type of the last sub-phase that decrements its
 //!   counter, i.e. the preference Promotion > Capture > Checkmate among the
 //!   wins at `p - 1` reaching it.
@@ -34,6 +34,7 @@ use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
 use crate::error::{EgtError, EgtResult};
+use crate::egt::Egt;
 use crate::piece_set::{EgtRole, EgtSide};
 use std::collections::{HashMap, BTreeMap};
 
@@ -80,12 +81,11 @@ impl EgtFileStatsBuilder {
         &mut self,
         outcome: MaybeDtcOutcome,
         local_idx: usize,
-        egt_idx: usize,
-        file: &mut EgtFile,
+        egt: &Egt,
         current_max_win_dtc: u16,
         current_max_loss_dtc: u16,
     ) {
-        let sym = file.egts[egt_idx].diagonal_symmetric(local_idx);
+        let sym = egt.diagonal_symmetric(local_idx);
         if let Some(other_idx) = sym && local_idx > other_idx {
             self.invalid_or_redundant += 1;
             return;
@@ -97,8 +97,7 @@ impl EgtFileStatsBuilder {
             let ply = outcome.to_u16() >> 3;
             *self.histogram_win.entry(ply).or_insert(0) += 1;
             if ply == current_max_win_dtc && current_max_win_dtc > 0 {
-                let global_idx = file.get_global_index(egt_idx, local_idx);
-                if let Some(pos) = file.index_to_position(global_idx, shakmaty::Color::White) {
+                if let Some(pos) = egt.position_from_index(local_idx, Color::White) {
                     let epd = shakmaty::fen::Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
                     self.longest_dtc_win_candidates.push(LongestDtcPosition {
                         epd,
@@ -112,8 +111,7 @@ impl EgtFileStatsBuilder {
             let ply = outcome.to_u16() >> 3;
             *self.histogram_loss.entry(ply).or_insert(0) += 1;
             if ply == current_max_loss_dtc {
-                let global_idx = file.get_global_index(egt_idx, local_idx);
-                if let Some(pos) = file.index_to_position(global_idx, shakmaty::Color::White) {
+                if let Some(pos) = egt.position_from_index(local_idx, Color::White) {
                     let epd = shakmaty::fen::Epd::from_position(&pos, shakmaty::EnPassantMode::Legal).to_string();
                     self.longest_dtc_loss_candidates.push(LongestDtcPosition {
                         epd,
@@ -184,18 +182,15 @@ impl RetrogradeSolver {
         }
     }
 
-    pub fn read_outcome(&mut self, handle: EgtHandle, local_index: usize) -> MaybeDtcOutcome {
-        let file = &mut self.files[handle.file_idx];
-        let global_index = file.get_global_index(handle.egt_idx, local_index);
-        file.read_from_index(global_index).unwrap()
-    }
 
-    pub fn write_outcome(&mut self, handle: EgtHandle, local_index: usize, outcome: MaybeDtcOutcome) {
-        let file = &mut self.files[handle.file_idx];
-        let global_index = file.get_global_index(handle.egt_idx, local_index);
-        file.write_to_index(global_index, outcome).unwrap();
-    }
+}
 
+/// Mutable values for only the current pair; a self-pair has one shared array.
+struct WorkingPair {
+    values: Vec<Vec<MaybeDtcOutcome>>,
+}
+
+impl WorkingPair {
     // The two updates below are the only writes that retrograde propagation
     // makes to a position other than the one being visited (the "update sink"
     // of `scaling_and_parallelization.md`, Section 4.3). Neither reads the
@@ -206,14 +201,14 @@ impl RetrogradeSolver {
     /// at this same ply, keeps the preferred conversion type (Checkmate >
     /// Capture > Promotion), so the result does not depend on the order of the
     /// updates. Returns whether the position was newly resolved.
-    fn mark_win(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
-        let v = self.read_outcome(table, idx);
+    fn mark_win(&mut self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let v = self.values[slot][idx];
         if v.is_unknown() {
-            self.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
+            self.values[slot][idx] = MaybeDtcOutcome::new_win(ct, plies);
             true
         } else {
             if v.is_win() && ply(v) == plies && ct > outcome_ct(v) {
-                self.write_outcome(table, idx, MaybeDtcOutcome::new_win(ct, plies));
+                self.values[slot][idx] = MaybeDtcOutcome::new_win(ct, plies);
             }
             false
         }
@@ -223,18 +218,18 @@ impl RetrogradeSolver {
     /// successors is a win (conversion type `ct`) at ply `plies - 1`. When the
     /// counter reaches zero, the position becomes a loss at `plies`. Returns
     /// whether the position was newly resolved.
-    fn decrement(&mut self, table: EgtHandle, idx: usize, ct: ConversionType, plies: u16) -> bool {
-        let v = self.read_outcome(table, idx);
+    fn decrement(&mut self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let v = self.values[slot][idx];
         if !v.is_unknown() {
             return false;
         }
         let counter = v.get_unknown_counter();
         debug_assert!(counter > 0);
         if counter == 1 {
-            self.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ct, plies));
+            self.values[slot][idx] = MaybeDtcOutcome::new_loss(ct, plies);
             true
         } else {
-            self.write_outcome(table, idx, MaybeDtcOutcome::new_unknown(counter - 1));
+            self.values[slot][idx] = MaybeDtcOutcome::new_unknown(counter - 1);
             false
         }
     }
@@ -272,53 +267,32 @@ fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionTyp
     }
 }
 
-/// Number of positions per block of a `PlySummary`. Blocks are aligned on
-/// global file indexes, and the size divides the frame size, so a block never
-/// crosses a frame.
+/// Number of positions per pair-local summary block.
 const SUMMARY_BLOCK_SIZE: usize = 4096;
 
-/// Per block of a table: an upper bound on the plies of the win and loss
-/// values it contains, so that scans for the values of a given ply can skip
-/// the blocks that cannot contain any (`scaling_and_parallelization.md`,
-/// Step 2). Blocks at the ends of the table may overlap neighbouring `Egt`s.
+/// Per local block, an upper bound on the plies of its resolved values.
 struct PlySummary {
-    /// Global index of the first position of the table.
-    offset: usize,
-    /// Global index one past the last position of the table.
-    end: usize,
-    /// Global block number of the first block of the table.
-    first_block: usize,
+    size: usize,
     last_ply: Vec<u16>,
 }
 
 impl PlySummary {
-    /// Every block starts at ply 1, the highest ply given by initialization,
-    /// so only the values resolved by propagation (ply >= 2) need recording.
-    fn new(solver: &RetrogradeSolver, table: EgtHandle) -> Self {
-        let file = &solver.files[table.file_idx];
-        debug_assert_eq!(file.frame_size % SUMMARY_BLOCK_SIZE, 0);
-        let offset = file.get_global_index(table.egt_idx, 0);
-        let end = offset + file.egts[table.egt_idx].index_range();
-        let first_block = offset / SUMMARY_BLOCK_SIZE;
-        let num_blocks = end.div_ceil(SUMMARY_BLOCK_SIZE) - first_block;
-        Self { offset, end, first_block, last_ply: vec![1; num_blocks] }
+    /// Initialization resolves values only at plies 0 and 1.
+    fn new(size: usize) -> Self {
+        Self { size, last_ply: vec![1; size.div_ceil(SUMMARY_BLOCK_SIZE)] }
     }
 
-    /// Records that the position at `local_index` was resolved at `plies`.
     fn record(&mut self, local_index: usize, plies: u16) {
-        let block = (self.offset + local_index) / SUMMARY_BLOCK_SIZE - self.first_block;
-        let last = &mut self.last_ply[block];
+        let last = &mut self.last_ply[local_index / SUMMARY_BLOCK_SIZE];
         *last = (*last).max(plies);
     }
 
-    /// The global index ranges of the blocks that may contain values at
-    /// `plies`, clamped to the table.
     fn blocks_with(&self, plies: u16) -> Vec<(usize, usize)> {
         self.last_ply.iter().enumerate()
             .filter(|&(_, &last)| last >= plies)
             .map(|(b, _)| {
-                let start = (self.first_block + b) * SUMMARY_BLOCK_SIZE;
-                (start.max(self.offset), (start + SUMMARY_BLOCK_SIZE).min(self.end))
+                let start = b * SUMMARY_BLOCK_SIZE;
+                (start, (start + SUMMARY_BLOCK_SIZE).min(self.size))
             })
             .collect()
     }
@@ -328,36 +302,30 @@ impl PlySummary {
     }
 }
 
-/// Visits all indexes of `table` within `blocks` (global index ranges, each
-/// within a single frame, see `PlySummary::blocks_with`) whose value satisfies
-/// `select`. Matching indexes of a block are collected first, so `process` may
-/// freely read and write the tables.
+/// Collect each block's matches before updates, including for a self-pair.
 fn scan_table<S, F>(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
+    working: &mut WorkingPair,
+    slot: usize,
     blocks: &[(usize, usize)],
     select: S,
     mut process: F,
-) -> EgtResult<()>
+)
 where
     S: Fn(MaybeDtcOutcome) -> bool,
-    F: FnMut(&mut RetrogradeSolver, usize, MaybeDtcOutcome),
+    F: FnMut(&mut WorkingPair, usize, MaybeDtcOutcome),
 {
-    let offset = solver.files[table.file_idx].get_global_index(table.egt_idx, 0);
     let mut matches = Vec::new();
     for &(start, end) in blocks {
         matches.clear();
-        let chunk = solver.files[table.file_idx].frame_chunk(start, end)?;
-        for (i, &v) in chunk.iter().enumerate() {
+        for (i, &v) in working.values[slot][start..end].iter().enumerate() {
             if select(v) {
-                matches.push((start - offset + i, v));
+                matches.push((start + i, v));
             }
         }
         for &(idx, v) in &matches {
-            process(solver, idx, v);
+            process(working, idx, v);
         }
     }
-    Ok(())
 }
 
 fn get_pawn_files(pieces: &[(EgtRole, EgtSide, usize)]) -> (FileVec, FileVec) {
@@ -393,33 +361,32 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
 // Whether predecessors generated from `table` have to be mirrored horizontally
 // before being indexed in `twin`. This depends only on the pawn files of the two
 // sub-tables, so it is computed once per table pair rather than per unmove.
-fn is_mirrored(solver: &RetrogradeSolver, table: EgtHandle, twin: EgtHandle) -> bool {
-    let (stm_files_a, sntm_files_a) = get_pawn_files(solver.files[table.file_idx].egts[table.egt_idx].pieces());
-    let (stm_files_b, sntm_files_b) = get_pawn_files(solver.files[twin.file_idx].egts[twin.egt_idx].pieces());
+fn is_mirrored(table: &Egt, twin: &Egt) -> bool {
+    let (stm_files_a, sntm_files_a) = get_pawn_files(table.pieces());
+    let (stm_files_b, sntm_files_b) = get_pawn_files(twin.pieces());
     stm_files_b != sntm_files_a || sntm_files_b != stm_files_a
 }
 
 pub fn quiet_unmoves<F>(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
-    twin: EgtHandle,
+    table: &Egt,
+    twin: &Egt,
     local_index: usize,
     mirrored: bool,
     mut f: F,
 ) where
-    F: FnMut(&mut RetrogradeSolver, usize),
+    F: FnMut(usize),
 {
-    let position = solver.files[table.file_idx].egts[table.egt_idx].position_from_index(local_index, Color::White);
+    let position = table.position_from_index(local_index, Color::White);
     let position = match position {
         Some(s) => s,
         _ => return,
     };
 
-    debug_assert_eq!(mirrored, is_mirrored(solver, table, twin));
+    debug_assert_eq!(mirrored, is_mirrored(table, twin));
 
     // The diagonal symmetry adjustment below only applies to pawnless tables,
     // and never to a source position that is already on the diagonal (`#p=4`).
-    let use_diagonal_symmetry = solver.files[twin.file_idx].egts[twin.egt_idx].is_pawnless()
+    let use_diagonal_symmetry = twin.is_pawnless()
         && !both_kings_on_diagonal(&position);
 
     RetrogradeAnalysis::new(&position)
@@ -430,8 +397,8 @@ pub fn quiet_unmoves<F>(
                     .expect("mirrored predecessor position must be legal");
             }
 
-            let pred_idx = solver.files[twin.file_idx].egts[twin.egt_idx].position_to_index(&pred_position);
-            f(solver, pred_idx);
+            let pred_idx = twin.position_to_index(&pred_position);
+            f(pred_idx);
 
             // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
             // positions and `#p=4` if it represents 4 equivalent positions (with our choice
@@ -442,11 +409,11 @@ pub fn quiet_unmoves<F>(
             // (since the symmetric move contributed to the counter for the reflection of `p`
             // but led to a non-canonical position).
             if use_diagonal_symmetry {
-                let maybe_reflected_idx = solver.files[twin.file_idx].egts[twin.egt_idx].diagonal_symmetric(pred_idx);
+                let maybe_reflected_idx = twin.diagonal_symmetric(pred_idx);
                 if let Some(reflected_idx) = maybe_reflected_idx {
                     // The current index represents 8 positions, while the predecessor index
                     // represents 4 positions. Push the diagonal reflection of the predecessor.
-                    f(solver, reflected_idx);
+                    f(reflected_idx);
                 }
             }
         });
@@ -586,35 +553,33 @@ struct InitCounts {
 /// (loss at ply 0), stalemate, win or loss at ply 1 by conversion, or unknown
 /// with its move counter.
 fn initialize_table(
-    solver: &mut RetrogradeSolver,
-    table: EgtHandle,
+    egt: &Egt,
+    values: &mut [MaybeDtcOutcome],
     dep_cache: &mut DependencyCache,
 ) -> EgtResult<InitCounts> {
-    let (size, pawnless) = {
-        let egt = &solver.files[table.file_idx].egts[table.egt_idx];
-        (egt.index_range(), egt.is_pawnless())
-    };
+    let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
+    debug_assert_eq!(values.len(), size);
     let mut counts = InitCounts { checkmates: 0, stalemates: 0, found: Found::default() };
 
     for idx in 0..size {
-        let position_opt = solver.files[table.file_idx].egts[table.egt_idx].position_from_index(idx, Color::White);
+        let position_opt = egt.position_from_index(idx, Color::White);
 
         if (idx+1) % 10000000 == 0 {
             println!("Scanned {}/{} indexes...", idx+1, size);
         }
 
         let Some(position) = position_opt else {
-            solver.write_outcome(table, idx, MaybeDtcOutcome::INVALID);
+            values[idx] = MaybeDtcOutcome::INVALID;
             continue;
         };
         let legals = position.legal_moves();
 
         if legals.is_empty() {
             if position.is_check() {
-                solver.write_outcome(table, idx, MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0));
+                values[idx] = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0);
                 counts.checkmates += 1;
             } else {
-                solver.write_outcome(table, idx, MaybeDtcOutcome::DRAW);
+                values[idx] = MaybeDtcOutcome::DRAW;
                 counts.stalemates += 1;
             }
             continue;
@@ -659,7 +624,7 @@ fn initialize_table(
         } else {
             MaybeDtcOutcome::new_unknown(counter)
         };
-        solver.write_outcome(table, idx, outcome);
+        values[idx] = outcome;
     }
 
     Ok(counts)
@@ -667,6 +632,7 @@ fn initialize_table(
 
 /// Per-pair output of `solve_pair`.
 struct PairResult {
+    working: WorkingPair,
     max_win_dtc_a: u16,
     max_loss_dtc_a: u16,
     max_win_dtc_b: u16,
@@ -678,29 +644,36 @@ struct PairResult {
 /// Solves the pair of sub-tables `table_a` and `table_b` (the same sub-table
 /// with the other side to move), leaving the draws as unknown.
 fn solve_pair(
-    solver: &mut RetrogradeSolver,
+    solver: &RetrogradeSolver,
     table_a: EgtHandle,
     table_b: EgtHandle,
     dep_cache: &mut DependencyCache,
 ) -> EgtResult<PairResult> {
     let init_start = std::time::Instant::now();
+    let egt = |table: EgtHandle| &solver.files[table.file_idx].egts[table.egt_idx];
 
     // (table, twin, mirrored, slot of the table, slot of the twin), where the
     // slot indexes the per-table counts (0 for A, 1 for B).
     let tables: Vec<(EgtHandle, EgtHandle, bool, usize, usize)> = if table_a == table_b {
-        vec![(table_a, table_a, is_mirrored(solver, table_a, table_a), 0, 0)]
+        vec![(table_a, table_a, is_mirrored(egt(table_a), egt(table_a)), 0, 0)]
     } else {
         vec![
-            (table_a, table_b, is_mirrored(solver, table_a, table_b), 0, 1),
-            (table_b, table_a, is_mirrored(solver, table_b, table_a), 1, 0),
+            (table_a, table_b, is_mirrored(egt(table_a), egt(table_b)), 0, 1),
+            (table_b, table_a, is_mirrored(egt(table_b), egt(table_a)), 1, 0),
         ]
+    };
+
+    let mut working = WorkingPair {
+        values: tables.iter().map(|&(table, ..)| {
+            vec![MaybeDtcOutcome::INVALID; egt(table).index_range()]
+        }).collect(),
     };
 
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
     let mut previous = [Found::default(); 2];
     let mut found_by_conversion = [Found::default(); 2];
     for &(table, _, _, slot, _) in &tables {
-        let counts = initialize_table(solver, table, dep_cache)?;
+        let counts = initialize_table(egt(table), &mut working.values[slot], dep_cache)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
         previous[slot].losses = counts.checkmates;
         found_by_conversion[slot] = counts.found;
@@ -713,7 +686,7 @@ fn solve_pair(
     let mut max_loss = [0u16; 2];
 
     // Indexed by slot. A symmetric pair has a single table and summary.
-    let mut summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(solver, table)).collect();
+    let mut summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
     // Blocks visited by the scans, and blocks the same scans would visit
     // without the summaries.
     let mut blocks_scanned = 0usize;
@@ -735,15 +708,15 @@ fn solve_pair(
             let blocks = summaries[slot].blocks_with(plies - 1);
             blocks_scanned += blocks.len();
             blocks_total += summaries[slot].num_blocks();
-            scan_table(solver, table, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |solver, idx, v| {
+            scan_table(&mut working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v| {
                 let ct = outcome_ct(v);
-                quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
-                    if solver.mark_win(twin, pred_idx, ct, plies) {
+                quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
+                    if working.mark_win(twin_slot, pred_idx, ct, plies) {
                         found[twin_slot].wins += 1;
                         summaries[twin_slot].record(pred_idx, plies);
                     }
                 });
-            })?;
+            });
         }
 
         // Phase L: wins at `plies - 1` decrement the counters of their
@@ -757,14 +730,14 @@ fn solve_pair(
                 let blocks = summaries[slot].blocks_with(plies - 1);
                 blocks_scanned += blocks.len();
                 blocks_total += summaries[slot].num_blocks();
-                scan_table(solver, table, &blocks, |v| v == target, |solver, idx, _| {
-                    quiet_unmoves(solver, table, twin, idx, mirrored, |solver, pred_idx| {
-                        if solver.decrement(twin, pred_idx, ct, plies) {
+                scan_table(&mut working, slot, &blocks, |v| v == target, |working, idx, _| {
+                    quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
+                        if working.decrement(twin_slot, pred_idx, ct, plies) {
                             found[twin_slot].losses += 1;
                             summaries[twin_slot].record(pred_idx, plies);
                         }
                     });
-                })?;
+                });
             }
         }
 
@@ -797,6 +770,7 @@ fn solve_pair(
     }
 
     Ok(PairResult {
+        working,
         max_win_dtc_a: max_win[0],
         max_loss_dtc_a: max_loss[0],
         max_win_dtc_b: max_win[1],
@@ -830,7 +804,10 @@ pub fn retrograde_analysis(
         Some(EgtFile::new(base_path, &twin_endgame)?)
     };
 
-    let mut solver = RetrogradeSolver::new(file_a, file_b);
+    let solver = RetrogradeSolver::new(file_a, file_b);
+    let mut writers = solver.files.iter()
+        .map(crate::egt_writer::EgtFileWriter::new)
+        .collect::<EgtResult<Vec<_>>>()?;
 
     // Match Egt sub-tables into pairs
     let mut table_pairs = Vec::new();
@@ -895,7 +872,7 @@ pub fn retrograde_analysis(
     let mut finalize_time = std::time::Duration::ZERO;
 
     for &(table_a, table_b) in &table_pairs {
-        let pair = solve_pair(&mut solver, table_a, table_b, &mut dep_cache)?;
+        let mut pair = solve_pair(&solver, table_a, table_b, &mut dep_cache)?;
         init_time += pair.init_time;
         propagation_time += pair.propagation_time;
         let current_max_win_dtc_a = pair.max_win_dtc_a;
@@ -919,16 +896,16 @@ pub fn retrograde_analysis(
         println!("{}: marking remaining positions as draws...", table_name(&solver, table_a));
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
-            let mut outcome = solver.read_outcome(table_a, idx);
+            let mut outcome = pair.working.values[0][idx];
             if outcome.is_unknown() {
                 outcome = MaybeDtcOutcome::DRAW;
-                solver.write_outcome(table_a, idx, outcome);
+                pair.working.values[0][idx] = outcome;
             }
+
             stats_builder_a.record_outcome(
                 outcome,
                 idx,
-                table_a.egt_idx,
-                &mut solver.files[table_a.file_idx],
+                &solver.files[table_a.file_idx].egts[table_a.egt_idx],
                 current_max_win_dtc_a,
                 current_max_loss_dtc_a,
             );
@@ -938,17 +915,17 @@ pub fn retrograde_analysis(
             println!("{}: marking remaining positions as draws...", table_name(&solver, table_b));
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
-                let mut outcome = solver.read_outcome(table_b, idx);
+                let mut outcome = pair.working.values[1][idx];
                 if outcome.is_unknown() {
                     outcome = MaybeDtcOutcome::DRAW;
-                    solver.write_outcome(table_b, idx, outcome);
+                    pair.working.values[1][idx] = outcome;
                 }
+
                 if let Some(ref mut builder_b) = stats_builder_b {
                     builder_b.record_outcome(
                         outcome,
                         idx,
-                        table_b.egt_idx,
-                        &mut solver.files[table_b.file_idx],
+                        &solver.files[table_b.file_idx].egts[table_b.egt_idx],
                         current_max_win_dtc_b,
                         current_max_loss_dtc_b,
                     );
@@ -956,14 +933,18 @@ pub fn retrograde_analysis(
                     stats_builder_a.record_outcome(
                         outcome,
                         idx,
-                        table_b.egt_idx,
-                        &mut solver.files[table_b.file_idx],
+                        &solver.files[table_b.file_idx].egts[table_b.egt_idx],
                         current_max_win_dtc_b,
                         current_max_loss_dtc_b,
                     );
                 }
             }
         }
+        writers[table_a.file_idx].write_table(table_a.egt_idx, &pair.working.values[0])?;
+        if table_a != table_b {
+            writers[table_b.file_idx].write_table(table_b.egt_idx, &pair.working.values[1])?;
+        }
+        // The pair arrays are dropped here, before allocating the next pair.
         finalize_time += finalize_start.elapsed();
     }
 
@@ -975,7 +956,19 @@ pub fn retrograde_analysis(
         finalize_time.as_secs_f64(),
     );
 
-    let mut files = solver.files;
+    let assembly_start = std::time::Instant::now();
+    for writer in &mut writers {
+        writer.finish()?;
+    }
+    // Each rename is atomic, but publishing the two destination files is not.
+    for writer in &mut writers {
+        writer.publish()?;
+    }
+    println!("{}: output assembly {:.3}s", endgame, assembly_start.elapsed().as_secs_f64());
+
+    let mut files = solver.files.into_iter().map(|file| {
+        EgtFile::new_from_file(base_path, &file.endgame)
+    }).collect::<EgtResult<Vec<_>>>()?;
     let mut file_a = files.remove(0);
     let mut file_b = if is_symmetric { None } else { Some(files.remove(0)) };
 
@@ -990,6 +983,116 @@ pub fn retrograde_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_local_mark_win_preference_and_newly_resolved() {
+        for order in [
+            [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate],
+            [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion],
+        ] {
+            let mut working = WorkingPair {
+                values: vec![vec![MaybeDtcOutcome::new_unknown(3)]],
+            };
+            let mut preferred = ConversionType::Promotion;
+            for (i, ct) in order.into_iter().enumerate() {
+                assert_eq!(working.mark_win(0, 0, ct, 7), i == 0);
+                preferred = preferred.max(ct);
+                assert_eq!(working.values[0][0], MaybeDtcOutcome::new_win(preferred, 7));
+            }
+            assert_eq!(working.values[0][0], MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
+            assert!(!working.mark_win(0, 0, ConversionType::Checkmate, 7));
+        }
+
+        let existing = vec![
+            MaybeDtcOutcome::new_win(ConversionType::Promotion, 2),
+            MaybeDtcOutcome::new_loss(ConversionType::Capture, 4),
+            MaybeDtcOutcome::DRAW,
+            MaybeDtcOutcome::INVALID,
+        ];
+        let mut working = WorkingPair { values: vec![existing.clone()] };
+        for idx in 0..existing.len() {
+            assert!(!working.mark_win(0, idx, ConversionType::Checkmate, 3));
+        }
+        assert_eq!(working.values[0], existing);
+    }
+
+    #[test]
+    fn pair_local_decrement_resolves_only_once_and_preserves_other_slot() {
+        let untouched = vec![MaybeDtcOutcome::new_unknown(5)];
+        let mut working = WorkingPair {
+            values: vec![vec![MaybeDtcOutcome::new_unknown(3)], untouched.clone()],
+        };
+        assert!(!working.decrement(0, 0, ConversionType::Checkmate, 8));
+        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_unknown(2));
+        assert!(!working.decrement(0, 0, ConversionType::Capture, 8));
+        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_unknown(1));
+        assert!(working.decrement(0, 0, ConversionType::Promotion, 8));
+        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert!(!working.decrement(0, 0, ConversionType::Checkmate, 9));
+        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert_eq!(working.values[1], untouched);
+
+        let assigned = vec![
+            MaybeDtcOutcome::new_win(ConversionType::Capture, 2),
+            MaybeDtcOutcome::DRAW,
+            MaybeDtcOutcome::INVALID,
+        ];
+        working.values[0] = assigned.clone();
+        for idx in 0..assigned.len() {
+            assert!(!working.decrement(0, idx, ConversionType::Promotion, 3));
+        }
+        assert_eq!(working.values[0], assigned);
+    }
+
+    #[test]
+    fn pair_local_ply_summary_clips_tails_and_keeps_maximum() {
+        let block = SUMMARY_BLOCK_SIZE;
+        let mut summary = PlySummary::new(2 * block + 3);
+        assert_eq!(summary.num_blocks(), 3);
+        assert_eq!(summary.blocks_with(0), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
+        assert_eq!(summary.blocks_with(1), summary.blocks_with(0));
+        assert!(summary.blocks_with(2).is_empty());
+        summary.record(block - 1, 4);
+        summary.record(block, 6);
+        summary.record(2 * block + 2, 9);
+        summary.record(2 * block, 2);
+        assert_eq!(summary.blocks_with(5), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
+        assert_eq!(summary.blocks_with(9), vec![(2 * block, 2 * block + 3)]);
+        assert!(summary.blocks_with(10).is_empty());
+        assert_eq!(PlySummary::new(block).blocks_with(1), vec![(0, block)]);
+        assert_eq!(PlySummary::new(3).blocks_with(1), vec![(0, 3)]);
+        let empty = PlySummary::new(0);
+        assert_eq!(empty.num_blocks(), 0);
+        assert!(empty.blocks_with(0).is_empty());
+    }
+
+    #[test]
+    fn pair_local_self_twin_uses_one_working_array() {
+        let dir = crate::TestDir::new("pair_local_self_twin");
+        let solver = RetrogradeSolver::new(EgtFile::new(&dir.0, "K_K").unwrap(), None);
+        let table = EgtHandle { file_idx: 0, egt_idx: 0 };
+        let mut deps = DependencyCache::with_options(&dir.0, None, false);
+        let pair = solve_pair(&solver, table, table, &mut deps).unwrap();
+        assert_eq!(pair.working.values.len(), 1);
+        assert_eq!(pair.working.values[0].len(), solver.files[0].egts[0].index_range());
+        assert!(pair.working.values[0].iter().all(|v| v.is_unknown() || v.is_draw()));
+        assert_eq!((pair.max_win_dtc_a, pair.max_loss_dtc_a, pair.max_win_dtc_b, pair.max_loss_dtc_b), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn pair_local_self_twin_scan_snapshots_matches_before_updates() {
+        let win = MaybeDtcOutcome::new_win(ConversionType::Capture, 1);
+        let mut working = WorkingPair { values: vec![vec![win, win, MaybeDtcOutcome::new_unknown(1)]] };
+        let mut visited = Vec::new();
+        scan_table(&mut working, 0, &[(0, 3)], |v| v == win, |working, idx, v| {
+            visited.push((idx, v));
+            working.values[0][1] = MaybeDtcOutcome::DRAW;
+            working.mark_win(0, 2, ConversionType::Capture, 2);
+        });
+        assert_eq!(visited, vec![(0, win), (1, win)]);
+        assert_eq!(working.values.len(), 1);
+        assert_eq!(working.values[0][2], MaybeDtcOutcome::new_win(ConversionType::Capture, 2));
+    }
 
     fn verify_table_generation(
         endgame: &str,

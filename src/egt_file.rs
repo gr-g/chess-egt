@@ -15,7 +15,7 @@ const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 const MAX_PAWNS: usize = 8;
 
 // Compression level used when storing data on disk
-const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
+pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LongestDtcPosition {
@@ -178,6 +178,13 @@ impl PawnKey {
     }
 }
 
+/// Logical extent of an unpadded, table-local transposed Zstd frame.
+#[derive(Debug, Clone, Copy)]
+struct FrameDescriptor {
+    start: usize,
+    len: usize,
+}
+
 /// Represents a file with endgame tablebases for a specific configuration of chess pieces.
 #[derive(Debug)]
 pub struct EgtFile {
@@ -201,8 +208,9 @@ pub struct EgtFile {
 
     /// The frames of the file.
     frames: Vec<FrameState>,
+    frame_layout: Vec<FrameDescriptor>,
 
-    /// Number of indexed locations per frame.
+    /// Maximum number of indexed locations per frame; tails may be shorter.
     pub frame_size: usize,
 
     /// Total number of indexed locations across all Egts in this file.
@@ -258,12 +266,16 @@ impl EgtFile {
         let index_range = acc;
 
         let frame_size = DEFAULT_FRAME_SIZE;
-        let num_frames = index_range.div_ceil(frame_size);
-
-        let mut frames = Vec::with_capacity(num_frames);
-        for _ in 0..num_frames {
-            frames.push(FrameState::Empty);
+        let mut frame_layout = Vec::new();
+        for (egt_idx, egt) in egts.iter().enumerate() {
+            for local_start in (0..egt.index_range()).step_by(frame_size) {
+                frame_layout.push(FrameDescriptor {
+                    start: egt_offsets[egt_idx] + local_start,
+                    len: frame_size.min(egt.index_range() - local_start),
+                });
+            }
         }
+        let frames = vec![FrameState::Empty; frame_layout.len()];
 
         Ok(Self {
             endgame: endgame.to_string(),
@@ -272,6 +284,7 @@ impl EgtFile {
             egt_map,
             egt_offsets,
             frames,
+            frame_layout,
             frame_size,
             index_range,
             stats: None,
@@ -287,10 +300,17 @@ impl EgtFile {
             return Err(EgtError::FileNotFound(egt_file.path));
         }
 
-        for f in 0..egt_file.frames.len() {
-            egt_file.frames[f] = FrameState::CompressedOnFile;
+        let mut source = std::fs::File::open(&egt_file.path)?;
+        let seek_table = zeekstd::SeekTable::from_seekable(&mut source)?;
+        if seek_table.num_frames() as usize != egt_file.num_frames() {
+            return Err(EgtError::Internal("invalid tablebase frame count"));
         }
-
+        for (frame_idx, frame) in egt_file.frame_layout.iter().enumerate() {
+            if seek_table.frame_size_decomp(frame_idx as u32)? != (frame.len * 2) as u64 {
+                return Err(EgtError::Internal("invalid tablebase frame length"));
+            }
+        }
+        egt_file.frames.fill(FrameState::CompressedOnFile);
         Ok(egt_file)
     }
 
@@ -309,40 +329,40 @@ impl EgtFile {
     /// Afterwards all frames are left in the `CompressedOnFile` state: the
     /// in-memory data is released and re-read from `self.path` on demand.
     pub fn save_to_file(&mut self) -> EgtResult<u64> {
-        use std::fs::File;
-        use std::io::BufWriter;
+        use std::io::{BufWriter, Write};
         use zeekstd::EncodeOptions;
+        use crate::egt_writer::{TemporaryFile, encode_frame};
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = File::create(&self.path)?;
-        let writer = BufWriter::new(file);
+        let mut temporary = TemporaryFile::new(&self.path, "save")?;
+        let mut writer = BufWriter::new(&mut temporary.file);
         let mut encoder = EncodeOptions::new()
             .compression_level(DEFAULT_COMPRESSION_LEVEL)
-            .into_encoder(writer)?;
+            .into_encoder(&mut writer)?;
 
-        // TODO: this does the encoding in one go with the uncompressed data,
-        // but in principle we could reuse the compressed frames.
+        // Use a separate destination so disk-backed input frames remain readable.
         for frame_idx in 0..self.frames.len() {
             self.ensure_uncompressed(frame_idx)?;
 
             // Transpose the frame
             if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
-                let transposed = transpose_frame(uncompressed);
-
-                // Compress the transposed frame
-                encoder.compress(&transposed)?;
-                encoder.end_frame()?;
+                encode_frame(&mut encoder, uncompressed)?;
             } else {
                 return Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"));
             }
 
-            // Drop the uncompressed data from memory.
-            self.frames[frame_idx] = FrameState::CompressedOnFile;
         }
 
-        // Finish the seekable Zstd file (writes the seek table)
-        Ok(encoder.finish()?)
+        encoder.flush()?;
+        let table = encoder.into_seek_table();
+        std::io::copy(&mut table.into_serializer(), &mut writer)?;
+        writer.flush()?;
+        drop(writer);
+        let bytes = temporary.file.metadata()?.len();
+        std::fs::rename(&temporary.path, &self.path)?;
+        self.frames.fill(FrameState::CompressedOnFile);
+        Ok(bytes)
     }
 
     /// Get uncompressed data for the frame at `frame_index`.
@@ -364,9 +384,11 @@ impl EgtFile {
         if start > end || end > self.index_range {
             return Err(EgtError::IndexOutOfRange { index: end, range: self.index_range });
         }
-        let frame_idx = start / self.frame_size;
-        let offset = start % self.frame_size;
-        if end - start > self.frame_size - offset {
+        if start == end {
+            return Ok(&[]);
+        }
+        let (frame_idx, offset) = self.locate_frame(start);
+        if end - start > self.frame_layout[frame_idx].len - offset {
             return Err(EgtError::Internal("frame_chunk range crosses a frame boundary"));
         }
         let data = self.get_frame_data(frame_idx)?;
@@ -430,14 +452,18 @@ impl EgtFile {
         self.egts[egt_idx].position_from_index(remaining_idx, side_to_move)
     }
 
+    fn locate_frame(&self, index: usize) -> (usize, usize) {
+        let frame_idx = self.frame_layout.partition_point(|frame| frame.start <= index) - 1;
+        (frame_idx, index - self.frame_layout[frame_idx].start)
+    }
+
     /// Reads an outcome directly by its global index.
     pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
         if index >= self.index_range {
             return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
         }
 
-        let frame_idx = index / self.frame_size;
-        let offset = index % self.frame_size;
+        let (frame_idx, offset) = self.locate_frame(index);
 
         let data = self.get_frame_data(frame_idx)?;
         Ok(data[offset])
@@ -449,8 +475,7 @@ impl EgtFile {
             return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
         }
 
-        let frame_idx = index / self.frame_size;
-        let offset = index % self.frame_size;
+        let (frame_idx, offset) = self.locate_frame(index);
 
         self.ensure_uncompressed(frame_idx)?;
 
@@ -466,10 +491,11 @@ impl EgtFile {
     /// Ensures that the frame at `frame_idx` is in the `Uncompressed` state.
     /// Allocates memory and decompresses if necessary.
     fn ensure_uncompressed(&mut self, frame_idx: usize) -> EgtResult<()> {
+        let frame = self.frame_layout[frame_idx];
         match &self.frames[frame_idx] {
             FrameState::Empty => {
                 // TODO: Allocate memory from arena
-                let uncompressed = vec![MaybeDtcOutcome::INVALID; self.frame_size];
+                let uncompressed = vec![MaybeDtcOutcome::INVALID; frame.len];
 
                 self.frames[frame_idx] = FrameState::Uncompressed {
                     compressed: vec![],
@@ -488,15 +514,15 @@ impl EgtFile {
                     }
                 })?;
                 let mut decoder = zeekstd::Decoder::new(file)?;
-                let mut transposed = vec![0u8; self.frame_size * 2];
+                let mut transposed = vec![0u8; frame.len * 2];
 
-                let uncompressed_offset = (frame_idx * self.frame_size * 2) as u64;
+                let uncompressed_offset = (frame.start as u64) * 2;
                 decoder.seek(SeekFrom::Start(uncompressed_offset))?;
                 decoder.read_exact(&mut transposed)?;
 
                 // Detranspose the frame
                 // TODO: allocate memory from arena
-                let uncompressed = detranspose_frame(&transposed, self.frame_size);
+                let uncompressed = detranspose_frame(&transposed, frame.len);
 
                 self.frames[frame_idx] = FrameState::Uncompressed {
                     compressed: vec![],
@@ -507,7 +533,7 @@ impl EgtFile {
             },
             FrameState::Compressed(compressed_bytes) => {
                 // TODO: Allocate memory from arena
-                let mut transposed = vec![0u8; self.frame_size * 2];
+                let mut transposed = vec![0u8; frame.len * 2];
 
                 // Decompress from memory
                 use zeekstd::{BytesWrapper, Decoder};
@@ -517,7 +543,7 @@ impl EgtFile {
                 decoder.read_exact(&mut transposed)?;
 
                 // Detranspose the frame
-                let uncompressed = detranspose_frame(&transposed, self.frame_size);
+                let uncompressed = detranspose_frame(&transposed, frame.len);
 
                 self.frames[frame_idx] = FrameState::Uncompressed {
                     compressed: vec![],
@@ -967,6 +993,84 @@ mod tests {
         let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();
         let loaded_outcome = another_egt_file.probe(&position).unwrap();
         assert_eq!(loaded_outcome, outcome);
+    }
+
+    #[test]
+    fn resaving_disk_backed_file() {
+        let dir = crate::TestDir::new("resaving_disk_backed_file");
+        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        let mut values = vec![MaybeDtcOutcome::INVALID; file.index_range];
+        for (idx, value) in values.iter_mut().enumerate() {
+            *value = if idx % 3 == 0 {
+                MaybeDtcOutcome::new_win(ConversionType::Promotion, 4567)
+            } else {
+                MaybeDtcOutcome::DRAW
+            };
+        }
+        for (idx, &value) in values.iter().enumerate() {
+            file.write_to_index(idx, value).unwrap();
+        }
+        file.save_to_file().unwrap();
+        let mut reader = EgtFile::new_from_file(&dir.0, "KP_K").unwrap();
+        assert_eq!(reader.num_frames(), file.egts.len());
+        for idx in 0..reader.index_range {
+            assert_eq!(reader.read_from_index(idx).unwrap(), values[idx]);
+        }
+        // Saving must not truncate disk-backed source data, including uncached frames.
+        reader.frames.fill(FrameState::CompressedOnFile);
+        reader.save_to_file().unwrap();
+        let mut reloaded = EgtFile::new_from_file(&dir.0, "KP_K").unwrap();
+        for idx in 0..reloaded.index_range {
+            assert_eq!(reloaded.read_from_index(idx).unwrap(), values[idx]);
+        }
+        assert_eq!(reloaded.frame_chunk(reloaded.index_range, reloaded.index_range).unwrap(), &[]);
+
+    }
+
+    #[test]
+    fn full_frames_short_tail_and_table_boundaries() {
+        let dir = crate::TestDir::new("frame_boundaries");
+        let mut file = EgtFile::new(&dir.0, "KQ_KR").unwrap();
+        assert!(file.num_frames() > 1);
+        assert_eq!(file.frame_layout.last().unwrap().len, 174420);
+        let indexes = [0, DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE,
+            DEFAULT_FRAME_SIZE + 1, file.index_range - 1];
+        for (n, &idx) in indexes.iter().enumerate() {
+            file.write_to_index(idx, MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1)).unwrap();
+        }
+        assert!(file.frame_chunk(DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE + 1).is_err());
+        file.save_to_file().unwrap();
+        let mut reader = EgtFile::new_from_file(&dir.0, "KQ_KR").unwrap();
+        for (n, &idx) in indexes.iter().enumerate() {
+            assert_eq!(reader.read_from_index(idx).unwrap(),
+                MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1));
+        }
+        let pawnful = EgtFile::new(&dir.0, "KP_K").unwrap();
+        assert_eq!(pawnful.num_frames(), pawnful.egts.len());
+        for (idx, frame) in pawnful.frame_layout.iter().enumerate() {
+            assert_eq!(frame.start, pawnful.get_global_index(idx, 0));
+            assert_eq!(frame.len, pawnful.egts[idx].index_range());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_frame_layout() {
+        let dir = crate::TestDir::new("invalid_frame_layout");
+        let file = EgtFile::new(&dir.0, "K_K").unwrap();
+        for bytes in [0, 3, 922, 926, DEFAULT_FRAME_SIZE * 2, DEFAULT_FRAME_SIZE * 2 + 2] {
+            let output = std::fs::File::create(&file.path).unwrap();
+            let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
+            encoder.compress(&vec![0; bytes]).unwrap();
+            encoder.finish().unwrap();
+            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+        }
+        // A correct payload with an extra empty frame has the wrong frame count.
+        let output = std::fs::File::create(&file.path).unwrap();
+        let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
+        encoder.compress(&vec![0; file.index_range * 2]).unwrap();
+        encoder.end_frame().unwrap();
+        encoder.finish().unwrap();
+        assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
     }
 
     #[test]

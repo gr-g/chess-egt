@@ -2,6 +2,7 @@ pub mod error;
 pub mod piece_set;
 mod egt;
 mod egt_file;
+mod egt_writer;
 mod retrograde;
 
 pub use error::{EgtError, EgtResult};
@@ -167,12 +168,11 @@ impl EgtGenerator {
             self.generate_deps,
         )?;
 
-        // Save to file
-        let bytes_a = file_a.save_to_file()?;
-        let mut bytes_b = None;
-        if let Some(ref mut fb) = file_b {
-            bytes_b = Some(fb.save_to_file()?);
-        }
+        // Retrograde analysis has already assembled and published the files.
+        let bytes_a = std::fs::metadata(&file_a.path)?.len();
+        let bytes_b = file_b.as_ref().map(|file| {
+            std::fs::metadata(&file.path).map(|metadata| metadata.len())
+        }).transpose()?;
 
         // Compute SHA-256 and finalize stats
         let sha256_a = compute_sha256(&file_a.path)?;
@@ -620,11 +620,7 @@ mod tests {
     // consistency of both tables.
     fn verify_internal_consistency(endgame: &str) {
         let test_dir = TestDir::new(&format!("verify_internal_consistency_{}", endgame));
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(&test_dir.0, endgame, None, true).unwrap();
-        file_a.save_to_file().unwrap();
-        if let Some(ref mut fb) = file_b {
-            fb.save_to_file().unwrap();
-        }
+        crate::retrograde::retrograde_analysis(&test_dir.0, endgame, None, true).unwrap();
 
         let mut prober = EgtProber::new(&test_dir.0);
         prober.verify_internal_consistency(endgame).unwrap();

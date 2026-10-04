@@ -67,16 +67,22 @@ An `EgtFile` represents a physical file on disk, storing the outcomes for a spec
 
 ## 4. File Format & Compression
 On disk, an `EgtFile` is compressed using a seekable Zstd format (via the `zeekstd` library).
-- The file is divided into **frames**, each containing a fixed number of positions (default: 256k).
-- Each frame is compressed independently, allowing seekable random access.
+- Files use **table-aligned frames** of at most `256 * 1024` positions. Frames never cross an `Egt` boundary.
+- Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the table lengths and validates it against the seek table.
 
 Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
 1. First: the low byte of all $N$ outcomes ($N$ bytes).
 2. Second: the high byte of all $N$ outcomes, skipping the (unused) high byte for invalid and drawn positions (max $N$ bytes).
 
-The new sequence of bytes is compressed using Zstd.
+The transposed buffer is always exactly `2 * N` bytes: high bytes for non-invalid, non-drawn outcomes are packed after the low bytes, and the unused tail remains zero.
+
+During generation, each finalized table is compressed into one temporary spool per output file. Final assembly copies the compressed table segments in stable `Egt` order without recompression and appends one final seek table.
 
 ## 5. Memory Management
+
+Generation uses separate flat `Vec<MaybeDtcOutcome>` arrays for the pair being solved. Once finalized, the pair is compressed into the output spools and its working arrays can be released. Working memory is one pair plus the dependency cache, indexing metadata, summaries, statistics, and compression/I/O buffers.
+
+`retrograde_analysis` assembles and publishes its output files before returning. Each file is published by an atomic rename, but publication of the two files is not transactional: failure between renames can leave only one output updated.
 
 ### 5.1 Frame States
 Each frame in an `EgtFile` can be in one of three states:
@@ -127,7 +133,7 @@ Before starting the main retrograde loop, both tables in the pair are initialize
        - K_KB (when the P promotes to N capturing the Q)
 
 ### 6.4 The Propagation Loop
-Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
+Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions, aligned on each table's local indices) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**
    * Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For each of them:
      * Call `quiet_unmoves`.
