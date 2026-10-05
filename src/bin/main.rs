@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long)]
     memory: Option<String>,
 
+    /// Number of generation workers (defaults to one).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    threads: u16,
+
     #[arg(long)]
     generate: Option<String>,
 
@@ -116,6 +120,7 @@ fn run() -> Result<(), EgtError> {
 }
 
 fn configure_generator(g: &mut EgtGenerator, cli: &Cli) {
+    g.with_threads(usize::from(cli.threads));
     if let Some(ref input) = cli.input_path {
         g.with_input_path(input.clone());
     }

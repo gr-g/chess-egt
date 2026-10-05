@@ -28,6 +28,11 @@
 //! updates itself: a winning conversion gives a win at ply 1, and losing
 //! conversions are subtracted from the position's own counter directly (a
 //! counter reaching zero gives a loss at ply 1).
+//!
+//! Rayon parallelizes disjoint initialization chunks and propagation blocks.
+//! Joined scans provide phase barriers; relaxed atomic CAS updates and summary
+//! fetch-max operations are sufficient within each phase. Dependency generation
+//! remains on the coordinator after failed initialization tasks have joined.
 
 use shakmaty::{Bitboard, Color, Chess, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
@@ -36,7 +41,10 @@ use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files,
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
 use crate::piece_set::{EgtRole, EgtSide};
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU16, Ordering};
+use rayon::prelude::*;
+use crate::egt_file::SharedDependencyReader;
 
 struct EgtFileStatsBuilder {
     endgame: String,
@@ -187,50 +195,51 @@ impl RetrogradeSolver {
 
 /// Mutable values for only the current pair; a self-pair has one shared array.
 struct WorkingPair {
-    values: Vec<Vec<MaybeDtcOutcome>>,
+    values: Vec<Vec<AtomicU16>>,
 }
 
 impl WorkingPair {
-    // The two updates below are the only writes that retrograde propagation
-    // makes to a position other than the one being visited (the "update sink"
-    // of `scaling_and_parallelization.md`, Section 4.3). Neither reads the
-    // state of any other position, so they can later become atomic updates or
-    // messages to the owner of `idx`.
+    fn load(&self, slot: usize, idx: usize) -> MaybeDtcOutcome {
+        MaybeDtcOutcome::from_u16(self.values[slot][idx].load(Ordering::Relaxed))
+    }
 
-    /// Marks `idx` as a win at `plies` if unknown. If it already is a win found
-    /// at this same ply, keeps the preferred conversion type (Checkmate >
-    /// Capture > Promotion), so the result does not depend on the order of the
-    /// updates. Returns whether the position was newly resolved.
-    fn mark_win(&mut self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
-        let v = self.values[slot][idx];
-        if v.is_unknown() {
-            self.values[slot][idx] = MaybeDtcOutcome::new_win(ct, plies);
-            true
-        } else {
-            if v.is_win() && ply(v) == plies && ct > outcome_ct(v) {
-                self.values[slot][idx] = MaybeDtcOutcome::new_win(ct, plies);
+    /// CAS preserves the best same-ply conversion even when workers race.
+    fn mark_win(&self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let cell = &self.values[slot][idx];
+        let mut raw = cell.load(Ordering::Relaxed);
+        loop {
+            let v = MaybeDtcOutcome::from_u16(raw);
+            let newly_resolved = v.is_unknown();
+            if !newly_resolved && !(v.is_win() && ply(v) == plies && ct > outcome_ct(v)) {
+                return false;
             }
-            false
+            match cell.compare_exchange_weak(raw, MaybeDtcOutcome::new_win(ct, plies).to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return newly_resolved,
+                Err(current) => raw = current,
+            }
         }
     }
 
-    /// Decrements the move counter of `idx` if unknown, because one of its
-    /// successors is a win (conversion type `ct`) at ply `plies - 1`. When the
-    /// counter reaches zero, the position becomes a loss at `plies`. Returns
-    /// whether the position was newly resolved.
-    fn decrement(&mut self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
-        let v = self.values[slot][idx];
-        if !v.is_unknown() {
-            return false;
-        }
-        let counter = v.get_unknown_counter();
-        debug_assert!(counter > 0);
-        if counter == 1 {
-            self.values[slot][idx] = MaybeDtcOutcome::new_loss(ct, plies);
-            true
-        } else {
-            self.values[slot][idx] = MaybeDtcOutcome::new_unknown(counter - 1);
-            false
+    /// Conversion-type barriers ensure the last decrement has the loss preference.
+    fn decrement(&self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
+        let cell = &self.values[slot][idx];
+        let mut raw = cell.load(Ordering::Relaxed);
+        loop {
+            let v = MaybeDtcOutcome::from_u16(raw);
+            if !v.is_unknown() {
+                return false;
+            }
+            let counter = v.get_unknown_counter();
+            debug_assert!(counter > 0);
+            let next = if counter == 1 {
+                MaybeDtcOutcome::new_loss(ct, plies)
+            } else {
+                MaybeDtcOutcome::new_unknown(counter - 1)
+            };
+            match cell.compare_exchange_weak(raw, next.to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return counter == 1,
+                Err(current) => raw = current,
+            }
         }
     }
 }
@@ -273,23 +282,25 @@ const SUMMARY_BLOCK_SIZE: usize = 4096;
 /// Per local block, an upper bound on the plies of its resolved values.
 struct PlySummary {
     size: usize,
-    last_ply: Vec<u16>,
+    last_ply: Vec<AtomicU16>,
 }
 
 impl PlySummary {
     /// Initialization resolves values only at plies 0 and 1.
     fn new(size: usize) -> Self {
-        Self { size, last_ply: vec![1; size.div_ceil(SUMMARY_BLOCK_SIZE)] }
+        Self { size, last_ply: (0..size.div_ceil(SUMMARY_BLOCK_SIZE)).map(|_| AtomicU16::new(1)).collect() }
     }
 
-    fn record(&mut self, local_index: usize, plies: u16) {
-        let last = &mut self.last_ply[local_index / SUMMARY_BLOCK_SIZE];
-        *last = (*last).max(plies);
+    fn record(&self, local_index: usize, plies: u16) {
+        let last = &self.last_ply[local_index / SUMMARY_BLOCK_SIZE];
+        if last.load(Ordering::Relaxed) < plies {
+            last.fetch_max(plies, Ordering::Relaxed);
+        }
     }
 
     fn blocks_with(&self, plies: u16) -> Vec<(usize, usize)> {
         self.last_ply.iter().enumerate()
-            .filter(|&(_, &last)| last >= plies)
+            .filter(|(_, last)| last.load(Ordering::Relaxed) >= plies)
             .map(|(b, _)| {
                 let start = b * SUMMARY_BLOCK_SIZE;
                 (start, (start + SUMMARY_BLOCK_SIZE).min(self.size))
@@ -304,28 +315,27 @@ impl PlySummary {
 
 /// Collect each block's matches before updates, including for a self-pair.
 fn scan_table<S, F>(
-    working: &mut WorkingPair,
+    working: &WorkingPair,
     slot: usize,
     blocks: &[(usize, usize)],
     select: S,
-    mut process: F,
-)
+    process: F,
+) -> Found
 where
-    S: Fn(MaybeDtcOutcome) -> bool,
-    F: FnMut(&mut WorkingPair, usize, MaybeDtcOutcome),
+    S: Fn(MaybeDtcOutcome) -> bool + Sync,
+    F: Fn(&WorkingPair, usize, MaybeDtcOutcome, &mut Found) + Sync,
 {
-    let mut matches = Vec::new();
-    for &(start, end) in blocks {
-        matches.clear();
-        for (i, &v) in working.values[slot][start..end].iter().enumerate() {
-            if select(v) {
-                matches.push((start + i, v));
-            }
+    blocks.par_iter().map(|&(start, end)| {
+        let matches: Vec<_> = (start..end).filter_map(|idx| {
+            let v = working.load(slot, idx);
+            select(v).then_some((idx, v))
+        }).collect();
+        let mut found = Found::default();
+        for (idx, v) in matches {
+            process(working, idx, v, &mut found);
         }
-        for &(idx, v) in &matches {
-            process(working, idx, v);
-        }
-    }
+        found
+    }).reduce(Found::default, Found::merge)
 }
 
 fn get_pawn_files(pieces: &[(EgtRole, EgtSide, usize)]) -> (FileVec, FileVec) {
@@ -514,7 +524,7 @@ impl DependencyCache {
                         g.with_input_path(input.clone());
                     }
                     g.with_generate_deps(self.generate_deps);
-                    g.generate(endgame).map_err(|source| EgtError::DependencyUnavailable {
+                    g.generate_in_pool(endgame).map_err(|source| EgtError::DependencyUnavailable {
                         dependency: endgame.to_string(),
                         source: Box::new(source),
                     })?;
@@ -537,11 +547,16 @@ struct Found {
 }
 
 impl Found {
+    fn merge(self, other: Self) -> Self {
+        Self { wins: self.wins + other.wins, losses: self.losses + other.losses }
+    }
+
     fn is_empty(self) -> bool {
         self.wins == 0 && self.losses == 0
     }
 }
 
+#[derive(Default)]
 struct InitCounts {
     checkmates: usize,
     stalemates: usize,
@@ -554,80 +569,82 @@ struct InitCounts {
 /// with its move counter.
 fn initialize_table(
     egt: &Egt,
-    values: &mut [MaybeDtcOutcome],
-    dep_cache: &mut DependencyCache,
+    values: &mut [AtomicU16],
+    reader: &SharedDependencyReader,
 ) -> EgtResult<InitCounts> {
     let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
     debug_assert_eq!(values.len(), size);
-    let mut counts = InitCounts { checkmates: 0, stalemates: 0, found: Found::default() };
+    values.par_chunks_mut(SUMMARY_BLOCK_SIZE).enumerate().map(|(block, chunk)| {
+        let mut counts = InitCounts::default();
+        for (offset, cell) in chunk.iter_mut().enumerate() {
+            let idx = block * SUMMARY_BLOCK_SIZE + offset;
+            let position_opt = egt.position_from_index(idx, Color::White);
 
-    for idx in 0..size {
-        let position_opt = egt.position_from_index(idx, Color::White);
 
-        if (idx+1) % 10000000 == 0 {
-            println!("Scanned {}/{} indexes...", idx+1, size);
-        }
+            let Some(position) = position_opt else {
+                *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
+                continue;
+            };
+            let legals = position.legal_moves();
 
-        let Some(position) = position_opt else {
-            values[idx] = MaybeDtcOutcome::INVALID;
-            continue;
-        };
-        let legals = position.legal_moves();
-
-        if legals.is_empty() {
-            if position.is_check() {
-                values[idx] = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0);
-                counts.checkmates += 1;
-            } else {
-                values[idx] = MaybeDtcOutcome::DRAW;
-                counts.stalemates += 1;
+            if legals.is_empty() {
+                if position.is_check() {
+                    *cell.get_mut() = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0).to_u16();
+                    counts.checkmates += 1;
+                } else {
+                    *cell.get_mut() = MaybeDtcOutcome::DRAW.to_u16();
+                    counts.stalemates += 1;
+                }
+                continue;
             }
-            continue;
-        }
 
-        let mut counter = if pawnless {
-            symmetry_adjusted_move_counter(&position)
-        } else {
-            legals.len() as u16
-        };
-        let mut win_conv: Option<ConversionType> = None;
-        let mut loss_conv: Option<ConversionType> = None;
+            let mut counter = if pawnless {
+                symmetry_adjusted_move_counter(&position)
+            } else {
+                legals.len() as u16
+            };
+            let mut win_conv: Option<ConversionType> = None;
+            let mut loss_conv: Option<ConversionType> = None;
 
-        for m in legals {
-            if m.is_capture() || m.is_promotion() {
-                let mut successor_position = position.clone();
-                successor_position.play_unchecked(m);
-                let dep_endgame = crate::get_endgame(&successor_position);
-                let dep_outcome = dep_cache.get_or_load(&dep_endgame)?.probe(&successor_position)?;
+            for m in legals {
+                if m.is_capture() || m.is_promotion() {
+                    let mut successor_position = position.clone();
+                    successor_position.play_unchecked(m);
+                    let dep_outcome = reader.probe(&successor_position)?;
 
-                let ct = if m.is_capture() { ConversionType::Capture } else { ConversionType::Promotion };
-                if dep_outcome.is_loss() {
-                    win_conv = Some(win_conv.map_or(ct, |w| w.max(ct)));
-                } else if dep_outcome.is_win() {
-                    // Conversion moves always count 1 in the counter (the
-                    // symmetry adjustment only applies to quiet king moves).
-                    counter -= 1;
-                    loss_conv = Some(better_loss_ct(loss_conv, ct));
+                    let ct = if m.is_capture() { ConversionType::Capture } else { ConversionType::Promotion };
+                    if dep_outcome.is_loss() {
+                        win_conv = Some(win_conv.map_or(ct, |w| w.max(ct)));
+                    } else if dep_outcome.is_win() {
+                        // Conversion moves always count 1 in the counter (the
+                        // symmetry adjustment only applies to quiet king moves).
+                        counter -= 1;
+                        loss_conv = Some(better_loss_ct(loss_conv, ct));
+                    }
                 }
             }
+
+            let outcome = if let Some(ct) = win_conv {
+                // A checkmate in 1 found by phase W(1) may still upgrade the
+                // conversion type.
+                counts.found.wins += 1;
+                MaybeDtcOutcome::new_win(ct, 1)
+            } else if counter == 0 {
+                // All moves are conversions to won positions.
+                counts.found.losses += 1;
+                MaybeDtcOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
+            } else {
+                MaybeDtcOutcome::new_unknown(counter)
+            };
+            *cell.get_mut() = outcome.to_u16();
         }
 
-        let outcome = if let Some(ct) = win_conv {
-            // A checkmate in 1 found by phase W(1) may still upgrade the
-            // conversion type.
-            counts.found.wins += 1;
-            MaybeDtcOutcome::new_win(ct, 1)
-        } else if counter == 0 {
-            // All moves are conversions to won positions.
-            counts.found.losses += 1;
-            MaybeDtcOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
-        } else {
-            MaybeDtcOutcome::new_unknown(counter)
-        };
-        values[idx] = outcome;
-    }
-
-    Ok(counts)
+        Ok(counts)
+    }).try_reduce(InitCounts::default, |a, b| Ok(InitCounts {
+        checkmates: a.checkmates + b.checkmates,
+        stalemates: a.stalemates + b.stalemates,
+        found: a.found.merge(b.found),
+    }))
 }
 
 /// Per-pair output of `solve_pair`.
@@ -665,18 +682,49 @@ fn solve_pair(
 
     let mut working = WorkingPair {
         values: tables.iter().map(|&(table, ..)| {
-            vec![MaybeDtcOutcome::INVALID; egt(table).index_range()]
+            (0..egt(table).index_range()).map(|_| AtomicU16::new(MaybeDtcOutcome::INVALID.to_u16())).collect()
         }).collect(),
     };
 
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
-    let mut previous = [Found::default(); 2];
-    let mut found_by_conversion = [Found::default(); 2];
-    for &(table, _, _, slot, _) in &tables {
-        let counts = initialize_table(egt(table), &mut working.values[slot], dep_cache)?;
-        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
-        previous[slot].losses = counts.checkmates;
-        found_by_conversion[slot] = counts.found;
+    let mut previous;
+    let mut found_by_conversion;
+    let mut attempted = HashSet::new();
+    loop {
+        // A failed attempt may leave partially initialized chunks. Reset all
+        // slots and counts, including tables completed before the failure.
+        previous = [Found::default(); 2];
+        found_by_conversion = [Found::default(); 2];
+        for values in &mut working.values {
+            for cell in values {
+                *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
+            }
+        }
+        let reader = SharedDependencyReader::new(
+            std::mem::take(&mut dep_cache.cache), &dep_cache.base_path,
+            dep_cache.input_path.as_deref(),
+        );
+        let result = (|| -> EgtResult<()> {
+            for &(table, _, _, slot, _) in &tables {
+                let counts = initialize_table(egt(table), &mut working.values[slot], &reader)?;
+                println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
+                previous[slot].losses = counts.checkmates;
+                found_by_conversion[slot] = counts.found;
+            }
+            Ok(())
+        })();
+        // Rayon has joined every task before ownership of warmed files returns.
+        dep_cache.cache = reader.into_cache()?;
+        match result {
+            Ok(()) => break,
+            Err(EgtError::DependencyUnavailable { dependency, source }) if dep_cache.generate_deps => {
+                if !attempted.insert(dependency.clone()) {
+                    return Err(EgtError::DependencyUnavailable { dependency, source });
+                }
+                dep_cache.get_or_load(&dependency)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let init_time = init_start.elapsed();
@@ -686,7 +734,7 @@ fn solve_pair(
     let mut max_loss = [0u16; 2];
 
     // Indexed by slot. A symmetric pair has a single table and summary.
-    let mut summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
+    let summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
     // Blocks visited by the scans, and blocks the same scans would visit
     // without the summaries.
     let mut blocks_scanned = 0usize;
@@ -708,15 +756,16 @@ fn solve_pair(
             let blocks = summaries[slot].blocks_with(plies - 1);
             blocks_scanned += blocks.len();
             blocks_total += summaries[slot].num_blocks();
-            scan_table(&mut working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v| {
+            let newly = scan_table(&working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v, local| {
                 let ct = outcome_ct(v);
                 quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
                     if working.mark_win(twin_slot, pred_idx, ct, plies) {
-                        found[twin_slot].wins += 1;
+                        local.wins += 1;
                         summaries[twin_slot].record(pred_idx, plies);
                     }
                 });
             });
+            found[twin_slot] = found[twin_slot].merge(newly);
         }
 
         // Phase L: wins at `plies - 1` decrement the counters of their
@@ -730,14 +779,15 @@ fn solve_pair(
                 let blocks = summaries[slot].blocks_with(plies - 1);
                 blocks_scanned += blocks.len();
                 blocks_total += summaries[slot].num_blocks();
-                scan_table(&mut working, slot, &blocks, |v| v == target, |working, idx, _| {
+                let newly = scan_table(&working, slot, &blocks, |v| v == target, |working, idx, _, local| {
                     quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
                         if working.decrement(twin_slot, pred_idx, ct, plies) {
-                            found[twin_slot].losses += 1;
+                            local.losses += 1;
                             summaries[twin_slot].record(pred_idx, plies);
                         }
                     });
                 });
+                found[twin_slot] = found[twin_slot].merge(newly);
             }
         }
 
@@ -781,6 +831,31 @@ fn solve_pair(
 }
 
 pub fn retrograde_analysis(
+    base_path: &std::path::Path,
+    endgame: &str,
+    input_path: Option<&std::path::Path>,
+    generate_deps: bool,
+) -> EgtResult<(EgtFile, Option<EgtFile>)> {
+    retrograde_analysis_with_threads(base_path, endgame, input_path, generate_deps, 1)
+}
+
+/// Generates tables in a dedicated Rayon pool. Zero threads is rejected.
+pub fn retrograde_analysis_with_threads(
+    base_path: &std::path::Path,
+    endgame: &str,
+    input_path: Option<&std::path::Path>,
+    generate_deps: bool,
+    threads: usize,
+) -> EgtResult<(EgtFile, Option<EgtFile>)> {
+    if threads == 0 {
+        return Err(EgtError::Internal("thread count must be positive"));
+    }
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()
+        .map_err(|_| EgtError::Internal("failed to build retrograde thread pool"))?;
+    pool.install(|| retrograde_analysis_in_pool(base_path, endgame, input_path, generate_deps))
+}
+
+pub(crate) fn retrograde_analysis_in_pool(
     base_path: &std::path::Path,
     endgame: &str,
     input_path: Option<&std::path::Path>,
@@ -892,14 +967,16 @@ pub fn retrograde_analysis(
 
         let finalize_start = std::time::Instant::now();
 
+        let mut values_a: Vec<_> = std::mem::take(&mut pair.working.values[0]).into_iter()
+            .map(|cell| MaybeDtcOutcome::from_u16(cell.into_inner())).collect();
         // Mark all remaining 'unknown' positions as draws
         println!("{}: marking remaining positions as draws...", table_name(&solver, table_a));
         let size_a = solver.files[table_a.file_idx].egts[table_a.egt_idx].index_range();
         for idx in 0..size_a {
-            let mut outcome = pair.working.values[0][idx];
+            let mut outcome = values_a[idx];
             if outcome.is_unknown() {
                 outcome = MaybeDtcOutcome::DRAW;
-                pair.working.values[0][idx] = outcome;
+                values_a[idx] = outcome;
             }
 
             stats_builder_a.record_outcome(
@@ -911,14 +988,18 @@ pub fn retrograde_analysis(
             );
         }
 
+        writers[table_a.file_idx].write_table(table_a.egt_idx, &values_a)?;
+        drop(values_a);
         if table_a != table_b {
+            let mut values_b: Vec<_> = std::mem::take(&mut pair.working.values[1]).into_iter()
+                .map(|cell| MaybeDtcOutcome::from_u16(cell.into_inner())).collect();
             println!("{}: marking remaining positions as draws...", table_name(&solver, table_b));
             let size_b = solver.files[table_b.file_idx].egts[table_b.egt_idx].index_range();
             for idx in 0..size_b {
-                let mut outcome = pair.working.values[1][idx];
+                let mut outcome = values_b[idx];
                 if outcome.is_unknown() {
                     outcome = MaybeDtcOutcome::DRAW;
-                    pair.working.values[1][idx] = outcome;
+                    values_b[idx] = outcome;
                 }
 
                 if let Some(ref mut builder_b) = stats_builder_b {
@@ -939,10 +1020,7 @@ pub fn retrograde_analysis(
                     );
                 }
             }
-        }
-        writers[table_a.file_idx].write_table(table_a.egt_idx, &pair.working.values[0])?;
-        if table_a != table_b {
-            writers[table_b.file_idx].write_table(table_b.egt_idx, &pair.working.values[1])?;
+            writers[table_b.file_idx].write_table(table_b.egt_idx, &values_b)?;
         }
         // The pair arrays are dropped here, before allocating the next pair.
         finalize_time += finalize_start.elapsed();
@@ -984,22 +1062,30 @@ pub fn retrograde_analysis(
 mod tests {
     use super::*;
 
+    fn atomic_values(values: Vec<MaybeDtcOutcome>) -> Vec<AtomicU16> {
+        values.into_iter().map(|v| AtomicU16::new(v.to_u16())).collect()
+    }
+
+    fn plain_values(values: &[AtomicU16]) -> Vec<MaybeDtcOutcome> {
+        values.iter().map(|v| MaybeDtcOutcome::from_u16(v.load(Ordering::Relaxed))).collect()
+    }
+
     #[test]
     fn pair_local_mark_win_preference_and_newly_resolved() {
         for order in [
             [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate],
             [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion],
         ] {
-            let mut working = WorkingPair {
-                values: vec![vec![MaybeDtcOutcome::new_unknown(3)]],
+            let working = WorkingPair {
+                values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(3)])],
             };
             let mut preferred = ConversionType::Promotion;
             for (i, ct) in order.into_iter().enumerate() {
                 assert_eq!(working.mark_win(0, 0, ct, 7), i == 0);
                 preferred = preferred.max(ct);
-                assert_eq!(working.values[0][0], MaybeDtcOutcome::new_win(preferred, 7));
+                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(preferred, 7));
             }
-            assert_eq!(working.values[0][0], MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
+            assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
             assert!(!working.mark_win(0, 0, ConversionType::Checkmate, 7));
         }
 
@@ -1009,45 +1095,45 @@ mod tests {
             MaybeDtcOutcome::DRAW,
             MaybeDtcOutcome::INVALID,
         ];
-        let mut working = WorkingPair { values: vec![existing.clone()] };
+        let working = WorkingPair { values: vec![atomic_values(existing.clone())] };
         for idx in 0..existing.len() {
             assert!(!working.mark_win(0, idx, ConversionType::Checkmate, 3));
         }
-        assert_eq!(working.values[0], existing);
+        assert_eq!(plain_values(&working.values[0]), existing);
     }
 
     #[test]
     fn pair_local_decrement_resolves_only_once_and_preserves_other_slot() {
         let untouched = vec![MaybeDtcOutcome::new_unknown(5)];
         let mut working = WorkingPair {
-            values: vec![vec![MaybeDtcOutcome::new_unknown(3)], untouched.clone()],
+            values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(3)]), atomic_values(untouched.clone())],
         };
         assert!(!working.decrement(0, 0, ConversionType::Checkmate, 8));
-        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_unknown(2));
+        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_unknown(2));
         assert!(!working.decrement(0, 0, ConversionType::Capture, 8));
-        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_unknown(1));
+        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_unknown(1));
         assert!(working.decrement(0, 0, ConversionType::Promotion, 8));
-        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
         assert!(!working.decrement(0, 0, ConversionType::Checkmate, 9));
-        assert_eq!(working.values[0][0], MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
-        assert_eq!(working.values[1], untouched);
+        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert_eq!(plain_values(&working.values[1]), untouched);
 
         let assigned = vec![
             MaybeDtcOutcome::new_win(ConversionType::Capture, 2),
             MaybeDtcOutcome::DRAW,
             MaybeDtcOutcome::INVALID,
         ];
-        working.values[0] = assigned.clone();
+        working.values[0] = atomic_values(assigned.clone());
         for idx in 0..assigned.len() {
             assert!(!working.decrement(0, idx, ConversionType::Promotion, 3));
         }
-        assert_eq!(working.values[0], assigned);
+        assert_eq!(plain_values(&working.values[0]), assigned);
     }
 
     #[test]
     fn pair_local_ply_summary_clips_tails_and_keeps_maximum() {
         let block = SUMMARY_BLOCK_SIZE;
-        let mut summary = PlySummary::new(2 * block + 3);
+        let summary = PlySummary::new(2 * block + 3);
         assert_eq!(summary.num_blocks(), 3);
         assert_eq!(summary.blocks_with(0), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
         assert_eq!(summary.blocks_with(1), summary.blocks_with(0));
@@ -1075,23 +1161,209 @@ mod tests {
         let pair = solve_pair(&solver, table, table, &mut deps).unwrap();
         assert_eq!(pair.working.values.len(), 1);
         assert_eq!(pair.working.values[0].len(), solver.files[0].egts[0].index_range());
-        assert!(pair.working.values[0].iter().all(|v| v.is_unknown() || v.is_draw()));
+        assert!(plain_values(&pair.working.values[0]).iter().all(|v| v.is_unknown() || v.is_draw()));
         assert_eq!((pair.max_win_dtc_a, pair.max_loss_dtc_a, pair.max_win_dtc_b, pair.max_loss_dtc_b), (0, 0, 0, 0));
     }
 
     #[test]
     fn pair_local_self_twin_scan_snapshots_matches_before_updates() {
         let win = MaybeDtcOutcome::new_win(ConversionType::Capture, 1);
-        let mut working = WorkingPair { values: vec![vec![win, win, MaybeDtcOutcome::new_unknown(1)]] };
-        let mut visited = Vec::new();
-        scan_table(&mut working, 0, &[(0, 3)], |v| v == win, |working, idx, v| {
-            visited.push((idx, v));
-            working.values[0][1] = MaybeDtcOutcome::DRAW;
+        let working = WorkingPair { values: vec![atomic_values(vec![win, win, MaybeDtcOutcome::new_unknown(1)])] };
+        let visited = std::sync::Mutex::new(Vec::new());
+        scan_table(&working, 0, &[(0, 3)], |v| v == win, |working, idx, v, _| {
+            visited.lock().unwrap().push((idx, v));
+            working.values[0][1].store(MaybeDtcOutcome::DRAW.to_u16(), Ordering::Relaxed);
             working.mark_win(0, 2, ConversionType::Capture, 2);
         });
-        assert_eq!(visited, vec![(0, win), (1, win)]);
+        assert_eq!(*visited.lock().unwrap(), vec![(0, win), (1, win)]);
         assert_eq!(working.values.len(), 1);
-        assert_eq!(working.values[0][2], MaybeDtcOutcome::new_win(ConversionType::Capture, 2));
+        assert_eq!(working.load(0, 2), MaybeDtcOutcome::new_win(ConversionType::Capture, 2));
+    }
+
+    #[test]
+    fn concurrent_cas_updates_resolve_once() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            for _ in 0..32 {
+                let working = WorkingPair { values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(96)])] };
+                let wins: usize = (0..96).into_par_iter().map(|i| {
+                    let ct = [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate][i % 3];
+                    usize::from(working.mark_win(0, 0, ct, 7))
+                }).sum();
+                assert_eq!(wins, 1);
+                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
+                let working = WorkingPair { values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(96)])] };
+                let losses: usize = (0..192).into_par_iter().map(|_| {
+                    usize::from(working.decrement(0, 0, ConversionType::Promotion, 8))
+                }).sum();
+                assert_eq!(losses, 1);
+                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+            }
+        });
+    }
+
+    #[test]
+    fn step4_concurrent_summary_max_and_clipped_tail() {
+        let block = SUMMARY_BLOCK_SIZE;
+        let summary = PlySummary::new(2 * block + 3);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let summary = &summary;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for stamp in (2..=32u16).rev() {
+                        // All workers contend on the first block, then stamp
+                        // distinct positions in both remaining blocks.
+                        summary.record(worker, stamp);
+                        summary.record(block + worker, stamp + 8);
+                        summary.record(2 * block + worker % 3, stamp + 16);
+                    }
+                });
+            }
+        });
+        assert_eq!(summary.num_blocks(), 3);
+        assert_eq!(summary.last_ply.iter().map(|v| v.load(Ordering::Relaxed)).collect::<Vec<_>>(), vec![32, 40, 48]);
+        assert_eq!(summary.blocks_with(32), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
+        assert_eq!(summary.blocks_with(33), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
+        assert_eq!(summary.blocks_with(41), vec![(2 * block, 2 * block + 3)]);
+        assert!(summary.blocks_with(49).is_empty());
+    }
+
+    #[test]
+    fn step4_ordered_loss_conversion_phases() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            let working = WorkingPair {
+                values: vec![atomic_values(vec![
+                    MaybeDtcOutcome::new_unknown(32),
+                    MaybeDtcOutcome::new_unknown(64),
+                    MaybeDtcOutcome::new_unknown(96),
+                ])],
+            };
+            let conversions = [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion];
+            for (phase, ct) in conversions.into_iter().enumerate() {
+                // Each reduction joins before the next conversion type starts.
+                let resolved: usize = (0..96).into_par_iter().map(|i| {
+                    usize::from(working.decrement(0, i % 3, ct, 8))
+                }).sum();
+                assert_eq!(resolved, 1);
+                for (idx, expected_ct) in conversions.into_iter().enumerate() {
+                    let expected = if idx <= phase {
+                        MaybeDtcOutcome::new_loss(expected_ct, 8)
+                    } else {
+                        MaybeDtcOutcome::new_unknown(32 * (idx - phase) as u16)
+                    };
+                    assert_eq!(working.load(0, idx), expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn step4_concurrent_win_updates_preserve_resolved_values() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let existing = vec![
+            MaybeDtcOutcome::new_win(ConversionType::Promotion, 2),
+            MaybeDtcOutcome::INVALID,
+            MaybeDtcOutcome::DRAW,
+            MaybeDtcOutcome::new_loss(ConversionType::Capture, 4),
+        ];
+        let working = WorkingPair { values: vec![atomic_values(existing.clone())] };
+        let resolved: usize = pool.install(|| {
+            (0..384).into_par_iter().map(|i| {
+                let ct = [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion][i % 3];
+                usize::from(working.mark_win(0, i % existing.len(), ct, 7))
+            }).sum()
+        });
+        assert_eq!(resolved, 0);
+        assert_eq!(plain_values(&working.values[0]), existing);
+    }
+
+    #[test]
+    fn step4_multiblock_self_twin_scan_visits_sources_once() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            let size = 3 * SUMMARY_BLOCK_SIZE + 6;
+            let plies = 7;
+            for source_is_loss in [true, false] {
+                let source = if source_is_loss {
+                    MaybeDtcOutcome::new_loss(ConversionType::Capture, plies - 1)
+                } else {
+                    MaybeDtcOutcome::new_win(ConversionType::Capture, plies - 1)
+                };
+                let working = WorkingPair {
+                    values: vec![atomic_values((0..size).map(|idx| {
+                        if idx % 2 == 0 { source } else { MaybeDtcOutcome::new_unknown(1) }
+                    }).collect())],
+                };
+                let visits: Vec<_> = (0..size).map(|_| AtomicU16::new(0)).collect();
+                let summary = PlySummary::new(size);
+
+                let blocks = summary.blocks_with(1);
+                assert_eq!(blocks.len(), 4);
+                assert_eq!(blocks.last(), Some(&(3 * SUMMARY_BLOCK_SIZE, size)));
+                let found = scan_table(&working, 0, &blocks,
+                    |v| v == source && ply(v) == plies - 1,
+                    |working, idx, v, local| {
+                        assert_eq!(v, source);
+                        visits[idx].fetch_add(1, Ordering::Relaxed);
+                        // A bijection from even sources to odd destinations,
+                        // shifted across blocks within the same working array.
+                        let target = (idx + 2 * SUMMARY_BLOCK_SIZE) % size + 1;
+                        if source_is_loss {
+                            if working.mark_win(0, target, ConversionType::Capture, plies) {
+                                local.wins += 1;
+                            }
+                        } else if working.decrement(0, target, ConversionType::Capture, plies) {
+                            local.losses += 1;
+                        }
+                    });
+                assert_eq!((found.wins, found.losses), if source_is_loss { (size / 2, 0) } else { (0, size / 2) });
+                let resolved = if source_is_loss {
+                    MaybeDtcOutcome::new_win(ConversionType::Capture, plies)
+                } else {
+                    MaybeDtcOutcome::new_loss(ConversionType::Capture, plies)
+                };
+                for (idx, visits) in visits.iter().enumerate() {
+                    assert_eq!(visits.load(Ordering::Relaxed), if idx % 2 == 0 { 1 } else { 0 });
+                    assert_eq!(working.load(0, idx), if idx % 2 == 0 { source } else { resolved });
+                }
+                assert_eq!(working.values.len(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn parallel_generation_is_byte_identical() {
+        for endgame in ["K_K", "KQ_K", "KP_K"] {
+            let serial = crate::TestDir::new(&format!("serial_{endgame}"));
+            let parallel = crate::TestDir::new(&format!("parallel_{endgame}"));
+            let (a, b) = retrograde_analysis_with_threads(&serial.0, endgame, None, true, 1).unwrap();
+            let (pa, pb) = retrograde_analysis_with_threads(&parallel.0, endgame, None, true, 4).unwrap();
+            for (file, parallel_file) in std::iter::once((a, pa)).chain(b.into_iter().zip(pb)) {
+                let name = format!("{}.ggegt", file.endgame);
+                assert_eq!(std::fs::read(serial.0.join(&name)).unwrap(), std::fs::read(parallel.0.join(&name)).unwrap(), "{name}");
+                let stats = file.stats.unwrap();
+                let parallel_stats = parallel_file.stats.unwrap();
+                assert_eq!(serde_json::to_value(stats).unwrap(), serde_json::to_value(parallel_stats).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_missing_dependency_does_not_generate_when_disabled() {
+        let dir = crate::TestDir::new("parallel_missing_dependency");
+        let result = retrograde_analysis_with_threads(&dir.0, "KQ_K", None, false, 4);
+        assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, .. }) if dependency == "K_K"));
+        assert!(!dir.0.join("K_K.ggegt").exists());
+    }
+
+    #[test]
+    fn rejects_zero_threads() {
+        let dir = crate::TestDir::new("zero_threads");
+        assert!(matches!(retrograde_analysis_with_threads(&dir.0, "K_K", None, false, 0), Err(EgtError::Internal(_))));
     }
 
     fn verify_table_generation(

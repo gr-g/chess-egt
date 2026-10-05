@@ -54,6 +54,7 @@ pub struct EgtGenerator {
     input_path: Option<PathBuf>,
     generate_deps: bool,
     verify: bool,
+    threads: usize,
 }
 
 impl EgtGenerator {
@@ -64,7 +65,13 @@ impl EgtGenerator {
             input_path: None,
             generate_deps: false,
             verify: true,
+            threads: 1,
         }
+    }
+
+    /// Sets generation workers. Zero is rejected by `generate`.
+    pub fn with_threads(&mut self, threads: usize) {
+        self.threads = threads;
     }
 
     pub fn with_assigned_memory(&mut self, n: usize) {
@@ -152,6 +159,15 @@ impl EgtGenerator {
     }
 
     pub fn generate(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
+        self.generate_impl(endgame, false)
+    }
+
+    /// Recursive dependencies reuse the explicitly installed solver pool.
+    pub(crate) fn generate_in_pool(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
+        self.generate_impl(endgame, true)
+    }
+
+    fn generate_impl(&self, endgame: &str, in_pool: bool) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {:?}", endgame, self.base_path);
 
@@ -161,12 +177,19 @@ impl EgtGenerator {
         //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = crate::retrograde::retrograde_analysis(
-            &self.base_path,
-            endgame,
-            self.input_path.as_deref(),
-            self.generate_deps,
-        )?;
+        let (mut file_a, mut file_b) = if in_pool {
+            crate::retrograde::retrograde_analysis_in_pool(
+                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps,
+            )?
+        } else if self.threads == 1 {
+            crate::retrograde::retrograde_analysis(
+                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps,
+            )?
+        } else {
+            crate::retrograde::retrograde_analysis_with_threads(
+                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps, self.threads,
+            )?
+        };
 
         // Retrograde analysis has already assembled and published the files.
         let bytes_a = std::fs::metadata(&file_a.path)?.len();

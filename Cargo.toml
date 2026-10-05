@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rayon = "1.11"
 zeekstd = "0.6.2"
 clap = { version = "4.4", features = ["derive"] }
 shakmaty = { git = "https://github.com/gr-g/shakmaty.git", branch = "main" }

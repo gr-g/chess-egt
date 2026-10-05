@@ -9,9 +9,10 @@ It builds on [`algorithms_comparison.md`](algorithms_comparison.md), in
 particular the single-threaded measurements of the counters and sweep core
 loops in its Section 2.A.
 
-**Status:** Steps 1-3 are implemented; later steps remain a roadmap. Historical
-Step 1/2 validation and measurements are recorded below. Step 3 reference
-validation and performance measurements remain open. Sizes are computed from
+**Status:** Steps 1-4 are implemented; later steps remain a roadmap. Historical
+Step 1/2 validation and measurements are recorded below. Step 3 is reference-validated
+on the sets listed below; its remaining sample measurements are still open.
+Step 4 correctness checks and initial scaling measurements are recorded below. Sizes are computed from
 the current indexing scheme. Compute estimates are extrapolated from the
 measured 4- and 5-piece generation times in `AGENTS.md` and should be treated as orders of magnitude.
 
@@ -355,7 +356,7 @@ sparse and repeated. Retrograde unmoves instead hit the whole working set at
 scattered locations, making frame-cache lookup and eviction inappropriate for
 **the tables being solved**.
 
-The solver now uses flat `Vec<MaybeDtcOutcome>` arrays for the active pair,
+The solver now uses flat `Vec<AtomicU16>` arrays for the active pair,
 separate from `EgtFile`. Finalized tables are compressed into one spool per
 output file, so solved pairs do not accumulate as uncompressed file frames.
 Working memory is one pair plus the dependency cache, index metadata, local
@@ -363,8 +364,8 @@ summaries, statistics, and compression/I/O buffers. Recursive dependency
 generation is an exception: a parent pair can remain allocated while a
 dependency is solved.
 
-Atomic working values for shared-memory parallelism and memory-mapped arrays
-for out-of-core runs remain future options.
+Atomic working values for shared-memory parallelism are implemented in Step 4.
+Memory-mapped arrays for out-of-core runs remain a future option.
 
 ### 6.2 A generation-specific index layout (larger lever, needs measurement)
 
@@ -505,14 +506,68 @@ remain unchanged; they do not establish Step 3 validation.
 
 ### Step 4: multi-threading (`rayon`)
 
-- Atomic implementation of the update sink (CAS on `AtomicU16`). Parallel
-  scans over chunks.
-- Parallel initialization (embarrassingly parallel; the dependency cache must
-  become shareable or be per thread).
-- **Acceptance:** byte-identical output. Measure scaling on a large 5-piece
-  table (e.g. 1, 2, 4 threads). Note that the local environment runs under
-  Xen virtualization and CPUs are virtual, so multithreaded measurements might
-  not be very reliable beyond 2 threads.
+- **Status: implemented and byte-reference-validated on all 3/4-piece endgames
+  at 1, 2, and 4 threads, and against the previous serial binary on `KQB_KQ`.**
+- `--threads N` / `EgtGenerator::with_threads(N)` selects a dedicated Rayon pool;
+  the default remains one thread. Zero is rejected. Pairs are solved serially,
+  using the same pool throughout an endgame. Recursive dependency generation
+  explicitly reuses that pool rather than constructing nested pools.
+- Working values are `AtomicU16`. `mark_win` and `decrement` use CAS loops over
+  the entire encoded value. A win can upgrade its same-ply conversion preference;
+  only the successful unknown-to-resolved transition increments the task-local
+  count. Decrements are applied once per emitted edge, without unconditional
+  subtraction from a value that may already be resolved.
+- Parallel scans use the existing 4096-position summary blocks and reduce local
+  counts after joining. Source tables remain sequential within each phase. The
+  joins preserve W, then L(Checkmate), L(Capture), L(Promotion), then next-ply
+  ordering. Self-twins retain one array. Scans snapshot matches per block;
+  writes at ply `p` cannot change matches selected at `p - 1`.
+- `PlySummary` uses atomic maxima and retains conservative `last_ply >= scanned_ply`
+  filtering. A load guard avoids unnecessary RMWs when a block is already stamped.
+  Working-value and summary operations use relaxed atomics: outcomes have no
+  separately published payload, and Rayon joins synchronize successive phases.
+- Initialization assigns disjoint mutable chunks to tasks, writing through
+  exclusive atomic access rather than CAS. Dependency files and decompressed
+  frames are shared, not duplicated per thread. A read/write-locked registry
+  gives warm lookups concurrent access; each dependency file has its own
+  read/write lock. Warm frame probes use read access; cold probes release it and
+  acquire write access, rechecking the frame before loading. Initial file loads
+  are serialized under the registry write lock; cold frame loads serialize only
+  within the affected file. Finer-grained frame synchronization remains optional.
+- Workers only load existing dependencies. If an encountered dependency is missing,
+  all initialization tasks join, warmed files return to `DependencyCache`, and the
+  coordinator generates it if enabled. Initialization then retries with reset
+  values and counts. This preserves lazy dependency requirements without a
+  conservative preflight requiring unused files. Cold recursive generation can
+  retain parent working arrays and caches, and repeated initialization has a cost;
+  production measurements below use existing dependencies.
+- Finalization consumes atomic arrays into plain outcomes one table at a time.
+  Statistics, compression, staging, assembly, verification, and JSON generation
+  remain serial and deterministic. No unsafe array reinterpretation is used.
+- **Validation:** `cargo test --release` passes 54 tests, including concurrent CAS
+  contention, concurrent summary maxima, ordered loss-conversion phases,
+  multi-block self-twin scans, cached/shared dependency probing, dependency
+  failure/recovery, zero-thread rejection, and 1-vs-4-thread output/statistics equality. All **132
+  `.ggegt`/`.json` files** from generation of all 3/4-piece endgames match the
+  current-format references in `~/tablebases` at each of 1, 2, and 4 threads.
+  Generation-only elapsed times were 350.3 s, 232.4 s, and 186.6 s respectively.
+- **Initial scaling measurement:** sequential runs of `KQB_KQ` (both orientations),
+  existing dependencies, `--noverify`, same release codegen and compression:
+
+  | Implementation | Initialization | Propagation | Finalization | Wall time | Peak RSS |
+  |---|---:|---:|---:|---:|---:|
+  | Previous serial binary | 84.123 s | 253.543 s | 77.645 s | 415.409 s | 496.7 MiB |
+  | New, 1 thread | 81.250 s | 265.565 s | 77.653 s | 424.565 s | 496.7 MiB |
+  | New, 2 threads | 45.494 s | 142.321 s | 78.114 s | 266.051 s | 498.0 MiB |
+  | New, 4 threads | 32.966 s | 104.096 s | 77.565 s | 214.647 s | 501.1 MiB |
+
+  All four output files are byte-identical across these runs. One-thread overhead
+  is 2.2%; end-to-end speedup against the previous binary is 1.56x / 1.94x at
+  2 / 4 threads. Serial finalization limits end-to-end scaling. Peak RSS was
+  measured with Linux `wait4`; wall time with a monotonic clock. These are single
+  runs on Xen virtual CPUs, not bare-metal scaling guarantees. Repeated runs,
+  deep/thin-frontier and dependency-heavy 5-piece samples, and 6-piece scaling
+  remain open.
 
 ### Step 5: pawn-rank slicing
 

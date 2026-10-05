@@ -1,6 +1,7 @@
 use std::collections::{HashMap, BTreeMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
@@ -220,6 +221,92 @@ pub struct EgtFile {
     pub stats: Option<EgtFileStats>,
 }
 
+/// Shared dependency files for parallel initialization, without recursive generation.
+///
+/// Move the coordinator's resolved cache here and borrow this reader from scoped
+/// workers. On `DependencyUnavailable`, join all workers, recover the cache with
+/// `into_cache`, resolve the dependency through `DependencyCache`, and retry.
+/// Frames are shared, not copied per worker; no eviction is performed.
+#[derive(Debug)]
+pub(crate) struct SharedDependencyReader {
+    files: RwLock<HashMap<String, Arc<RwLock<EgtFile>>>>,
+    base_path: PathBuf,
+    input_path: Option<PathBuf>,
+}
+
+impl SharedDependencyReader {
+    pub(crate) fn new(
+        files: HashMap<String, EgtFile>,
+        base_path: &Path,
+        input_path: Option<&Path>,
+    ) -> Self {
+        Self {
+            files: RwLock::new(files.into_iter()
+                .map(|(name, file)| (name, Arc::new(RwLock::new(file))))
+                .collect()),
+            base_path: base_path.to_path_buf(),
+            input_path: input_path.map(Path::to_path_buf),
+        }
+    }
+
+    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
+        let endgame = crate::get_endgame(position);
+        let cached_file = {
+            let files = self.files.read()
+                .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
+            files.get(&endgame).map(Arc::clone)
+        };
+        let file = if let Some(file) = cached_file {
+            file
+        } else {
+            let mut files = self.files.write()
+                .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
+            // Recheck after releasing the read lock: another worker may have loaded it.
+            if !files.contains_key(&endgame) {
+                // Serialize loading so racing workers never allocate duplicate files.
+                // This only reads existing files: generation must stay on the coordinator.
+                let file = crate::load_existing_file(
+                    &self.base_path, self.input_path.as_deref(), &endgame,
+                ).map_err(|source| match source {
+                    EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
+                        dependency: endgame.clone(),
+                        source: Box::new(source),
+                    },
+                    other => other,
+                })?;
+                files.insert(endgame.clone(), Arc::new(RwLock::new(file)));
+            }
+            Arc::clone(files.get(&endgame)
+                .ok_or(EgtError::Internal("dependency registry entry missing after insert"))?)
+        };
+        {
+            let reader = file.read()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            if let Some(outcome) = reader.probe_cached(position)? {
+                return Ok(outcome);
+            }
+        }
+        // Release the read guard before acquiring the write guard. `probe` checks
+        // the frame state again, so another worker may already have warmed it.
+        let mut writer = file.write()
+            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+        writer.probe(position)
+    }
+
+    /// Recovers owned files, including frames warmed by workers, after they join.
+    pub(crate) fn into_cache(self) -> EgtResult<HashMap<String, EgtFile>> {
+        let files = self.files.into_inner()
+            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
+        files.into_iter().map(|(name, file)| {
+            let file = Arc::try_unwrap(file)
+                .map_err(|_| EgtError::Internal("dependency file still shared"))?
+                .into_inner()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            Ok((name, file))
+        }).collect()
+    }
+}
+
 impl EgtFile {
     /// Creates a new EgtFile for a given piece configuration and path.
     ///
@@ -322,6 +409,20 @@ impl EgtFile {
     pub fn probe(&mut self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
         let index = self.map_position_to_index(position)?;
         self.read_from_index(index)
+    }
+
+    /// Probes without allocating, decompressing, or reading from disk.
+    /// `None` means the frame is cold, not that the outcome is invalid/unknown.
+    pub(crate) fn probe_cached(&self, position: &Chess) -> EgtResult<Option<MaybeDtcOutcome>> {
+        let index = self.map_position_to_index(position)?;
+        if index >= self.index_range {
+            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
+        }
+        let (frame_idx, offset) = self.locate_frame(index);
+        match &self.frames[frame_idx] {
+            FrameState::Uncompressed { uncompressed, .. } => Ok(Some(uncompressed[offset])),
+            _ => Ok(None),
+        }
     }
 
     /// Save the entire EgtFile using seekable Zstd compression.
@@ -805,6 +906,94 @@ mod tests {
     use super::*;
     use shakmaty::fen::Fen;
     use shakmaty::Color;
+
+    #[test]
+    fn cached_probe_does_not_warm_frames() {
+        let dir = crate::TestDir::new("cached_probe_does_not_warm_frames");
+        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
+            .into_position(CastlingMode::Standard).unwrap();
+        assert_eq!(file.probe_cached(&position).unwrap(), None);
+        assert!(file.frames.iter().all(|frame| matches!(frame, FrameState::Empty)));
+        let index = file.map_position_to_index(&position).unwrap();
+        for outcome in [MaybeDtcOutcome::INVALID, MaybeDtcOutcome::new_unknown(3), MaybeDtcOutcome::DRAW] {
+            file.write_to_index(index, outcome).unwrap();
+            assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
+        }
+        file.ensure_compressed(file.locate_frame(index).0).unwrap();
+        assert_eq!(file.probe_cached(&position).unwrap(), None);
+        assert_eq!(file.probe(&position).unwrap(), MaybeDtcOutcome::DRAW);
+        file.save_to_file().unwrap();
+        assert_eq!(file.probe_cached(&position).unwrap(), None);
+    }
+
+    #[test]
+    fn shared_dependency_cold_and_warm_probes() {
+        let base = crate::TestDir::new("shared_dependency_base");
+        let input = crate::TestDir::new("shared_dependency_input");
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
+            .into_position(CastlingMode::Standard).unwrap();
+        let outcome = MaybeDtcOutcome::new_win(ConversionType::Promotion, 7);
+        // Distinct values verify that lazy loading honors input-path precedence.
+        for (path, value) in [(&base.0, MaybeDtcOutcome::DRAW), (&input.0, outcome)] {
+            let mut file = EgtFile::new(path, "KP_K").unwrap();
+            file.write_to_index(file.map_position_to_index(&position).unwrap(), value).unwrap();
+            file.save_to_file().unwrap();
+        }
+        for preloaded in [false, true] {
+            let mut files = HashMap::new();
+            if preloaded {
+                files.insert("KP_K".to_string(), EgtFile::new_from_file(&input.0, "KP_K").unwrap());
+            }
+            let reader = SharedDependencyReader::new(files, &base.0, Some(&input.0));
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let reader = &reader;
+                    let position = &position;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..20 {
+                            assert_eq!(reader.probe(position).unwrap(), outcome);
+                        }
+                    });
+                }
+            });
+            // A warm probe needs only shared guards for both registry and file.
+            let registry_guard = reader.files.read().unwrap();
+            let file = Arc::clone(registry_guard.get("KP_K").unwrap());
+            let guard = file.read().unwrap();
+            assert_eq!(reader.probe(&position).unwrap(), outcome);
+            drop(guard);
+            drop(file);
+            drop(registry_guard);
+            let cache = reader.into_cache().unwrap();
+            assert_eq!(cache.len(), 1);
+            let file = &cache["KP_K"];
+            assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
+            assert_eq!(file.frames.iter().filter(|frame| matches!(frame, FrameState::Uncompressed { .. })).count(), 1);
+        }
+    }
+
+    #[test]
+    fn shared_dependency_missing_can_be_resolved_by_coordinator() {
+        let dir = crate::TestDir::new("shared_dependency_missing");
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
+            .into_position(CastlingMode::Standard).unwrap();
+        let reader = SharedDependencyReader::new(HashMap::new(), &dir.0, None);
+        assert!(matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
+            dependency, source,
+        }) if dependency == "KP_K" && matches!(*source, EgtError::FileNotFound(_))));
+        assert!(!dir.0.join("KP_K.ggegt").exists());
+        let mut cache = reader.into_cache().unwrap();
+        assert!(cache.is_empty());
+        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        file.write_to_index(file.map_position_to_index(&position).unwrap(), MaybeDtcOutcome::DRAW).unwrap();
+        cache.insert("KP_K".to_string(), file);
+        let reader = SharedDependencyReader::new(cache, &dir.0, None);
+        assert_eq!(reader.probe(&position).unwrap(), MaybeDtcOutcome::DRAW);
+    }
 
     #[test]
     fn test_parse_endgame_name() {
