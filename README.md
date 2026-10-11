@@ -5,13 +5,37 @@ Goals:
  - Provide tablebases with the Depth to Conversion (DTC) metric, particularly suitable for applications such as practicing endgames against the computer.
  - Provide a clean, readable Rust codebase that people interested in generating chess tablebase can understand, modify and use in other projects, even if performance is not super-optimized as in the state-of-the-art [Syzygy](https://www.chessprogramming.org/Syzygy_Bases) code.
 
+# Usage
+
+```sh
+# Generate tables locally.
+cargo run --release -- --path ./tablebases --generate-all-3
+
+# Generate locally using an existing local dependency set.
+cargo run --release -- --path ./tablebases --generate-all-4
+
+# Generate locally using dependencies from an AWS S3 bucket
+# (requires specific environment variables with connection info - see
+# [https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html])
+cargo run --release -- --path ./tablebases --input-path s3://ggegt/ --generate-all-4
+
+# Probe a table.
+cargo run --release -- --path ./tablebases '8/8/8/8/8/2K5/4Q3/7k w - - 0 1'
+```
+
+Run the test suite with:
+
+```sh
+cargo test --release
+```
+
 # Design Specifications
 
 ## 1. High-Level Architecture
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt` & `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFile`)**: Manages the physical files on disk, seekable Zstd compression/decompression, and the in-memory frame cache.
+3. **Storage & Memory Layer (`EgtFile`, `EgtFileWriter`)**: Manages local/cloud objects through `object_store`, seekable Zstd compression/decompression, in-memory compressed sub-tables, buffered publication, and the in-memory frame cache.
 4. **Retrograde Analysis** (`RetrogradeSolver`): The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
@@ -59,30 +83,31 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
      $$\text{local\_index} = \text{index\_offset} + \text{aggregated\_combinations}$$
 
 ### 3.2 `EgtFile` Composition
-An `EgtFile` represents a physical file on disk, storing the outcomes for a specific combination of pieces on the board (e.g., `KP_K`) and is composed of multiple `Egt` objects (e.g., `KPa_K`, `KPb_K`, `KPc_K`, `KPd_K`).
+An `EgtFile` represents a stored `.ggegt` object (local or cloud), storing the outcomes for a specific combination of pieces on the board (e.g., `KP_K`) and is composed of multiple `Egt` objects (e.g., `KPa_K`, `KPb_K`, `KPc_K`, `KPd_K`).
 - The `EgtFile` maps its global index space sequentially to the constituent `Egt` objects.
 - The global index is computed as:
   $$\text{global\_index} = \text{egt\_offset} + \text{local\_index}$$
   where $\text{egt\_offset}$ is the sum of the index ranges of all preceding `Egt` objects in a stable order.
 
 ## 4. File Format & Compression
-On disk, an `EgtFile` is compressed using a seekable Zstd format (via the `zeekstd` library).
+An `EgtFile` is stored using a seekable Zstd format (via the `zeekstd` library).
 - Files use **table-aligned frames** of at most `256 * 1024` positions. Frames never cross an `Egt` boundary.
 - Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the table lengths and validates it against the seek table.
-
+- Seek tables are checksum-free: `17 + 8 * num_frames` bytes. Checksum-bearing seek tables are not supported. The footer frame count is checked before parsing to bound allocation; compressed and decompressed lengths are also validated.
+- Readers cache the seek table and fetch one compressed range per cold frame.
 Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
 1. First: the low byte of all $N$ outcomes ($N$ bytes).
 2. Second: the high byte of all $N$ outcomes, skipping the (unused) high byte for invalid and drawn positions (max $N$ bytes).
 
 The transposed buffer is always exactly `2 * N` bytes: high bytes for non-invalid, non-drawn outcomes are packed after the low bytes, and the unused tail remains zero.
 
-During generation, each finalized table is compressed into one temporary spool per output file. Final assembly copies the compressed table segments in stable `Egt` order without recompression and appends one final seek table.
+During generation, each finalized sub-table is compressed and retained in memory for its output file. Publication streams the compressed segments in stable `Egt` order without recompression and appends one final seek table through the `object_store` buffered writer. SHA-256 covers these exact published bytes.
 
 ## 5. Memory Management
 
-Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved. Once finalized, each table is converted to plain outcomes and compressed into the output spools, releasing its working array. Working memory is one pair plus the shared dependency cache, indexing metadata, summaries, statistics, and compression/I/O buffers; safe final conversion may temporarily allocate an additional plain table. Recursive dependency generation can retain a parent pair and its cache.
+Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved. Once finalized, each table is converted to plain outcomes and compressed in memory, releasing its working array. Working memory is one pair plus **accumulated compressed output**, the shared dependency cache, indexing metadata, summaries, statistics, and compression/I/O buffers; safe final conversion may temporarily allocate an additional plain table. Compressed output grows as sub-tables are finalized and remains resident until publication, so memory is not bounded by the active pair alone. Recursive dependency generation can retain a parent pair, its compressed output, and its cache.
 
-`retrograde_analysis` assembles and publishes its output files before returning. Each file is published by an atomic rename, but publication of the two files is not transactional: failure between renames can leave only one output updated.
+`retrograde_analysis` publishes its in-memory compressed output through `object_store` before returning. The buffered uploader bounds in-flight upload concurrency, but does not remove the memory cost of accumulated compressed sub-tables.
 
 ### 5.1 Frame States
 Each frame in an `EgtFile` can be in one of three states:

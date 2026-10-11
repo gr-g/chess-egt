@@ -47,7 +47,7 @@ Size on disk: 3592.53MiB (1.16 bits/pos on average, lowest compression for KBB_K
 =============================================================================================
 
 ## TODO
-- Parallelization: see the roadmap in `scaling_and_parallelization.md` (Step 1 is done).
+- Parallelization: see the roadmap in `scaling_and_parallelization.md`.
 - Use `object_store` crate to use cloud storage in addition to local filesystem.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
 - Visibility and public interface.

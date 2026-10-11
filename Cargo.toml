@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 rayon = "1.11"
 zeekstd = "0.6.2"
+zstd-safe = { version = "7.2.4", features = ["std"] }
 clap = { version = "4.4", features = ["derive"] }
 shakmaty = { git = "https://github.com/gr-g/shakmaty.git", branch = "main" }
 arrayvec = "0.7"
@@ -13,6 +14,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
+object_store = { version = "0.14.2", features = ["aws", "azure", "gcp", "http"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }
+url = "2"
+bytes = "1"
 
 [[bin]]
 name = "chess-egt"

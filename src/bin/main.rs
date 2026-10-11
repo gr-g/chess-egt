@@ -58,23 +58,26 @@ fn run() -> Result<(), EgtError> {
     let cli = Cli::parse();
 
     if let Some(ref endgame) = cli.generate {
-        let mut g = EgtGenerator::new(&cli.path);
-        configure_generator(&mut g, &cli);
+        let mut g = EgtGenerator::new(&cli.path)?;
+        configure_generator(&mut g, &cli)?;
         g.generate(endgame)?;
     } else if cli.generate_all_3 {
-        let mut g = EgtGenerator::new(&cli.path);
-        configure_generator(&mut g, &cli);
+        let mut g = EgtGenerator::new(&cli.path)?;
+        configure_generator(&mut g, &cli)?;
         g.generate("K_K")?;
-        generate_all(3, &cli);
+        generate_all(3, &cli)?;
     } else if cli.generate_all_4 {
-        generate_all(4, &cli);
+        generate_all(4, &cli)?;
     } else if cli.generate_all_5 {
-        generate_all(5, &cli);
+        generate_all(5, &cli)?;
     } else if let Some(fen) = cli.position {
         let fen_obj: Fen = fen.parse().map_err(|e| EgtError::InvalidPosition(format!("invalid FEN: {e:?}")))?;
         let position = fen_obj.into_position(CastlingMode::Standard)
             .map_err(|e| EgtError::InvalidPosition(format!("invalid position: {e:?}")))?;
-        let mut prober = EgtProber::new(&cli.path);
+        let mut prober = EgtProber::new(&cli.path)?;
+        if let Some(ref input) = cli.input_path {
+            prober.with_input_path(input)?;
+        }
         let outcome = prober.probe(&position)?;
 
         let message = match outcome {
@@ -119,27 +122,22 @@ fn run() -> Result<(), EgtError> {
     Ok(())
 }
 
-fn configure_generator(g: &mut EgtGenerator, cli: &Cli) {
+fn configure_generator(g: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
     g.with_threads(usize::from(cli.threads));
     if let Some(ref input) = cli.input_path {
-        g.with_input_path(input.clone());
+        g.with_input_path(input)?;
     }
     g.with_generate_deps(cli.generate_deps);
     g.with_verify(!cli.noverify);
+    Ok(())
 }
 
-fn generate_all(n: usize, cli: &Cli) {
+fn generate_all(n: usize, cli: &Cli) -> Result<(), EgtError> {
     let path = &cli.path;
     println!("Generating all {}-pieces endgames...", n);
-    let endgames = match EgtGenerator::list_n_pieces_endgames(n) {
-        Ok(e) => e,
-        Err(e) => {
-            println!("Failed to list {}-pieces endgames: {}", n, e);
-            return;
-        }
-    };
-    let mut g = EgtGenerator::new(path);
-    configure_generator(&mut g, cli);
+    let endgames = EgtGenerator::list_n_pieces_endgames(n)?;
+    let mut g = EgtGenerator::new(path)?;
+    configure_generator(&mut g, cli)?;
     let start_all = std::time::Instant::now();
     let mut unique_positions = 0;
     let mut total_bytes = 0;
@@ -170,6 +168,7 @@ fn generate_all(n: usize, cli: &Cli) {
             }
             Err(e) => {
                 println!("Failed to generate endgame {}: {}", endgame, e);
+                return Err(e);
             }
         }
     }
@@ -199,4 +198,5 @@ fn generate_all(n: usize, cli: &Cli) {
         println!("Size on disk: {:.2}MiB ({:.2} bits/pos on average).", size_mb, avg_bits_per_pos);
     }
     println!("=============================================================================================");
+    Ok(())
 }

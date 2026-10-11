@@ -1,6 +1,5 @@
 //! Error types for the chess-egt library.
 
-use std::path::PathBuf;
 
 /// A specialized result type for chess-egt operations.
 pub type EgtResult<T> = Result<T, EgtError>;
@@ -39,7 +38,17 @@ pub enum EgtError {
 
     /// A file expected to exist was not found.
     #[error("egt file not found: {0}")]
-    FileNotFound(PathBuf),
+    FileNotFound(String),
+
+        #[error("invalid storage location: {0}")]
+        InvalidStorageLocation(String),
+
+        #[error("storage operation failed for {location}: {source}")]
+        Storage {
+            location: String,
+            #[source]
+            source: object_store::Error,
+        },
 
     /// A consistency check failed during verification.
     #[error("consistency check failed for {endgame:?} at index {index}: {reason}")]

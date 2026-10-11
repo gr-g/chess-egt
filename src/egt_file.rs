@@ -1,6 +1,10 @@
 use std::collections::{HashMap, BTreeMap};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
+use crate::storage::{Location, block_on};
 use std::sync::{Arc, RwLock};
 use shakmaty::{CastlingMode, Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
@@ -192,8 +196,9 @@ pub struct EgtFile {
     /// The name of this endgame file (e.g. "KQ_KP").
     pub endgame: String,
 
-    /// Path to the file.
-    pub path: PathBuf,
+    pub(crate) location: Location,
+    pub(crate) key: ObjectPath,
+    seek_table: Option<zeekstd::SeekTable>,
 
     /// The sub-tables (Egt objects) that compose this file.
     pub egts: Vec<Egt>,
@@ -230,22 +235,22 @@ pub struct EgtFile {
 #[derive(Debug)]
 pub(crate) struct SharedDependencyReader {
     files: RwLock<HashMap<String, Arc<RwLock<EgtFile>>>>,
-    base_path: PathBuf,
-    input_path: Option<PathBuf>,
+    base_path: Location,
+    input_path: Option<Location>,
 }
 
 impl SharedDependencyReader {
     pub(crate) fn new(
         files: HashMap<String, EgtFile>,
-        base_path: &Path,
-        input_path: Option<&Path>,
+        base_path: &Location,
+        input_path: Option<&Location>,
     ) -> Self {
         Self {
             files: RwLock::new(files.into_iter()
                 .map(|(name, file)| (name, Arc::new(RwLock::new(file))))
                 .collect()),
-            base_path: base_path.to_path_buf(),
-            input_path: input_path.map(Path::to_path_buf),
+            base_path: base_path.clone(),
+            input_path: input_path.cloned(),
         }
     }
 
@@ -266,7 +271,7 @@ impl SharedDependencyReader {
                 // Serialize loading so racing workers never allocate duplicate files.
                 // This only reads existing files: generation must stay on the coordinator.
                 let file = crate::load_existing_file(
-                    &self.base_path, self.input_path.as_deref(), &endgame,
+                    &self.base_path, self.input_path.as_ref(), &endgame,
                 ).map_err(|source| match source {
                     EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
                         dependency: endgame.clone(),
@@ -312,7 +317,10 @@ impl EgtFile {
     ///
     /// The file starts with no memory allocated.
     pub fn new(base_path: &Path, endgame: &str) -> EgtResult<Self> {
-        let path = base_path.join(format!("{}.ggegt", endgame));
+        Self::new_in(&Location::parse(base_path)?, endgame)
+    }
+
+    pub(crate) fn new_in(location: &Location, endgame: &str) -> EgtResult<Self> {
 
         let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name(endgame)?;
 
@@ -366,7 +374,9 @@ impl EgtFile {
 
         Ok(Self {
             endgame: endgame.to_string(),
-            path,
+            location: location.clone(),
+            key: location.prefix.clone().join(format!("{}.ggegt", endgame)),
+            seek_table: None,
             egts,
             egt_map,
             egt_offsets,
@@ -380,25 +390,59 @@ impl EgtFile {
 
     /// Creates an EgtFile representing an existing file.
     ///
-    /// The file starts with no memory allocated. Data is read from the file on demand.
+    /// Data is read on demand. The object must not be replaced while this reader
+    /// is in use; reads are not pinned to an object version.
     pub fn new_from_file(base_path: &Path, endgame: &str) -> EgtResult<Self> {
-        let mut egt_file = Self::new(base_path, endgame)?;
-        if !std::fs::exists(&egt_file.path)? {
-            return Err(EgtError::FileNotFound(egt_file.path));
-        }
+        Self::open_in(&Location::parse(base_path)?, endgame)
+    }
 
-        let mut source = std::fs::File::open(&egt_file.path)?;
-        let seek_table = zeekstd::SeekTable::from_seekable(&mut source)?;
-        if seek_table.num_frames() as usize != egt_file.num_frames() {
+    pub(crate) fn open_in(location: &Location, endgame: &str) -> EgtResult<Self> {
+        let mut file = Self::new_in(location, endgame)?;
+        file.load_seek_table()?;
+        file.frames.fill(FrameState::CompressedOnFile);
+        Ok(file)
+    }
+
+    fn load_seek_table(&mut self) -> EgtResult<()> {
+        // Our checksum-free seek tables have 8-byte entries and 17 bytes of framing.
+        let table_size = 17 + 8 * self.num_frames() as u64;
+        let options = GetOptions::new().with_range(Some(GetRange::Suffix(table_size)));
+        let result = block_on(self.location.store.get_opts(&self.key, options))
+            .map_err(|error| self.location.error(&self.key, error))?;
+        let table_start = result.range.start;
+        let bytes = block_on(result.bytes())
+            .map_err(|error| self.location.error(&self.key, error))?;
+        if bytes.len() as u64 != table_size {
+            return Err(EgtError::Internal("truncated tablebase seek table"));
+        }
+        // zeekstd allocates from the footer count before checking the source length.
+        let count = u32::from_le_bytes(bytes[bytes.len() - 9..bytes.len() - 5].try_into().unwrap());
+        if count as usize != self.num_frames() {
             return Err(EgtError::Internal("invalid tablebase frame count"));
         }
-        for (frame_idx, frame) in egt_file.frame_layout.iter().enumerate() {
-            if seek_table.frame_size_decomp(frame_idx as u32)? != (frame.len * 2) as u64 {
+        let mut source = zeekstd::BytesWrapper::new(&bytes);
+        let table = zeekstd::SeekTable::from_seekable(&mut source)?;
+        if table.size_comp() != table_start {
+            return Err(EgtError::Internal("invalid tablebase compressed length"));
+        }
+        for (index, frame) in self.frame_layout.iter().enumerate() {
+            if table.frame_size_decomp(index as u32)? != (frame.len * 2) as u64
+                || table.frame_size_comp(index as u32)? == 0
+            {
                 return Err(EgtError::Internal("invalid tablebase frame length"));
             }
         }
-        egt_file.frames.fill(FrameState::CompressedOnFile);
-        Ok(egt_file)
+        self.seek_table = Some(table);
+        Ok(())
+    }
+
+    pub(crate) fn save_stats(&self, stats: &EgtFileStats) -> EgtResult<()> {
+        self.location.ensure_writable()?;
+        let key = self.location.prefix.clone().join(format!("{}.json", self.endgame));
+        let json = serde_json::to_vec_pretty(stats)?;
+        block_on(self.location.store.put(&key, json.into()))
+            .map_err(|error| self.location.error(&key, error))?;
+        Ok(())
     }
 
     pub fn num_frames(&self) -> usize {
@@ -428,21 +472,18 @@ impl EgtFile {
     /// Save the entire EgtFile using seekable Zstd compression.
     ///
     /// Afterwards all frames are left in the `CompressedOnFile` state: the
-    /// in-memory data is released and re-read from `self.path` on demand.
+    /// in-memory data is released and re-read from the object on demand.
     pub fn save_to_file(&mut self) -> EgtResult<u64> {
-        use std::io::{BufWriter, Write};
+        use std::io::{Read, Write};
         use zeekstd::EncodeOptions;
-        use crate::egt_writer::{TemporaryFile, encode_frame};
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut temporary = TemporaryFile::new(&self.path, "save")?;
-        let mut writer = BufWriter::new(&mut temporary.file);
+        use crate::egt_writer::{encode_frame, publish_buffers};
+        self.location.ensure_writable()?;
+        let mut compressed = Vec::new();
         let mut encoder = EncodeOptions::new()
             .compression_level(DEFAULT_COMPRESSION_LEVEL)
-            .into_encoder(&mut writer)?;
+            .into_encoder(&mut compressed)?;
 
-        // Use a separate destination so disk-backed input frames remain readable.
+        // Complete encoding before publication so disk-backed input stays readable.
         for frame_idx in 0..self.frames.len() {
             self.ensure_uncompressed(frame_idx)?;
 
@@ -457,11 +498,11 @@ impl EgtFile {
 
         encoder.flush()?;
         let table = encoder.into_seek_table();
-        std::io::copy(&mut table.into_serializer(), &mut writer)?;
-        writer.flush()?;
-        drop(writer);
-        let bytes = temporary.file.metadata()?.len();
-        std::fs::rename(&temporary.path, &self.path)?;
+        table.into_serializer().read_to_end(&mut compressed)?;
+        let (bytes, _) = publish_buffers(
+            &self.location, &self.key, std::iter::once(compressed.into()),
+        )?;
+        self.load_seek_table()?;
         self.frames.fill(FrameState::CompressedOnFile);
         Ok(bytes)
     }
@@ -606,50 +647,30 @@ impl EgtFile {
                 Ok(())
             },
             FrameState::CompressedOnFile => {
-                // Load compressed data from file
-                let file = std::fs::File::open(&self.path).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        EgtError::FileNotFound(self.path.clone())
-                    } else {
-                        EgtError::Io(e)
-                    }
-                })?;
-                let mut decoder = zeekstd::Decoder::new(file)?;
-                let mut transposed = vec![0u8; frame.len * 2];
-
-                let uncompressed_offset = (frame.start as u64) * 2;
-                decoder.seek(SeekFrom::Start(uncompressed_offset))?;
-                decoder.read_exact(&mut transposed)?;
-
-                // Detranspose the frame
-                // TODO: allocate memory from arena
-                let uncompressed = detranspose_frame(&transposed, frame.len);
-
+                let table = self.seek_table.as_ref()
+                    .ok_or(EgtError::Internal("missing tablebase seek table"))?;
+                let range = table.frame_start_comp(frame_idx as u32)?
+                    ..table.frame_end_comp(frame_idx as u32)?;
+                let length = range.end - range.start;
+                let compressed = block_on(self.location.store.get_range(&self.key, range))
+                    .map_err(|error| self.location.error(&self.key, error))?;
+                if compressed.len() as u64 != length {
+                    return Err(EgtError::Internal("truncated tablebase range"));
+                }
+                let uncompressed = decode_frame(&compressed, frame.len)?;
                 self.frames[frame_idx] = FrameState::Uncompressed {
                     compressed: vec![],
                     uncompressed,
-                    dirty: true,
+                    dirty: false,
                 };
                 Ok(())
             },
             FrameState::Compressed(compressed_bytes) => {
-                // TODO: Allocate memory from arena
-                let mut transposed = vec![0u8; frame.len * 2];
-
-                // Decompress from memory
-                use zeekstd::{BytesWrapper, Decoder};
-
-                let wrapper = BytesWrapper::new(compressed_bytes);
-                let mut decoder = Decoder::new(wrapper)?;
-                decoder.read_exact(&mut transposed)?;
-
-                // Detranspose the frame
-                let uncompressed = detranspose_frame(&transposed, frame.len);
-
+                let uncompressed = decode_frame(compressed_bytes, frame.len)?;
                 self.frames[frame_idx] = FrameState::Uncompressed {
-                    compressed: vec![],
+                    compressed: compressed_bytes.clone(),
                     uncompressed,
-                    dirty: true,
+                    dirty: false,
                 };
                 Ok(())
             },
@@ -680,7 +701,11 @@ impl EgtFile {
                     let mut temp = FrameState::Empty;
                     std::mem::swap(&mut self.frames[frame_idx], &mut temp);
                     if let FrameState::Uncompressed { compressed, .. } = temp {
-                        self.frames[frame_idx] = FrameState::Compressed(compressed);
+                        self.frames[frame_idx] = if compressed.is_empty() {
+                            FrameState::CompressedOnFile
+                        } else {
+                            FrameState::Compressed(compressed)
+                        };
                     }
                 } else {
                     // Regenerate the compressed bytes
@@ -707,6 +732,21 @@ impl EgtFile {
             },
         }
     }
+}
+
+fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<MaybeDtcOutcome>> {
+    let mut transposed = vec![0; len * 2];
+    // One-shot decoding is bounded by both slices and rejects truncated input.
+    // zeekstd's streaming decoder can otherwise loop at premature EOF.
+    let decoded = zstd_safe::decompress(&mut transposed[..], compressed).map_err(|code| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("invalid compressed tablebase frame: {}", zstd_safe::get_error_name(code)))
+    })?;
+    if decoded != transposed.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            "decompressed tablebase frame has wrong length").into());
+    }
+    Ok(detranspose_frame(&transposed, len))
 }
 
 /// Transposes (bit-slices) a frame of `MaybeDtcOutcome` values using an 8-8
@@ -945,7 +985,8 @@ mod tests {
             if preloaded {
                 files.insert("KP_K".to_string(), EgtFile::new_from_file(&input.0, "KP_K").unwrap());
             }
-            let reader = SharedDependencyReader::new(files, &base.0, Some(&input.0));
+            let reader = SharedDependencyReader::new(files,
+                &Location::parse(&base.0).unwrap(), Some(&Location::parse(&input.0).unwrap()));
             let barrier = std::sync::Barrier::new(8);
             std::thread::scope(|scope| {
                 for _ in 0..8 {
@@ -981,7 +1022,7 @@ mod tests {
         let dir = crate::TestDir::new("shared_dependency_missing");
         let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
             .into_position(CastlingMode::Standard).unwrap();
-        let reader = SharedDependencyReader::new(HashMap::new(), &dir.0, None);
+        let reader = SharedDependencyReader::new(HashMap::new(), &Location::parse(&dir.0).unwrap(), None);
         assert!(matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
             dependency, source,
         }) if dependency == "KP_K" && matches!(*source, EgtError::FileNotFound(_))));
@@ -991,7 +1032,7 @@ mod tests {
         let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
         file.write_to_index(file.map_position_to_index(&position).unwrap(), MaybeDtcOutcome::DRAW).unwrap();
         cache.insert("KP_K".to_string(), file);
-        let reader = SharedDependencyReader::new(cache, &dir.0, None);
+        let reader = SharedDependencyReader::new(cache, &Location::parse(&dir.0).unwrap(), None);
         assert_eq!(reader.probe(&position).unwrap(), MaybeDtcOutcome::DRAW);
     }
 
@@ -1247,19 +1288,80 @@ mod tests {
         let dir = crate::TestDir::new("invalid_frame_layout");
         let file = EgtFile::new(&dir.0, "K_K").unwrap();
         for bytes in [0, 3, 922, 926, DEFAULT_FRAME_SIZE * 2, DEFAULT_FRAME_SIZE * 2 + 2] {
-            let output = std::fs::File::create(&file.path).unwrap();
+            let output = std::fs::File::create(dir.0.join("K_K.ggegt")).unwrap();
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
             encoder.compress(&vec![0; bytes]).unwrap();
             encoder.finish().unwrap();
             assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
         }
         // A correct payload with an extra empty frame has the wrong frame count.
-        let output = std::fs::File::create(&file.path).unwrap();
+        let output = std::fs::File::create(dir.0.join("K_K.ggegt")).unwrap();
         let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
         encoder.compress(&vec![0; file.index_range * 2]).unwrap();
         encoder.end_frame().unwrap();
         encoder.finish().unwrap();
         assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_seek_table_suffixes() {
+        let dir = crate::TestDir::new("malformed_seek_table_suffixes");
+        let path = dir.0.join("K_K.ggegt");
+        let mut file = EgtFile::new(&dir.0, "K_K").unwrap();
+        file.save_to_file().unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let table_start = valid.len() - 25;
+
+        for length in [0, 8, 9, 24] {
+            std::fs::write(&path, &valid[valid.len() - length..]).unwrap();
+            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+        }
+        // Reject the declared count before zeekstd can allocate from it.
+        let mut inflated = valid.clone();
+        let count_start = inflated.len() - 9;
+        inflated[count_start..count_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, inflated).unwrap();
+        assert!(matches!(EgtFile::new_from_file(&dir.0, "K_K"),
+            Err(EgtError::Internal("invalid tablebase frame count"))));
+
+        // zeekstd, rather than our loader, validates magic and reserved bits.
+        for offset in [valid.len() - 1, valid.len() - 5, table_start] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] ^= 0x04;
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+        }
+        let mut prefixed = vec![0];
+        prefixed.extend_from_slice(&valid);
+        std::fs::write(&path, prefixed).unwrap();
+        assert!(matches!(EgtFile::new_from_file(&dir.0, "K_K"),
+            Err(EgtError::Internal("invalid tablebase compressed length"))));
+
+        // The reader deliberately accepts only our checksum-free seek-table format.
+        let mut checksummed = valid.clone();
+        checksummed.splice(table_start + 16..table_start + 16, [0; 4]);
+        checksummed[table_start + 4..table_start + 8].copy_from_slice(&21u32.to_le_bytes());
+        let descriptor = checksummed.len() - 5;
+        checksummed[descriptor] |= 0x80;
+        std::fs::write(&path, checksummed).unwrap();
+        assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+
+        std::fs::write(&path, valid).unwrap();
+        EgtFile::new_from_file(&dir.0, "K_K").unwrap();
+    }
+
+    #[test]
+    fn rejects_short_frame_range() {
+        let dir = crate::TestDir::new("short_frame_range");
+        let path = dir.0.join("K_K.ggegt");
+        let mut file = EgtFile::new(&dir.0, "K_K").unwrap();
+        file.save_to_file().unwrap();
+        let mut reader = EgtFile::new_from_file(&dir.0, "K_K").unwrap();
+        let frame_end = reader.seek_table.as_ref().unwrap().frame_end_comp(0).unwrap();
+        std::fs::OpenOptions::new().write(true).open(path).unwrap()
+            .set_len(frame_end - 1).unwrap();
+        assert!(matches!(reader.read_from_index(0),
+            Err(EgtError::Internal("truncated tablebase range"))));
     }
 
     #[test]

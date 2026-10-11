@@ -1,73 +1,28 @@
-//! Stages finalized tables without retaining their uncompressed arrays.
+//! Retains compressed sub-tables in memory until publication in file order.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{Read, Write};
+
+use bytes::Bytes;
+use object_store::{buffered::BufWriter, path::Path as ObjectPath};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFile, MaybeDtcOutcome, transpose_frame};
 use crate::error::{EgtError, EgtResult};
+use crate::storage::{Location, block_on};
 
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) struct TemporaryFile {
-    pub(crate) path: PathBuf,
-    pub(crate) file: File,
+struct CompressedTable {
+    data: Bytes,
+    seek_table: zeekstd::SeekTable,
 }
 
-impl TemporaryFile {
-    pub(crate) fn new(destination: &Path, kind: &str) -> io::Result<Self> {
-        let parent = destination
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let name = destination.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename")
-        })?;
-        loop {
-            let mut temporary_name = name.to_os_string();
-            temporary_name.push(format!(
-                ".{}.{}.{}.tmp",
-                std::process::id(),
-                NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
-                kind
-            ));
-            let path = parent.join(temporary_name);
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => return Ok(Self { path, file }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-struct Segment {
-    offset: u64,
-    length: u64,
-    frames: Vec<(u32, u32)>,
-}
-
-/// One compressed spool per destination; publication is explicit and atomic.
 pub(crate) struct EgtFileWriter {
-    destination: PathBuf,
+    location: Location,
+    key: ObjectPath,
     frame_size: usize,
     lengths: Vec<usize>,
-    segments: Vec<Option<Segment>>,
-    spool: TemporaryFile,
-    completed: Option<TemporaryFile>,
+    tables: Vec<Option<CompressedTable>>,
+    footer: Option<Bytes>,
     published: bool,
 }
 
@@ -76,13 +31,14 @@ impl EgtFileWriter {
         if file.frame_size == 0 || file.frame_size > (u32::MAX as usize) / 2 {
             return Err(EgtError::Internal("invalid writer frame size"));
         }
+        file.location.ensure_writable()?;
         Ok(Self {
-            destination: file.path.clone(),
+            location: file.location.clone(),
+            key: file.key.clone(),
             frame_size: file.frame_size,
             lengths: file.egts.iter().map(|egt| egt.index_range()).collect(),
-            segments: (0..file.egts.len()).map(|_| None).collect(),
-            spool: TemporaryFile::new(&file.path, "spool")?,
-            completed: None,
+            tables: (0..file.egts.len()).map(|_| None).collect(),
+            footer: None,
             published: false,
         })
     }
@@ -92,14 +48,14 @@ impl EgtFileWriter {
         egt_idx: usize,
         values: &[MaybeDtcOutcome],
     ) -> EgtResult<()> {
-        if self.completed.is_some() || self.published {
+        if self.footer.is_some() || self.published {
             return Err(EgtError::Internal("writer is already finished"));
         }
         let length = *self.lengths.get(egt_idx).ok_or(EgtError::IndexOutOfRange {
             index: egt_idx,
             range: self.lengths.len(),
         })?;
-        if self.segments[egt_idx].is_some() {
+        if self.tables[egt_idx].is_some() {
             return Err(EgtError::Internal("table has already been written"));
         }
         if values.len() != length {
@@ -111,88 +67,109 @@ impl EgtFileWriter {
             ));
         }
 
-        // Failed writes leave only unreachable bytes; retries append a fresh segment.
-        let offset = self.spool.file.seek(SeekFrom::End(0))?;
+        let mut data = Vec::new();
         let mut encoder = zeekstd::EncodeOptions::new()
             .compression_level(DEFAULT_COMPRESSION_LEVEL)
-            .into_encoder(&mut self.spool.file)?;
+            .into_encoder(&mut data)?;
         for chunk in values.chunks(self.frame_size) {
             encode_frame(&mut encoder, chunk)?;
         }
         // into_seek_table consumes the encoder without flushing its output buffer.
         encoder.flush()?;
-        let table = encoder.into_seek_table();
-        self.spool.file.flush()?;
-        let mut frames = Vec::with_capacity(table.num_frames() as usize);
-        for index in 0..table.num_frames() {
-            frames.push((
-                table.frame_size_comp(index)? as u32,
-                table.frame_size_decomp(index)? as u32,
-            ));
-        }
-        self.segments[egt_idx] = Some(Segment {
-            offset,
-            length: table.size_comp(),
-            frames,
+        let seek_table = encoder.into_seek_table();
+        self.tables[egt_idx] = Some(CompressedTable {
+            data: data.into(),
+            seek_table,
         });
         Ok(())
     }
 
-    /// Assembles a complete temporary file but does not change the destination.
+    /// Validates completeness and prepares the seek table without publishing.
     pub(crate) fn finish(&mut self) -> EgtResult<()> {
         if self.published {
             return Err(EgtError::Internal("writer is already published"));
         }
-        if self.completed.is_some() {
+        if self.footer.is_some() {
             return Ok(());
         }
-        if self.segments.iter().any(Option::is_none) {
-            return Err(EgtError::Internal("cannot finish with missing tables"));
-        }
-        self.spool.file.flush()?;
-        let mut completed = TemporaryFile::new(&self.destination, "completed")?;
-        {
-            let mut output = BufWriter::new(&mut completed.file);
-            let mut table = zeekstd::SeekTable::new();
-            for segment in self.segments.iter().flatten() {
-                self.spool.file.seek(SeekFrom::Start(segment.offset))?;
-                let copied = io::copy(
-                    &mut (&mut self.spool.file).take(segment.length),
-                    &mut output,
+        let mut table = zeekstd::SeekTable::new();
+        for compressed in &self.tables {
+            let compressed = compressed
+                .as_ref()
+                .ok_or(EgtError::Internal("cannot finish with missing tables"))?;
+            for index in 0..compressed.seek_table.num_frames() {
+                table.log_frame(
+                    compressed.seek_table.frame_size_comp(index)? as u32,
+                    compressed.seek_table.frame_size_decomp(index)? as u32,
                 )?;
-                if copied != segment.length {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "compressed spool segment is truncated",
-                    )
-                    .into());
-                }
-                for &(compressed, decompressed) in &segment.frames {
-                    table.log_frame(compressed, decompressed)?;
-                }
             }
-            io::copy(&mut table.into_serializer(), &mut output)?;
-            output.flush()?;
         }
-        self.completed = Some(completed);
+        let mut footer = Vec::new();
+        table.into_serializer().read_to_end(&mut footer)?;
+        self.footer = Some(footer.into());
         Ok(())
     }
 
-    /// Renames the finished file over the destination and returns its byte size.
-    pub(crate) fn publish(&mut self) -> EgtResult<u64> {
+    /// Publishes in canonical order, then releases the compressed buffers.
+    pub(crate) fn publish(&mut self) -> EgtResult<(u64, String)> {
         if self.published {
             return Err(EgtError::Internal("writer is already published"));
         }
-        let completed = self.completed.as_mut().ok_or(EgtError::Internal(
+        let footer = self.footer.as_ref().ok_or(EgtError::Internal(
             "writer must be finished before publication",
         ))?;
-        completed.file.flush()?;
-        let bytes = completed.file.metadata()?.len();
-        fs::rename(&completed.path, &self.destination)?;
-        self.completed = None;
+        let buffers = self
+            .tables
+            .iter()
+            .flatten()
+            .map(|table| table.data.clone())
+            .chain(std::iter::once(footer.clone()));
+        let result = publish_buffers(&self.location, &self.key, buffers)?;
+        self.tables.clear();
+        self.footer = None;
         self.published = true;
-        Ok(bytes)
+        Ok(result)
     }
+}
+
+const UPLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+/// Publishes owned buffers without concatenating them into another full artifact.
+pub(crate) fn publish_buffers(
+    location: &Location,
+    key: &ObjectPath,
+    buffers: impl IntoIterator<Item = Bytes>,
+) -> EgtResult<(u64, String)> {
+    location.ensure_writable()?;
+    block_on(async {
+        let mut writer =
+            BufWriter::with_capacity(location.store.clone(), key.clone(), UPLOAD_BUFFER_SIZE)
+                .with_max_concurrency(2);
+        let mut hash = Sha256::new();
+        let mut length = 0;
+        for buffer in buffers {
+            // BufWriter applies backpressure per put, not per internally spawned part.
+            for start in (0..buffer.len()).step_by(UPLOAD_BUFFER_SIZE) {
+                let chunk = buffer.slice(start..buffer.len().min(start + UPLOAD_BUFFER_SIZE));
+                hash.update(&chunk);
+                length += chunk.len() as u64;
+                if let Err(error) = writer.put(chunk).await {
+                    let _ = writer.abort().await;
+                    return Err(location.error(key, error));
+                }
+            }
+        }
+        // shutdown completes publication and delegates completion-error cleanup
+        // to object_store; abort cannot be called after this consumes its upload.
+        writer.shutdown().await.map_err(|error| EgtError::Storage {
+            location: location.describe(key),
+            source: object_store::Error::Generic {
+                store: "tablebase publication",
+                source: Box::new(error),
+            },
+        })?;
+        Ok((length, format!("{:x}", hash.finalize())))
+    })
 }
 
 pub(crate) fn encode_frame<W: Write>(
@@ -207,18 +184,75 @@ pub(crate) fn encode_frame<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
+    use std::fs;
+
+    #[test]
+    fn publication_roundtrip_in_memory() {
+        let location = Location::parse("memory:///tables").unwrap();
+        let key = location.prefix.clone().join("K_K.ggegt");
+        for length in [
+            0,
+            17,
+            UPLOAD_BUFFER_SIZE - 1,
+            UPLOAD_BUFFER_SIZE,
+            UPLOAD_BUFFER_SIZE + 17,
+            2 * UPLOAD_BUFFER_SIZE,
+        ] {
+            let data: Bytes = (0..length)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>()
+                .into();
+            // Split buffers independently of upload boundaries, like sub-tables + footer.
+            let split = length / 3;
+            let buffers = [data.slice(..split), data.slice(split..)];
+            let (bytes, sha256) = publish_buffers(&location, &key, buffers).unwrap();
+            assert_eq!(bytes, data.len() as u64);
+            assert_eq!(sha256, format!("{:x}", Sha256::digest(&data)));
+            let uploaded = block_on(async {
+                location
+                    .store
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            });
+            assert_eq!(uploaded, data);
+        }
+    }
 
     #[test]
     fn reverse_order_and_short_tails_load_via_reader() {
         let dir = crate::TestDir::new("writer_reverse_order");
         let file = EgtFile::new(&dir.0, "KP_K").unwrap();
-        // Each table ends in a short frame, exercising per-table frame boundaries.
         assert!(
             file.egts
                 .iter()
                 .all(|egt| egt.index_range() % file.frame_size != 0)
         );
         let mut writer = EgtFileWriter::new(&file).unwrap();
+        // Independent canonical encoding provides a byte-for-byte reference.
+        let mut expected = Vec::new();
+        let mut encoder = zeekstd::EncodeOptions::new()
+            .compression_level(DEFAULT_COMPRESSION_LEVEL)
+            .into_encoder(&mut expected)
+            .unwrap();
+        for idx in 0..file.egts.len() {
+            let value = if idx % 2 == 0 {
+                MaybeDtcOutcome::DRAW
+            } else {
+                MaybeDtcOutcome::INVALID
+            };
+            let values = vec![value; file.egts[idx].index_range()];
+            for chunk in values.chunks(file.frame_size) {
+                encode_frame(&mut encoder, chunk).unwrap();
+            }
+        }
+        encoder.flush().unwrap();
+        let table = encoder.into_seek_table();
+        table.into_serializer().read_to_end(&mut expected).unwrap();
         for idx in (0..file.egts.len()).rev() {
             let value = if idx % 2 == 0 {
                 MaybeDtcOutcome::DRAW
@@ -230,9 +264,18 @@ mod tests {
                 .unwrap();
         }
         writer.finish().unwrap();
-        assert!(!file.path.exists());
-        let bytes = writer.publish().unwrap();
-        assert_eq!(bytes, fs::metadata(&file.path).unwrap().len());
+        writer.finish().unwrap();
+        let destination = dir.0.join("KP_K.ggegt");
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+        let (bytes, sha256) = writer.publish().unwrap();
+        assert_eq!(bytes, expected.len() as u64);
+        assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert!(writer.tables.is_empty());
+        assert!(writer.publish().is_err());
+        assert!(writer.finish().is_err());
+        assert!(writer.write_table(0, &[]).is_err());
         let mut reader = EgtFile::new_from_file(&dir.0, "KP_K").unwrap();
         let mut offset = 0;
         for idx in 0..file.egts.len() {
@@ -268,41 +311,18 @@ mod tests {
     }
 
     #[test]
-    fn unique_temporaries_and_drop_cleanup_preserve_destination() {
+    fn unpublished_writer_preserves_destination_without_temporary_files() {
         let dir = crate::TestDir::new("writer_cleanup");
         let file = EgtFile::new(&dir.0, "K_K").unwrap();
-        fs::write(&file.path, b"existing destination").unwrap();
+        let destination = dir.0.join("K_K.ggegt");
+        fs::write(&destination, b"existing destination").unwrap();
         let mut writer = EgtFileWriter::new(&file).unwrap();
-        let other = EgtFileWriter::new(&file).unwrap();
-        assert_ne!(writer.spool.path, other.spool.path);
-        let spool = writer.spool.path.clone();
-        let other_spool = other.spool.path.clone();
         writer
             .write_table(0, &vec![MaybeDtcOutcome::DRAW; file.egts[0].index_range()])
             .unwrap();
         writer.finish().unwrap();
-        let completed = writer.completed.as_ref().unwrap().path.clone();
         drop(writer);
-        drop(other);
-        for path in [spool, other_spool, completed] {
-            assert!(!path.exists());
-        }
-        assert_eq!(fs::read(&file.path).unwrap(), b"existing destination");
-    }
-
-    #[test]
-    fn truncated_spool_cleans_failed_assembly() {
-        let dir = crate::TestDir::new("writer_truncated");
-        let file = EgtFile::new(&dir.0, "K_K").unwrap();
-        let mut writer = EgtFileWriter::new(&file).unwrap();
-        writer
-            .write_table(0, &vec![MaybeDtcOutcome::DRAW; file.egts[0].index_range()])
-            .unwrap();
-        writer.spool.file.set_len(0).unwrap();
-        assert!(writer.finish().is_err());
-        assert!(writer.completed.is_none());
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
-        drop(writer);
-        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+        assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
     }
 }

@@ -1,15 +1,31 @@
+//! Chess endgame generation and probing through a synchronous API.
+//!
+//! Generator/prober constructors and `with_input_path` resolve storage locations
+//! and are fallible: callers must handle their `EgtResult` (for example with `?`).
+//! Locations may be local directories or supported object-store URLs. Generated
+//! compressed results are retained in RAM until publication.
+//!
+//! Storage operations block the calling thread, including remote reads and writes.
+//! Async applications should call this API from `tokio::task::spawn_blocking`
+//! rather than directly from an async task, including construction/configuration
+//! and calls to generate, probe, or verify tables.
+
 pub mod error;
 pub mod piece_set;
 mod egt;
 mod egt_file;
 mod egt_writer;
 mod retrograde;
+mod storage;
 
 pub use error::{EgtError, EgtResult};
 pub use egt_file::{EgtFile, EgtFileStats, LongestDtcPosition};
 use shakmaty::{Role, Chess, Color, Move, MoveList, Position};
 use std::cmp::Ordering;
+use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
+use crate::storage::Location;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,18 +65,27 @@ impl PartialOrd for DtcOutcome {
 }
 
 pub struct EgtGenerator {
-    base_path: PathBuf,
+    base_path: Location,
     assigned_memory: Option<usize>,
-    input_path: Option<PathBuf>,
+    input_path: Option<Location>,
     generate_deps: bool,
     verify: bool,
     threads: usize,
 }
 
 impl EgtGenerator {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    /// Resolves a local output directory or object-store URL once.
+    ///
+    /// Returns an error for invalid locations or backend initialization failures.
+    /// Read-only outputs are rejected when generation starts. This is a
+    /// synchronous API; async applications should use `spawn_blocking`.
+    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
+        Ok(Self::from_location(Location::parse(path)?))
+    }
+
+    pub(crate) fn from_location(location: Location) -> Self {
         Self {
-            base_path: path.into(),
+            base_path: location,
             assigned_memory: None,
             input_path: None,
             generate_deps: false,
@@ -78,10 +103,16 @@ impl EgtGenerator {
         self.assigned_memory = Some(n);
     }
 
-    /// Sets an additional path used to look up dependency files. If not set,
-    /// only `base_path` is consulted for dependencies.
-    pub fn with_input_path(&mut self, path: impl Into<PathBuf>) {
-        self.input_path = Some(path.into());
+    /// Resolves an additional local directory or object-store URL for dependencies.
+    /// Input is searched first; output is tried only if the input file is missing.
+    /// If not set, only the output location is consulted.
+    ///
+    /// Returns an error if the location cannot be resolved, leaving the previous
+    /// setting unchanged. This synchronous API should run in `spawn_blocking`
+    /// when called from an async application.
+    pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
+        self.input_path = Some(Location::parse(path)?);
+        Ok(())
     }
 
     /// Enables automatic generation of missing dependencies on the fly.
@@ -169,7 +200,7 @@ impl EgtGenerator {
 
     fn generate_impl(&self, endgame: &str, in_pool: bool) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
         let start_time = std::time::Instant::now();
-        println!("Generating endgame {} at {:?}", endgame, self.base_path);
+        println!("Generating endgame {} at {}", endgame, self.base_path.display);
 
         // TODO: Preallocate memory
         //if let Some(n) = self.assigned_memory {
@@ -179,51 +210,28 @@ impl EgtGenerator {
         // Run retrograde analysis
         let (mut file_a, mut file_b) = if in_pool {
             crate::retrograde::retrograde_analysis_in_pool(
-                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps,
+                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
             )?
         } else if self.threads == 1 {
             crate::retrograde::retrograde_analysis(
-                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps,
+                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
             )?
         } else {
             crate::retrograde::retrograde_analysis_with_threads(
-                &self.base_path, endgame, self.input_path.as_deref(), self.generate_deps, self.threads,
+                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps, self.threads,
             )?
         };
 
-        // Retrograde analysis has already assembled and published the files.
-        let bytes_a = std::fs::metadata(&file_a.path)?.len();
-        let bytes_b = file_b.as_ref().map(|file| {
-            std::fs::metadata(&file.path).map(|metadata| metadata.len())
-        }).transpose()?;
-
-        // Compute SHA-256 and finalize stats
-        let sha256_a = compute_sha256(&file_a.path)?;
-        let mut stats_a = file_a.stats.take()
+        // Publication supplies the size and hash of each output file.
+        let stats_a = file_a.stats.take()
             .ok_or(EgtError::Internal("stats missing for file_a after generation"))?;
-        stats_a.bytes = bytes_a;
-        stats_a.sha256 = sha256_a;
-
-        // Save JSON file for A
-        let json_path_a = file_a.path.with_extension("json");
-        let json_str_a = serde_json::to_string_pretty(&stats_a)?;
-        std::fs::write(json_path_a, json_str_a)?;
+        file_a.save_stats(&stats_a)?;
 
         let mut stats_b = None;
         if let Some(ref mut fb) = file_b {
-            let sha256_b = compute_sha256(&fb.path)?;
-            let mut s_b = fb.stats.take()
+            let s_b = fb.stats.take()
                 .ok_or(EgtError::Internal("stats missing for file_b after generation"))?;
-            let bytes_b_val = bytes_b
-                .ok_or(EgtError::Internal("bytes_b missing despite file_b being present"))?;
-            s_b.bytes = bytes_b_val;
-            s_b.sha256 = sha256_b;
-
-            // Save JSON file for B
-            let json_path_b = fb.path.with_extension("json");
-            let json_str_b = serde_json::to_string_pretty(&s_b)?;
-            std::fs::write(json_path_b, json_str_b)?;
-
+            fb.save_stats(&s_b)?;
             stats_b = Some(s_b);
         }
 
@@ -232,13 +240,16 @@ impl EgtGenerator {
 
         // Check internal consistency
         if self.verify {
-            let mut prober = EgtProber::new(&self.base_path);
-            if let Some(ref input) = self.input_path {
-                prober.with_input_path(input.clone());
+            let mut prober = EgtProber::from_location(self.base_path.clone());
+            prober.input_path = self.input_path.clone();
+            // Verify the freshly published outputs, not same-named input files.
+            prober.cache.insert(file_a.endgame.clone(), file_a);
+            if let Some(fb) = file_b {
+                prober.cache.insert(fb.endgame.clone(), fb);
             }
-            prober.verify_internal_consistency(&file_a.endgame)?;
-            if let Some(ref mut fb) = file_b {
-                prober.verify_internal_consistency(&fb.endgame)?;
+            prober.verify_internal_consistency(&stats_a.endgame)?;
+            if let Some(ref sb) = stats_b {
+                prober.verify_internal_consistency(&sb.endgame)?;
             }
         }
 
@@ -247,18 +258,27 @@ impl EgtGenerator {
 }
 
 pub struct EgtProber {
-    base_path: PathBuf,
+    base_path: Location,
     /// Additional path used to look up dependency files. If `None`, only
     /// `base_path` is consulted.
-    input_path: Option<PathBuf>,
+    input_path: Option<Location>,
     assigned_memory: Option<usize>,
     cache: HashMap<String, EgtFile>,
 }
 
 impl EgtProber {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    /// Resolves a local tablebase directory or object-store URL once.
+    ///
+    /// Returns an error for invalid locations or backend initialization failures.
+    /// This synchronous API should run in `spawn_blocking` when called from an
+    /// async application, as should subsequent probing and verification.
+    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
+        Ok(Self::from_location(Location::parse(path)?))
+    }
+
+    pub(crate) fn from_location(location: Location) -> Self {
         Self {
-            base_path: path.into(),
+            base_path: location,
             input_path: None,
             assigned_memory: None,
             cache: HashMap::new(),
@@ -269,16 +289,22 @@ impl EgtProber {
         self.assigned_memory = Some(n);
     }
 
-    /// Sets an additional path used to look up dependency files. If not set,
-    /// only `base_path` is consulted.
-    pub fn with_input_path(&mut self, path: impl Into<PathBuf>) {
-        self.input_path = Some(path.into());
+    /// Resolves an additional local directory or object-store URL for table lookup.
+    /// Input is searched first; the base location is tried only for missing files.
+    /// If not set, only the base location is consulted.
+    ///
+    /// Returns an error if the location cannot be resolved, leaving the previous
+    /// setting unchanged. This synchronous API should run in `spawn_blocking`
+    /// when called from an async application.
+    pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
+        self.input_path = Some(Location::parse(path)?);
+        Ok(())
     }
 
     /// Attempts to load an existing file, looking it up first in `input_path`
-    /// (if set and distinct from `base_path`) and then in `base_path`.
+    /// (if set) and then in `base_path`.
     fn load_existing(&self, endgame: &str) -> EgtResult<EgtFile> {
-        load_existing_file(&self.base_path, self.input_path.as_deref(), endgame)
+        load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)
     }
 
     pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
@@ -491,20 +517,20 @@ fn move_value(m: &Move, successor_outcome: DtcOutcome) -> DtcOutcome {
 }
 
 /// Attempts to load an existing `EgtFile`, looking it up first in `input_path`
-/// (if set and distinct from `base_path`) and then in `base_path`.
+/// (if set) and then in `base_path`, falling back only when a file is missing.
 fn load_existing_file(
-    base_path: &std::path::Path,
-    input_path: Option<&std::path::Path>,
+    base_path: &Location,
+    input_path: Option<&Location>,
     endgame: &str,
 ) -> EgtResult<EgtFile> {
-    if let Some(input) = input_path && input != base_path {
-        match EgtFile::new_from_file(input, endgame) {
+    if let Some(input) = input_path {
+        match EgtFile::open_in(input, endgame) {
             Ok(f) => return Ok(f),
             Err(EgtError::FileNotFound(_)) => {}
             Err(e) => return Err(e),
         }
     }
-    EgtFile::new_from_file(base_path, endgame)
+    EgtFile::open_in(base_path, endgame)
 }
 
 pub fn get_endgame(position: &Chess) -> String {
@@ -591,21 +617,6 @@ pub fn print_pair_stats(
 }
 
 
-fn compute_sha256(path: &std::path::Path) -> std::io::Result<String> {
-    use sha2::{Sha256, Digest};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 65536];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
 
 /// A fresh, test-specific directory under the system temp dir. Tests running in
 /// parallel must not share output directories: they would overwrite (or read
@@ -643,9 +654,10 @@ mod tests {
     // consistency of both tables.
     fn verify_internal_consistency(endgame: &str) {
         let test_dir = TestDir::new(&format!("verify_internal_consistency_{}", endgame));
-        crate::retrograde::retrograde_analysis(&test_dir.0, endgame, None, true).unwrap();
+        let location = Location::parse(&test_dir.0).unwrap();
+        crate::retrograde::retrograde_analysis(&location, endgame, None, true).unwrap();
 
-        let mut prober = EgtProber::new(&test_dir.0);
+        let mut prober = EgtProber::new(&test_dir.0).unwrap();
         prober.verify_internal_consistency(endgame).unwrap();
         let (a, b) = endgame.split_once('_').unwrap();
         if a != b {
@@ -671,6 +683,69 @@ mod tests {
         let egt_file = EgtFile::new(&std::env::temp_dir(), "KP_K").unwrap();
         assert!(egt_file.egts.len() > 1, "expected KP_K to be composed of several Egts");
         verify_internal_consistency("KP_K");
+    }
+
+    #[test]
+    fn generator_publishes_finalized_stats() {
+        use sha2::{Digest, Sha256};
+
+        let output = TestDir::new("generator_stats_output");
+        let input = TestDir::new("generator_stats_input");
+        // Same-named input files must not shadow outputs during verification.
+        for endgame in ["KQ_K", "K_KQ"] {
+            std::fs::write(input.0.join(format!("{endgame}.ggegt")), b"invalid table").unwrap();
+        }
+        let mut generator = EgtGenerator::new(&output.0).unwrap();
+        generator.with_input_path(&input.0).unwrap();
+        generator.with_generate_deps(true);
+        // Default verification also exercises reopening published dependencies.
+        let (stats_a, stats_b) = generator.generate("KQ_K").unwrap();
+        assert!(output.0.join("K_K.ggegt").exists());
+        for stats in std::iter::once(stats_a).chain(stats_b) {
+            let data = std::fs::read(output.0.join(format!("{}.ggegt", stats.endgame))).unwrap();
+            assert_eq!(stats.bytes, data.len() as u64);
+            assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(&data)));
+            let json = std::fs::read(output.0.join(format!("{}.json", stats.endgame))).unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&json).unwrap(),
+                serde_json::to_value(&stats).unwrap());
+        }
+    }
+
+    #[test]
+    fn read_only_output_is_rejected_before_generation() {
+        let mut generator = EgtGenerator::new("https://example.com/tables/").unwrap();
+        for threads in [1, 4] {
+            generator.with_threads(threads);
+            assert!(matches!(generator.generate("K_K"),
+                Err(EgtError::InvalidStorageLocation(message)) if message.contains("read-only")));
+        }
+    }
+
+    #[test]
+    fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
+        let mut generator = EgtGenerator::new("memory:///nested/tables").unwrap();
+        generator.with_generate_deps(true);
+        let (stats_a, stats_b) = generator.generate("KQ_K").unwrap();
+
+        let mut prober = EgtProber::from_location(generator.base_path.clone());
+        prober.verify_internal_consistency(&stats_a.endgame).unwrap();
+        prober.verify_internal_consistency(&stats_b.unwrap().endgame).unwrap();
+        assert!(prober.load_existing("K_K").is_ok());
+    }
+
+    #[test]
+    fn input_lookup_falls_back_only_for_missing_files() {
+        let output = TestDir::new("input_fallback_output");
+        let input = TestDir::new("input_fallback_input");
+        EgtGenerator::new(&output.0).unwrap().generate("K_K").unwrap();
+
+        let mut prober = EgtProber::new(&output.0).unwrap();
+        prober.with_input_path(&input.0).unwrap();
+        assert!(prober.load_existing("K_K").is_ok());
+
+        std::fs::write(input.0.join("K_K.ggegt"), b"invalid table").unwrap();
+        let error = prober.load_existing("K_K").unwrap_err();
+        assert!(!matches!(error, EgtError::FileNotFound(_)));
     }
 
     #[test]

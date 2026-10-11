@@ -9,8 +9,9 @@ It builds on [`algorithms_comparison.md`](algorithms_comparison.md), in
 particular the single-threaded measurements of the counters and sweep core
 loops in its Section 2.A.
 
-**Status:** Steps 1-4 are implemented; later steps remain a roadmap. Historical
-Step 1/2 validation and measurements are recorded below. Step 3 is reference-validated
+**Status:** Steps 1-4 and the minimal object-storage prerequisite of Step 6 are
+implemented; Step 5 and the Step 6 job system remain a roadmap, as do Steps 7-8.
+Historical Step 1/2 validation and measurements are recorded below. Step 3 is reference-validated
 on the sets listed below; its remaining sample measurements are still open.
 Step 4 correctness checks and initial scaling measurements are recorded below. Sizes are computed from
 the current indexing scheme. Compute estimates are extrapolated from the
@@ -124,8 +125,10 @@ are injected into the retrograde loop at the matching ply. A pawn push to a
 position lost at ply `d` makes its predecessor a win at ply `d + 1`, so that
 predecessor has to be handled at ply `d + 1`, not during initialization.
 
-The result is thousands of **idempotent, retryable jobs** that read inputs from
-object storage and write outputs to it. This needs a scheduler, not MPI.
+The planned result is thousands of **idempotent, retryable jobs** that read inputs
+from object storage and write outputs to it. This needs a scheduler, not MPI.
+The storage prerequisite is implemented, but the job graph, scheduler, and
+completion manifests are not (see Step 6).
 
 ### Level 2: shared-memory multi-threading
 
@@ -357,12 +360,13 @@ scattered locations, making frame-cache lookup and eviction inappropriate for
 **the tables being solved**.
 
 The solver now uses flat `Vec<AtomicU16>` arrays for the active pair,
-separate from `EgtFile`. Finalized tables are compressed into one spool per
-output file, so solved pairs do not accumulate as uncompressed file frames.
-Working memory is one pair plus the dependency cache, index metadata, local
-summaries, statistics, and compression/I/O buffers. Recursive dependency
-generation is an exception: a parent pair can remain allocated while a
-dependency is solved.
+separate from `EgtFile`. Finalized sub-tables are compressed and retained in
+memory for each output file, so solved pairs do not accumulate as uncompressed
+file frames. Working memory is one pair plus **accumulated compressed output**,
+the dependency cache, index metadata, local summaries, statistics, and
+compression/I/O buffers. Compressed output grows until publication; there is no
+disk scratch staging. Recursive dependency generation is an exception: a parent
+pair and its compressed output can remain allocated while a dependency is solved.
 
 Atomic working values for shared-memory parallelism are implemented in Step 4.
 Memory-mapped arrays for out-of-core runs remain a future option.
@@ -475,32 +479,37 @@ remain unchanged; they do not establish Step 3 validation.
 - `PlySummary` retains the Step 2 conservative scan logic, but its 4096-position
   blocks are now aligned on each table's local indices, independent of storage
   frames. The global alignment described in Step 2 is historical.
-- Each finalized table is compressed into **one spool per output file** and its
-  working array is released after staging the pair. Frames are table-aligned,
+- Each finalized sub-table is compressed into **in-memory output segments** and
+  its working array is released after compressing the pair. Frames are table-aligned,
   contain at most `256 * 1024` positions, and end in short, unpadded tails.
   The transposition is unchanged: exactly `2 * N` bytes for a frame of `N`
   positions, including the unused zero tail after packed high bytes.
-- Final assembly copies compressed segments in stable table order, without
-  recompression, and writes **one final seek table**. The encoder is flushed
+- Publication streams compressed segments in stable table order, without
+  recompression, and writes **one final seek table** through the `object_store`
+  buffered writer, hashing the bytes as they are published. The encoder is flushed
   before `into_seek_table`, which does not flush its output buffer. No
   `RawEncoder` is needed.
 - The reader constructs the table-aligned frame layout from the `Egt` lengths
   and validates frame counts and decompressed lengths against the seek table.
 - `retrograde_analysis` finishes and publishes the output files before
-  returning. Each rename is atomic, but the two-file publication is
-  **nontransactional**: a failure between renames can update only one file.
-- Working memory is one pair plus dependency cache, index metadata, summaries,
-  statistics, and compression/I/O buffers. Recursive dependency generation can
-  retain a parent pair while solving a dependency (Section 6.1).
+  returning. Multi-artifact publication is **nontransactional**: a failure
+  between uploads can update only one output or leave its statistics unpublished.
+- Working memory is one pair plus accumulated compressed output, dependency
+  cache, index metadata, summaries, statistics, and compression/I/O buffers.
+  Bounded upload concurrency limits in-flight buffers, not retained compressed
+  output. Recursive dependency generation can retain a parent pair and its
+  compressed output while solving a dependency (Section 6.1).
 - **Acceptance:** per-index outcome/DTC equality and logical statistics
   equality, excluding `bytes`, `sha256`, and `num_frames`. Exact outcome values (including conversion type
   and DTC) and semantic statistics matched the reference tables in
   `~/tablebases` for every logical index in both orientations of the validated
   endgames.
-- **Validation:** `cargo test --release` covers full/short frames, disk-backed
-  resaving, reverse-order staging, invalid layouts, missing/duplicate
-  submissions, and temporary-file cleanup. The reference comparisons above
-  were performed during Step 3 implementation. The remaining four endgames
+- **Historical validation:** during Step 3 implementation, `cargo test --release`
+  covered full/short frames, disk-backed resaving, reverse-order staging, invalid
+  layouts, missing/duplicate submissions, and temporary-file cleanup under the
+  former disk-spool design. This is not validation of the current in-memory
+  publication path. The reference comparisons above were performed during
+  Step 3 implementation. The remaining four endgames
   in the 5-piece sample and generation-only elapsed-time, peak-RSS, and
   output-size comparisons have not been measured.
 
@@ -542,7 +551,7 @@ remain unchanged; they do not establish Step 3 validation.
   retain parent working arrays and caches, and repeated initialization has a cost;
   production measurements below use existing dependencies.
 - Finalization consumes atomic arrays into plain outcomes one table at a time.
-  Statistics, compression, staging, assembly, verification, and JSON generation
+  Statistics, compression, ordered publication, verification, and JSON generation
   remain serial and deterministic. No unsafe array reinterpretation is used.
 - **Validation:** `cargo test --release` passes 54 tests, including concurrent CAS
   contention, concurrent summary maxima, ordered loss-conversion phases,
@@ -578,12 +587,43 @@ remain unchanged; they do not establish Step 3 validation.
 
 ### Step 6: jobs and object storage
 
-- A job graph over (endgame, pair, slice), with outputs written to object
-  storage (the `object_store` TODO). An existing output means the job is done,
-  which makes jobs idempotent and retryable.
-- A simple runner (local first, then a fleet of instances pulling jobs from a
-  queue).
-- **Milestone:** full 6-piece generation on a small fleet.
+- **Storage prerequisite: done.** Local and cloud queries
+  and publication now use `object_store`, with all cloud backend features
+  enabled. Locations accept plain relative/absolute paths and
+  `object_store` URLs (`file`, `s3`/`s3a`, `gs`,
+  `az`/`adl`/`azure`/`abfs`/`abfss`, `http`/`https`, `memory`). Local paths are
+  made absolute and converted to file URLs. URL userinfo, queries, and
+  fragments are rejected before backend initialization; configuration and
+  credentials come from environment variables via `parse_url_opts`. The backend,
+  prefix, and display URL are shared, and writability is recorded from
+  `ObjectStoreScheme::parse`, not inferred by reparsing the display string.
+  Generic HTTP is read-only and rejected early as a generation destination;
+  HTTPS cloud URLs recognized by `object_store` retain backend write support.
+- Lookups prefer `--input-path`, falling back to `--path` only on `NotFound`;
+  probing also honors the input location. Readers load the checksum-free seek
+  table with one suffix GET, validate its frame count before parsing, and fetch
+  one compressed frame range per cold miss. The shared in-memory dependency
+  cache is unchanged: **no LRU eviction yet**. Remote dependencies warm this
+  cache during generation, but cold requests add latency and request/transfer
+  costs. Local input with remote output is an alternative; measure these costs
+  before deploying a fleet.
+- Compressed sub-tables are retained in memory. Accumulated compressed output adds to the active pair's
+  memory footprint. Publication streams segments and the final seek table through
+  the `object_store` buffered writer: a small-object PUT or multipart upload with
+  bounded concurrency. SHA-256 is computed over bytes as they are published,
+  without a second local artifact; JSON statistics are published separately
+  afterward. Verification still follows publication. The synchronous library
+  uses a shared private Tokio runtime; async applications must call it through
+  `spawn_blocking`. See [README.md](README.md#storage-and-usage) for configuration
+  and the storage API.
+- **Jobs: not implemented.** Still needed: a job graph over (endgame, pair,
+  slice), a simple runner (local first, then instances pulling jobs from a
+  queue), and a validated completion protocol/manifests for idempotent retries.
+  Multi-artifact publication is not transactional, and an existing `.ggegt`
+  object is **not proof that a complete job succeeded or passed verification**.
+  Job completion must account for both outputs, their statistics, and
+  verification rather than merely detecting one existing object.
+- **Milestone (pending):** full 6-piece generation on a small fleet.
 
 ### Step 7: reduce the cost per position
 
