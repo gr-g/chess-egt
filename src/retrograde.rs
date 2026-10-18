@@ -38,7 +38,7 @@
 //! All writers validate that every sub-table is complete before either file in
 //! an endgame pair is published.
 
-use shakmaty::{Bitboard, Color, Chess, Move, Position, Role};
+use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, EgtFileStats, LongestDtcPosition};
@@ -382,6 +382,30 @@ fn is_mirrored(table: &Egt, twin: &Egt) -> bool {
     stm_files_b != sntm_files_a || sntm_files_b != stm_files_a
 }
 
+/// Quiet predecessors of a pawnless tablebase position, without castling rights.
+fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
+    debug_assert!(position.board().pawns().is_empty());
+    debug_assert!(position.castles().castling_rights().is_empty());
+
+    let occupied = position.board().occupied();
+    let mut base_setup = position.to_setup(EnPassantMode::Always);
+    base_setup.turn = !position.turn();
+
+    for to in position.board().by_color(base_setup.turn) {
+        let piece = position.board().piece_at(to).expect("occupied square must have a piece");
+        let origins = attacks::attacks(to, piece, occupied) & !occupied;
+        for from in origins {
+            let mut setup = base_setup.clone();
+            setup.board.discard_piece_at(to);
+            setup.board.set_piece_at(from, piece);
+
+            if let Ok(predecessor) = setup.position::<Chess>(position.castles().mode()) {
+                f(predecessor);
+            }
+        }
+    }
+}
+
 pub fn quiet_unmoves<F>(
     table: &Egt,
     twin: &Egt,
@@ -404,33 +428,39 @@ pub fn quiet_unmoves<F>(
     let use_diagonal_symmetry = twin.is_pawnless()
         && !both_kings_on_diagonal(&position);
 
-    RetrogradeAnalysis::new(&position)
-        .with_castling_mode(CastlingRetrogradeMode::NoCastling)
-        .quiet_unmoves(|pred_position, _m| {
-            let pred_idx = if mirrored {
-                twin.reflected_position_to_index(&pred_position)
-            } else {
-                twin.position_to_index(&pred_position)
-            };
-            f(pred_idx);
+    let mut emit = |pred_position: Chess| {
+        let pred_idx = if mirrored {
+            twin.reflected_position_to_index(&pred_position)
+        } else {
+            twin.position_to_index(&pred_position)
+        };
+        f(pred_idx);
 
-            // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
-            // positions and `#p=4` if it represents 4 equivalent positions (with our choice
-            // of canonicalization, `#p=4` positions are positions with both kings on the
-            // a1-h8 diagonal). When retrograde propagation from `p'` finds move `p -> p'`
-            // with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the
-            // counter for the reflection of `p` along the diagonal should also be decremented
-            // (since the symmetric move contributed to the counter for the reflection of `p`
-            // but led to a non-canonical position).
-            if use_diagonal_symmetry {
-                let maybe_reflected_idx = twin.diagonal_symmetric(pred_idx);
-                if let Some(reflected_idx) = maybe_reflected_idx {
-                    // The current index represents 8 positions, while the predecessor index
-                    // represents 4 positions. Push the diagonal reflection of the predecessor.
-                    f(reflected_idx);
-                }
+        // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
+        // positions and `#p=4` if it represents 4 equivalent positions (with our choice
+        // of canonicalization, `#p=4` positions are positions with both kings on the
+        // a1-h8 diagonal). When retrograde propagation from `p'` finds move `p -> p'`
+        // with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the
+        // counter for the reflection of `p` along the diagonal should also be decremented
+        // (since the symmetric move contributed to the counter for the reflection of `p`
+        // but led to a non-canonical position).
+        if use_diagonal_symmetry {
+            let maybe_reflected_idx = twin.diagonal_symmetric(pred_idx);
+            if let Some(reflected_idx) = maybe_reflected_idx {
+                // The current index represents 8 positions, while the predecessor index
+                // represents 4 positions. Push the diagonal reflection of the predecessor.
+                f(reflected_idx);
             }
-        });
+        }
+    };
+
+    if table.is_pawnless() {
+        pawnless_quiet_unmoves(&position, emit);
+    } else {
+        RetrogradeAnalysis::new(&position)
+            .with_castling_mode(CastlingRetrogradeMode::NoCastling)
+            .quiet_unmoves(|pred_position, _m| emit(pred_position));
+    }
 }
 
 fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) -> u16 {
@@ -1066,6 +1096,58 @@ pub(crate) fn retrograde_analysis_in_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_pawnless_unmoves_match_reference(position: &Chess) {
+        let mut expected = HashMap::new();
+        RetrogradeAnalysis::new(position)
+            .with_castling_mode(CastlingRetrogradeMode::NoCastling)
+            .quiet_unmoves(|predecessor, _m| {
+                *expected.entry(predecessor).or_insert(0usize) += 1;
+            });
+        let mut actual = HashMap::new();
+        pawnless_quiet_unmoves(position, |predecessor| {
+            *actual.entry(predecessor).or_insert(0usize) += 1;
+        });
+        assert_eq!(actual, expected, "predecessor multisets differ for {position:?}");
+    }
+
+    #[test]
+    fn pawnless_unmoves_match_reference() {
+        let dir = crate::TestDir::new("pawnless_unmoves_match_reference");
+        for endgame in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KQ_KR", "KNN_K", "KQR_KB"] {
+            let file = EgtFile::new(&dir.0, endgame).unwrap();
+            for egt in &file.egts {
+                for turn in [Color::White, Color::Black] {
+                    let mut checked = 0;
+                    let stride = (egt.index_range() / 512).max(1);
+                    for idx in (0..egt.index_range()).step_by(stride) {
+                        if let Some(position) = egt.position_from_index(idx, turn) {
+                            assert_pawnless_unmoves_match_reference(&position);
+                            checked += 1;
+                        }
+                    }
+                    assert!(checked > 0, "no valid samples for {endgame}, {turn:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pawnless_unmoves_match_reference_in_checks_and_terminal_positions() {
+        use shakmaty::{CastlingMode, fen::Fen};
+
+        for fen in [
+            "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1", // Checkmate.
+            "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1", // Stalemate.
+            "4k3/8/8/1B6/8/8/8/K3R3 b - - 0 1", // Discovered double check.
+            "4k3/4r3/8/8/8/8/8/K3R3 w - - 0 1", // Pinned previous mover.
+            "4r2k/8/8/8/8/8/4R3/4K3 b - - 0 1", // Last move can block check.
+        ] {
+            let position: Chess = fen.parse::<Fen>().unwrap()
+                .into_position(CastlingMode::Standard).unwrap();
+            assert_pawnless_unmoves_match_reference(&position);
+        }
+    }
 
     fn atomic_values(values: Vec<MaybeDtcOutcome>) -> Vec<AtomicU16> {
         values.into_iter().map(|v| AtomicU16::new(v.to_u16())).collect()

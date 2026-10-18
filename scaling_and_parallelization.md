@@ -624,10 +624,11 @@ remain unchanged; they do not establish Step 3 validation.
 
 ### Step 6: reduce the cost per position
 
-- Avoid `from_setup` re-validation. Evaluate a generation-specific index
-  layout (Section 6.2).
-- Required before 7 pieces are economically reasonable. Can be started any time
-  after Step 1, since the byte-identical check guards it.
+- **Targeted per-position optimizations started.**
+  Pawnless quiet-unmove construction now uses a small local reverse-attack
+  path with checked predecessor construction, but without checked forward replay
+  or successor comparison. Pawnful/en-passant handling still uses the fork.
+- Optimize pawnful quiet-unmove construction (still pending).
 
 ### Step 7: distributed backend (worker swarm)
 
@@ -645,6 +646,11 @@ remain unchanged; they do not establish Step 3 validation.
 - Consider further slicing of positions with one pair of opposing pawns (see [https://github.com/lichess-org/op1]).
 - **Acceptance:** byte-identical output. Peak memory reduced to about one slice
   plus the successor slices it reads.
+
+### Optional step: further optimizations
+
+- Avoid `from_setup` re-validation in source decoding.
+- Evaluate a generation-specific index layout (Section 6.2).
 
 ---
 
