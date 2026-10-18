@@ -62,6 +62,12 @@ impl Egt {
         self.indexer.position_to_index(position)
     }
 
+    /// Encodes the horizontal reflection of a no-castling position.
+    /// The reflected position must match this table's piece set and pawn files.
+    pub(crate) fn reflected_position_to_index(&self, position: &Chess) -> usize {
+        self.indexer.reflected_position_to_index(position)
+    }
+
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
     // If the index represents an invalid position, returns None.
     pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
@@ -236,6 +242,50 @@ mod tests {
     fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
         if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
             assert_eq!(i, egt.indexer.position_to_index(&position));
+        }
+    }
+
+    #[test]
+    fn reflected_index_matches_board_reflection() {
+        use crate::egt_file::mirror_horizontally;
+
+        for name in ["KPa_K", "KPd_KPe", "KPaPaPd_KPbPf", "KNN_K"] {
+            let egt = from_tablename(name).unwrap();
+            let stride = (egt.index_range() / 256).max(1);
+            let mut checked = 0;
+            for turn in [Color::White, Color::Black] {
+                for idx in (0..egt.index_range()).step_by(stride) {
+                    if let Some(position) = egt.position_from_index(idx, turn) {
+                        let source = mirror_horizontally(&position).unwrap();
+                        let reflected = mirror_horizontally(&source).unwrap();
+                        assert_eq!(egt.reflected_position_to_index(&source), egt.position_to_index(&reflected), "{name}, {turn:?}, {idx}");
+                        assert_eq!(egt.reflected_position_to_index(&source), idx);
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 0, "no valid samples for {name}");
+        }
+    }
+
+    #[test]
+    fn reflected_index_preserves_legal_en_passant() {
+        use crate::egt_file::mirror_horizontally;
+        use shakmaty::{CastlingMode, Position, fen::Fen};
+
+        for (fen, name) in [
+            ("7k/8/8/3Pp3/8/8/8/K7 w - e6 0 1", "KPe_KPd"),
+            ("7k/8/8/8/3pP3/8/8/K7 b - e3 0 1", "KPe_KPd"),
+            ("7k/8/8/3Pp3/8/4P3/4P3/K7 w - e6 0 1", "KPdPdPe_KPd"),
+            ("7k/4p3/4p3/8/3pP3/8/8/K7 b - e3 0 1", "KPdPdPe_KPd"),
+        ] {
+            let position: Chess = fen.parse::<Fen>().unwrap()
+                .into_position(CastlingMode::Standard).unwrap();
+            assert!(position.legal_ep_square().is_some());
+            let reflected = mirror_horizontally(&position).unwrap();
+            assert_eq!(reflected.legal_ep_square(), position.legal_ep_square().map(|sq| sq.flip_horizontal()));
+            let egt = from_tablename(name).unwrap();
+            assert_eq!(egt.reflected_position_to_index(&position), egt.position_to_index(&reflected), "{fen}");
         }
     }
 

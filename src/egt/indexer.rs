@@ -389,9 +389,18 @@ impl Indexer {
 
     // Encodes the position into an index, which represents the position up to symmetries.
     pub fn position_to_index(&self, position: &Chess) -> usize {
-        //println!("position_to_index: {}", position);
-        //println!("en passant: {:?}", position.en_passant());
-        let ep_file = position.legal_ep_square().map(|sq| sq.file());
+        self.position_to_index_impl::<false>(position)
+    }
+
+    // Encodes the horizontal reflection without constructing another Chess.
+    pub(crate) fn reflected_position_to_index(&self, position: &Chess) -> usize {
+        self.position_to_index_impl::<true>(position)
+    }
+
+    fn position_to_index_impl<const REFLECTED: bool>(&self, position: &Chess) -> usize {
+        let ep_file = position.legal_ep_square().map(|sq| {
+            if REFLECTED { sq.flip_horizontal().file() } else { sq.file() }
+        });
         let (index_offset, ep_idx) = self.adjust_ep_from_position(ep_file);
         // Now the en passant option reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
@@ -400,7 +409,7 @@ impl Indexer {
         let mut buffer_coord = Self::filled_coord(self.n_pieces);
         let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
 
-        self.position_to_coord(ep_idx, &mut buffer_coord, position);
+        self.position_to_coord::<REFLECTED>(ep_idx, &mut buffer_coord, position);
         // Now `buffer_coord` has the coordinates (rank, file) of the pieces.
         //println!("buffer_coord: {:?}", buffer_coord);
 
@@ -584,11 +593,15 @@ impl Indexer {
 
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
-    fn position_to_coord(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
+    fn position_to_coord<const REFLECTED: bool>(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
         assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
         for p in self.piece_set(ep_idx) {
             let mut bb = match p.role {
-                EgtRole::Pawn(f) => position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(f),
+                EgtRole::Pawn(f) => {
+                    // Piece groups describe the target files, not the source files.
+                    let source_file = if REFLECTED { File::new(7 - f.to_u32()) } else { f };
+                    position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file)
+                }
                 EgtRole::King => position.board().by_role(Role::King),
                 EgtRole::Queen => position.board().by_role(Role::Queen),
                 EgtRole::Rook => position.board().by_role(Role::Rook),
@@ -601,6 +614,7 @@ impl Indexer {
             };
             assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
             for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
+                let square = if REFLECTED { square.flip_horizontal() } else { square };
                 buffer_coord[i] = (square.rank().to_usize(), square.file().to_usize());
             }
         }

@@ -41,7 +41,7 @@
 use shakmaty::{Bitboard, Color, Chess, Move, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
-use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
+use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, EgtFileStats, LongestDtcPosition};
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
 use crate::piece_set::{EgtRole, EgtSide};
@@ -406,13 +406,12 @@ pub fn quiet_unmoves<F>(
 
     RetrogradeAnalysis::new(&position)
         .with_castling_mode(CastlingRetrogradeMode::NoCastling)
-        .quiet_unmoves(|mut pred_position, _m| {
-            if mirrored {
-                pred_position = mirror_horizontally(&pred_position)
-                    .expect("mirrored predecessor position must be legal");
-            }
-
-            let pred_idx = twin.position_to_index(&pred_position);
+        .quiet_unmoves(|pred_position, _m| {
+            let pred_idx = if mirrored {
+                twin.reflected_position_to_index(&pred_position)
+            } else {
+                twin.position_to_index(&pred_position)
+            };
             f(pred_idx);
 
             // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
