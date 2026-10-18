@@ -38,7 +38,7 @@
 //! All writers validate that every sub-table is complete before either file in
 //! an endgame pair is published.
 
-use shakmaty::{Bitboard, Color, Chess, Position, Role};
+use shakmaty::{Bitboard, Color, Chess, Move, Position, Role};
 use shakmaty::retrograde::{RetrogradeAnalysis, CastlingRetrogradeMode};
 use crate::{ConversionType, EgtGenerator};
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical, mirror_horizontally, EgtFileStats, LongestDtcPosition};
@@ -434,8 +434,7 @@ pub fn quiet_unmoves<F>(
         });
 }
 
-fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
-    let legals = position.legal_moves();
+fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) -> u16 {
     let kings = position.board().by_role(Role::King);
 
     // Let's say a canonical position `p` has `#p=8` if it represents 8
@@ -454,7 +453,7 @@ fn symmetry_adjusted_move_counter(position: &Chess) -> u16 {
     }
 
     let mut counter = 0;
-    for m in &legals {
+    for m in legals {
         // Whether `#p'=4` depends only on the two king squares, so only a quiet
         // king move can require the adjustment. Deriving the successor's king
         // bitboard directly avoids cloning and replaying the position for every
@@ -600,7 +599,7 @@ fn initialize_table(
             }
 
             let mut counter = if pawnless {
-                symmetry_adjusted_move_counter(&position)
+                symmetry_adjusted_move_counter(&position, &legals)
             } else {
                 legals.len() as u16
             };
