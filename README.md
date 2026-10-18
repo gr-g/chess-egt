@@ -29,6 +29,10 @@ Run the test suite with:
 cargo test --release
 ```
 
+Chess rules and position validation use the upstream
+[`shakmaty`](https://crates.io/crates/shakmaty) crate. Retrograde analysis
+is implemented locally for the tablebase solver.
+
 # Design Specifications
 
 ## 1. High-Level Architecture
@@ -64,7 +68,7 @@ En-passant positions are encoded separately in different ranges of indices (sub-
 #### Local Indexing Algorithm (`board_to_index`)
 The `Indexer` maps a chess position to a unique integer in `[0, index_range)` using a multi-step compaction and combinatorial encoding process:
 
-   - The indexer checks if there is an active en-passant option on the board.
+   - The indexer checks whether a legal en-passant capture is available. A raw EP square without a legal capture is equivalent to no EP.
    - If so, it selects the corresponding sub-table and adjusts the `index_offset`. In this sub-table, the pawn on the 5th rank that can be captured en-passant is fixed and not encoded, reducing the number of combinations.
    - The board position is converted into coordinates `(rank, file)` for each piece.
    - To avoid duplicate indexing of identical positions for indistinguishable pieces (e.g., two white knights, or multiple pawns of the same color on the same file), their coordinates are sorted in a descending standard order.
@@ -122,8 +126,8 @@ Retrograde analysis is the recursive algorithm used to generate endgame tablebas
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis is run on both tables simultaneously in a single unified loop. Both tables are initialized and propagated together.
 
 Generation supports shared-memory parallelism through Rayon. Use `--threads N`
-(or `EgtGenerator::with_threads(N)` in the library); the default is one thread,
-with zero rejected. For example:
+(or `EgtGenerator::with_threads(N)` in the library); the default is one thread.
+For example:
 
 ```sh
 cargo run --release -- --path ./tables --input-path ~/tablebases --generate KQB_KQ --threads 4 --noverify
@@ -150,29 +154,22 @@ A formal approach is the following. Let's say a canonical position `p` has `#p=8
 Similarly, when retrograde propagation from `p'` finds a reverse move `p -> p'` with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the counter for the reflection of `p` along the diagonal should also be decremented (since the symmetric move contributed to the counter for the reflection of `p` but led to a non-canonical position).
 
 ### 6.3 Initialization Phase
-Before starting the main retrograde loop, both tables in the pair are initialized:
-1. **Invalid Positions:** Scan all indices and mark invalid positions as 'invalid'.
-2. **Stalemate Positions:** Identify all valid positions with no legal moves that are not in check, and mark them as 'draw'.
-3. **Checkmate Positions:** Identify all checkmated positions and mark them as 'loss (mate-in-0)'.
-   * Perform the unmoves (`quiet_unmoves`). Mark the resulting predecessor positions as 'win (mate-in-1)' in the twin table.
-4. **Move Counters:** Initialize the decremental move counter for all remaining valid positions (marked as 'unknown').
-5. **Dependency Probing (Conversions):** For each table, probe the fully generated dependency tables (which have fewer pieces or fewer pawns) to resolve capture and promotion moves:
-   * Scan the losing positions in the dependency tables and perform the corresponding unmoves (`capture_unmoves`, `promotion_unmoves`, `promotion_capture_unmoves`). Mark the resulting predecessor positions as 'win (capture-in-1)' or 'win(promotion-in-1)' if they are not already marked.
-   * Scan the winning positions in the dependency tables and perform the corresponding unmoves (`capture_unmoves`, `promotion_unmoves`, `promotion_capture_unmoves`). If a predecessor position is 'unknown', decrement the counter. If the counter reaches zero, mark the predecessor as 'loss (capture-in-1)' or 'loss (promotion-in-1)'.
-   * Here are some examples of dependency generation:
-     - the table K_K has no dependencies.
-     - the table K_KQ has one dependency: K_K (when the Q is captured)
-     - the table KQ_KPa has one dependency: K_KQ (when the P is captured)
-     - the table KPa_KQ has 9 dependencies:
-       - K_KPa (when the Q is captured)
-       - KQ_KQ (when the P promotes to Q)
-       - KQ_KR (when the P promotes to R)
-       - KQ_KB (when the P promotes to B)
-       - KQ_KB (when the P promotes to N)
-       - K_KQ (when the P promotes to Q capturing the Q)
-       - K_KR (when the P promotes to R capturing the Q)
-       - K_KB (when the P promotes to B capturing the Q)
-       - K_KB (when the P promotes to N capturing the Q)
+Both tables in the pair are initialized independently, with each position updating
+only its own entry:
+
+1. **Decode and validate:** scan all indices and mark invalid arrangements as invalid.
+2. **Generate legal moves:** an empty list means checkmate (loss at ply 0)
+   when in check, or stalemate (draw) otherwise.
+3. **Initialize counters:** count legal moves, with the pawnless symmetry adjustment
+   described above.
+4. **Probe conversions forward:** play legal captures/promotions and probe their
+   dependency tables. A losing successor resolves the position as a win at ply 1;
+   each winning successor removes one move from its counter. A zero counter
+   resolves a loss at ply 1. Conversions to draws remain in the counter.
+
+Dependencies have fewer pieces after captures or fewer pawns after promotions.
+Quiet predecessors of checkmates are visited in the first propagation phase;
+initialization does not generate capture or promotion unmoves.
 
 ### 6.4 The Propagation Loop
 Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions, aligned on each table's local indices) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
@@ -193,9 +190,18 @@ Every resolved position stores its distance, so the positions to propagate at a 
 
 A phase only scans values at ply `n-1` and only writes values at ply `n` (or counters), so the result does not depend on the order in which positions are visited. Running the three conversion types separately makes the conversion type of a loss deterministic (the last one to decrement its counter, i.e. Promotion > Capture > Checkmate).
 
-### 6.5 Use of reverse move generation for transitions from a different endgame
-The current approach relies only on `quiet_unmoves()`: a function that lists reverse moves without considering captures or promotions. This is enough during initialization, when we can scan all indexes and list the legal moves and consider transitions to simpler endgames. During this phase, for each capture/promotion move, we compute the index in the dependency and lookup the tablebase result: a losing successor makes the position a win at ply 1, and a winning successor decrements the position's own counter (a counter reaching zero makes it a loss at ply 1).
+### 6.5 Predecessor Generation
 
-In principle another approach is possible, which consists in scanning all indexes of simpler endgames, generating reverse capture/promotion moves from there (with unmove functions such as `capture_unmoves()`, `promotion_unmoves()`, or `promotion_capture_unmoves()`) and using these to update the predecessors.
+`quiet_unmoves()` in `src/retrograde.rs` returns predecessor indices in the twin
+table. Local pawnless and pawnful generators use reverse attacks onto empty
+squares and reverse single/double pawn pushes. They construct each candidate
+through Shakmaty's checked `Setup` API. Castling, captures, and promotions are
+excluded.
+
+### 6.6 Alternative Conversion Initialization
+
+An alternative to forward dependency probing would scan simpler endgames and
+generate reverse capture/promotion moves to update their predecessors. These
+unmove functions are not part of the current implementation.
 
 If this approach was used, note that special care should be given to unmoves from a pawnless successor (which has 8-way symmetry) to a pawned predecessor (which has 2-way horizontal symmetry). The process would be to reconstruct the 4 rotations of the canonical pawnless board, then call the retrograde unmove function on each of the 4 rotations. For each resulting predecessor board, if the newly placed pawn lands on files e–h, horizontally reflect the board to files a–d to canonicalize.

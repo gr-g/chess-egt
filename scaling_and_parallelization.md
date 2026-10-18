@@ -9,13 +9,9 @@ It builds on [`algorithms_comparison.md`](algorithms_comparison.md), in
 particular the single-threaded measurements of the counters and sweep core
 loops in its Section 2.A.
 
-**Status:** Steps 1-4 and the minimal object-storage prerequisite of Step 6 are
-implemented; Step 5 and the Step 6 job system remain a roadmap, as do Steps 7-8.
-Historical Step 1/2 validation and measurements are recorded below. Step 3 is reference-validated
-on the sets listed below; its remaining sample measurements are still open.
-Step 4 correctness checks and initial scaling measurements are recorded below. Sizes are computed from
-the current indexing scheme. Compute estimates are extrapolated from the
-measured 4- and 5-piece generation times in `AGENTS.md` and should be treated as orders of magnitude.
+**Status:** Steps 1-4, the object-storage prerequisite of Step 5, and the local
+per-position optimizations in Step 6 are implemented. The job runner in Step 5
+and distributed backend in Step 7 remain proposals.
 
 ---
 
@@ -35,8 +31,8 @@ measured 4- and 5-piece generation times in `AGENTS.md` and should be treated as
   sweep's zero extra memory. Its updates are pushed to the position being
   updated and never require reading remote data. It therefore runs unchanged on
   shared memory (atomic updates) and on separate-memory workers (messages).
-- **Recommended order:** independent jobs first, multi-threading second,
-  worker swarm last, built behind the same core-loop abstraction.
+- **Next scaling step:** schedule independent jobs around the existing
+  multi-threaded solver before introducing a worker swarm.
 - **At 7 pieces, the cost per position dominates everything.** A 5x faster core
   loop saves more than any parallelization design.
 - **Cloud cost (speculative, Section 9):** all 6-piece tables take about one day
@@ -411,53 +407,46 @@ enough. Worth revisiting together with the object-storage work.
 
 ## 7. Implementation roadmap
 
-Each step is independently useful. Changes that preserve the storage layout
-retain the **byte-identical** output guarantee (sha256 comparisons against the
-appropriate reference baseline). Step 3 changes the frame layout and instead
-requires per-index outcome/DTC equality and logical statistics equality,
-excluding `bytes`, `sha256`, and `num_frames`. Historical Step 1/2 results below
-remain unchanged; they do not establish Step 3 validation.
+Implemented steps describe the current backend; pending steps identify work
+needed for larger table sets. Output-preserving changes require **byte-identical**
+`.ggegt` and `.json` output against compatible references. Storage-layout changes
+instead require per-index outcome/DTC equality and logical statistics equality,
+excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 
 ### Step 1: scan-driven counter loop (single-threaded)
 
-- Implement Section 4.2 as a third `Algorithm` variant (e.g. `scan`), reusing
-  `quiet_unmoves` and the symmetry-adjusted counter initialization.
-- Conversion-type sub-phases, as in 4.2, so the output does not depend on
-  processing order.
-- Write the loop against an internal "update sink" interface
-  (`mark_win(table, idx, ct, ply)`, `decrement(table, idx, ct, ply)`), with a
-  direct, non-atomic implementation for now.
-- **Acceptance:** byte-identical output. Time close to the counters
-  (target ≤ +5%). Peak memory close to the sweep's. Measure on the 5-piece
-  sample of `algorithms_comparison.md` Section 2.A.
-- Then: make `scan` the default and decide whether to keep `counters` (the
-  queues) or retire it. Keep `sweep` as the reference.
-- **Status: done.** Implemented as `--algorithm scan`. Output is
-  byte-identical (`.ggegt` and `.json`) on all 3/4-piece tables and the 5-piece
-  sample. It is now the only core loop (`solve_pair` in `retrograde.rs`): the
-  `counters` and `sweep` loops were removed to keep the code simple (they
-  remain in the git history). The update sink is two methods on
-  `RetrogradeSolver` (`mark_win`, `decrement`). The loop is not generic over it
-  yet, because `quiet_unmoves` passes the whole solver to its callback; this
-  split belongs to Steps 3-4.
+- **Status: implemented.** `solve_pair` in `retrograde.rs` uses the
+  scan-driven counter loop of Section 4.2; there is no algorithm selector.
+  Symmetry-adjusted counters record moves not yet known to lose. Each ply
+  scans resolved values at the previous ply and propagates through quiet
+  predecessors, without a separate frontier queue.
+- Conversion-type sub-phases make the output independent of processing order:
+  W precedes L(Checkmate), L(Capture), and L(Promotion). Scans read values at
+  `p - 1` and update counters or resolve values at `p`.
+- Updates are `WorkingPair::mark_win` and `WorkingPair::decrement`, using atomic
+  CAS as described in Step 4. `quiet_unmoves` takes immutable source/twin `Egt`
+  metadata and emits predecessor local indices; its callback does not receive
+  the solver. A generic update-sink abstraction is not required by this backend.
+- **Reference evidence:** the scan-loop implementation produced byte-identical
+  `.ggegt` and `.json` output on all 3/4-piece tables and the 5-piece sample.
+  [Algorithm comparisons](algorithms_comparison.md), Section 2.A, records the
+  time/memory measurements. These establish the loop's output-preserving
+  behavior at implementation time, not current whole-project hash validation.
 
 ### Step 2: per-block ply summary
 
-- One byte per block recording the last ply at which a value was resolved in
-  it. Scans skip blocks that cannot contain values of the scanned ply.
-- **Acceptance:** check if there are meaningful advantages of this approach on
-  deep tables where each ply resolves few positions (`KNN_KP`, `KBB_KN`). If
-  yes we keep it, otherwise we go ahead without any changes.
-- **Status: done, kept.** `PlySummary` in `retrograde.rs`: one `u16` per block
-  of 4096 positions (aligned on global indices, so a block never crosses a
-  frame), created per pair in `solve_pair`. Every block starts at ply 1, which
-  covers initialization. A block is stamped when `mark_win` or `decrement`
-  resolves a position in it. A scan for values at `p - 1` visits the blocks
-  stamped at `p - 1` or later: this is conservative (blocks stamped at `p` are
-  visited too), which keeps the output byte-identical. The list of blocks is
-  taken before each scan, which is correct because a scan only writes values at
-  `p`. Measurements (single-threaded, baseline and new binaries run
-  concurrently on the same machine):
+- **Status: implemented.** `PlySummary` in `retrograde.rs` stores one
+  `AtomicU16` per block of 4096 positions, aligned on each table's local
+  indices and independent of storage frames. `solve_pair` creates one summary
+  per working array; a self-twin shares one array and summary.
+- Every block starts at ply 1, covering initialization. When `mark_win` or
+  `decrement` newly resolves a position, the callback stamps its block using
+  an atomic maximum. A scan for values at `p - 1` visits blocks stamped at
+  `p - 1` or later. This conservative filter also admits blocks stamped at `p`
+  without omitting earlier matches. The block list is taken before each scan;
+  writes at `p` cannot create new matches at `p - 1`.
+- **Implementation-era measurements** (single-threaded, baseline and new
+  binaries run concurrently on the same machine):
 
   | Set / Endgame | Blocks visited | Propagation before | After | Δ |
   |---|---:|---:|---:|---:|
@@ -465,26 +454,25 @@ remain unchanged; they do not establish Step 3 validation.
   | `KBB_KN` | 65% | 132.2 s | 131.4 s | -1% |
   | All 4-piece | 54% | 248.0 s | 247.9 s | 0% |
 
-  Output is byte-identical (`.ggegt` and `.json`) on all 4-piece tables,
-  `KNN_KP` and `KBB_KN`. The gain matches the scan overhead measured in
-  Step 1 on `KNN_KP` (+10%), which is now almost gone. `KBB_KN` gains little
-  because the positions resolved at a ply are spread over most blocks. The
-  summary pays off only when the frontier is thin in blocks, not just in
-  positions. Separate win/loss summaries or smaller blocks might tighten
-  this, but were not tried.
+  Those runs produced byte-identical `.ggegt` and `.json` output on all
+  4-piece tables, `KNN_KP`, and `KBB_KN`. The `KNN_KP` gain largely offset
+  the scan overhead measured in the algorithm comparison (+10%). `KBB_KN`
+  gained little because positions resolved at a ply were spread over most
+  blocks. The summary pays off when the frontier is thin in blocks, not just
+  in positions. Separate win/loss summaries or smaller blocks remain possible
+  refinements; these results are not current upstream performance measurements.
 
 ### Step 3: flat working table, per-pair output
 
-- **Status: implemented and reference-validated on all 3/4-piece endgames,
-  `KNN_KP`, and `KBB_KN`.**
-  The active pair uses flat `Vec<MaybeDtcOutcome>` arrays separate from
-  `EgtFile`. `quiet_unmoves` takes immutable source/twin `Egt` metadata and
-  calls back with predecessor local indices, rather than passing the solver.
-- `PlySummary` retains the Step 2 conservative scan logic, but its 4096-position
-  blocks are now aligned on each table's local indices, independent of storage
-  frames. The global alignment described in Step 2 is historical.
-- Each finalized sub-table is compressed into **in-memory output segments** and
-  its working array is released after compressing the pair. Frames are table-aligned,
+- **Status: implemented.** `WorkingPair` holds flat `Vec<AtomicU16>` arrays
+  separate from `EgtFile`, one per active table (one shared array for a
+  self-twin). Encoded values are interpreted as `MaybeDtcOutcome` on load.
+  Predecessor callbacks use table-local indices, and `PlySummary` blocks are
+  independent of the file's frame layout.
+- Finalization consumes each atomic array into plain outcomes, marks remaining
+  unknowns as draws, records statistics, and compresses the sub-table into
+  **in-memory output segments**. Its plain array is then released before
+  finalizing the twin or allocating the next pair. Frames are table-aligned,
   contain at most `256 * 1024` positions, and end in short, unpadded tails.
   The transposition is unchanged: exactly `2 * N` bytes for a frame of `N`
   positions, including the unused zero tail after packed high bytes.
@@ -503,24 +491,22 @@ remain unchanged; they do not establish Step 3 validation.
   Bounded upload concurrency limits in-flight buffers, not retained compressed
   output. Recursive dependency generation can retain a parent pair and its
   compressed output while solving a dependency (Section 6.1).
-- **Acceptance:** per-index outcome/DTC equality and logical statistics
-  equality, excluding `bytes`, `sha256`, and `num_frames`. Exact outcome values (including conversion type
-  and DTC) and semantic statistics matched the reference tables in
-  `~/tablebases` for every logical index in both orientations of the validated
-  endgames.
-- **Historical validation:** during Step 3 implementation, `cargo test --release`
-  covered full/short frames, disk-backed resaving, reverse-order staging, invalid
-  layouts, missing/duplicate submissions, and temporary-file cleanup under the
-  former disk-spool design. This is not validation of the current in-memory
-  publication path. The reference comparisons above were performed during
-  Step 3 implementation. The remaining four endgames
-  in the 5-piece sample and generation-only elapsed-time, peak-RSS, and
-  output-size comparisons have not been measured.
+- **Validation criterion:** per-index outcome/DTC equality and logical
+  statistics equality, excluding `bytes`, `sha256`, and `num_frames`, because
+  the table-aligned frame layout changes physical output. At implementation
+  time, exact outcome values (including conversion type and DTC) and semantic
+  statistics matched `~/tablebases` at every logical index in both orientations
+  of all 3/4-piece endgames, `KNN_KP`, and `KBB_KN`.
+- Those comparisons do not establish full reference validation of the current
+  in-memory publication path. The remaining four endgames in the 5-piece sample
+  and generation-only elapsed-time, peak-RSS, and output-size comparisons remain
+  unmeasured for this layout change.
 
 ### Step 4: multi-threading (`rayon`)
 
-- **Status: implemented and byte-reference-validated on all 3/4-piece endgames
-  at 1, 2, and 4 threads, and against the previous serial binary on `KQB_KQ`.**
+- **Status: implemented.** Reference and scaling measurements below establish
+  implementation-era behavior, not fresh validation of the current dependency
+  and solver configuration.
 - `--threads N` / `EgtGenerator::with_threads(N)` selects a dedicated Rayon pool;
   the default remains one thread. Zero is rejected. Pairs are solved serially,
   using the same pool throughout an endgame. Recursive dependency generation
@@ -557,14 +543,15 @@ remain unchanged; they do not establish Step 3 validation.
 - Finalization consumes atomic arrays into plain outcomes one table at a time.
   Statistics, compression, ordered publication, verification, and JSON generation
   remain serial and deterministic. No unsafe array reinterpretation is used.
-- **Validation:** `cargo test --release` passes 54 tests, including concurrent CAS
-  contention, concurrent summary maxima, ordered loss-conversion phases,
-  multi-block self-twin scans, cached/shared dependency probing, dependency
-  failure/recovery, zero-thread rejection, and 1-vs-4-thread output/statistics equality. All **132
-  `.ggegt`/`.json` files** from generation of all 3/4-piece endgames match the
-  current-format references in `~/tablebases` at each of 1, 2, and 4 threads.
-  Generation-only elapsed times were 350.3 s, 232.4 s, and 186.6 s respectively.
-- **Initial scaling measurement:** sequential runs of `KQB_KQ` (both orientations),
+- **Test coverage:** concurrent CAS contention, concurrent summary maxima,
+  ordered loss-conversion phases, multi-block self-twin scans, cached/shared
+  dependency probing, dependency failure/recovery, zero-thread rejection, and
+  1-vs-4-thread output/statistics equality. Run tests with `cargo test --release`.
+- **Reference evidence:** implementation-time generation of all 3/4-piece
+  endgames produced **132 `.ggegt`/`.json` files** matching the table-aligned
+  references in `~/tablebases` at each of 1, 2, and 4 threads. Generation-only
+  elapsed times were 350.3 s, 232.4 s, and 186.6 s respectively.
+- **Implementation-era scaling measurement:** sequential runs of `KQB_KQ` (both orientations),
   existing dependencies, `--noverify`, same release codegen and compression:
 
   | Implementation | Initialization | Propagation | Finalization | Wall time | Peak RSS |
@@ -611,8 +598,7 @@ remain unchanged; they do not establish Step 3 validation.
   without a second local artifact; JSON statistics are published separately
   afterward. Verification still follows publication. The synchronous library
   uses a shared private Tokio runtime; async applications must call it through
-  `spawn_blocking`. See [README.md](README.md#storage-and-usage) for configuration
-  and the storage API.
+  `spawn_blocking`. See [README.md](README.md#usage) for command-line examples.
 - **Jobs: not implemented.** Still needed: a job graph over (endgame, pair,
   slice), a simple runner (local first, then instances pulling jobs from a
   queue), and a validated completion protocol/manifests for idempotent retries.
@@ -624,11 +610,21 @@ remain unchanged; they do not establish Step 3 validation.
 
 ### Step 6: reduce the cost per position
 
-- **Targeted per-position optimizations started.**
-  Pawnless quiet-unmove construction now uses a small local reverse-attack
-  path with checked predecessor construction, but without checked forward replay
-  or successor comparison. Pawnful/en-passant handling still uses the fork.
-- Optimize pawnful quiet-unmove construction (still pending).
+- **Implemented:** initialization reuses its legal-move list; reflected indexing
+  avoids `Chess` reconstruction; local pawnless and pawnful quiet predecessors
+  use reverse attacks and checked `Setup` construction without forward replay.
+  EP state is legal-normalized, not based on pawn adjacency. The reverse paths
+  exclude castling, captures, and promotions and use upstream Shakmaty 0.30.
+- Independent exhaustive local oracles use checked forward play to compare
+  predecessor multisets, including EP legality and multiplicity. An indexed
+  `KRP_KP` regression covers a double push with no legal EP capture. Affected
+  legacy tables and dependents require regeneration; their hashes are not a
+  correctness requirement for this semantic correction.
+- **Remaining:** measure checked construction during source decoding and
+  predecessor generation, index encoding, and finalization/compression on the
+  current configuration before choosing further optimizations. Earlier profiles
+  do not establish current upstream cost shares. See
+  [benchmarking](benchmarking.md) for reproducible benchmarks.
 
 ### Step 7: distributed backend (worker swarm)
 
