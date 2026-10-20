@@ -35,6 +35,13 @@ struct Cli {
     #[arg(long)]
     generate_all_5: bool,
 
+    /// Verify the internal consistency of an existing endgame table without generating it.
+    #[arg(long, value_name = "ENDGAME", conflicts_with_all = [
+        "generate", "generate_all_3", "generate_all_4", "generate_all_5",
+        "generate_deps", "noverify", "position",
+    ])]
+    verify: Option<String>,
+
     /// Automatically generate missing dependency endgames on the fly.
     /// By default dependencies must already be available.
     #[arg(long)]
@@ -70,6 +77,12 @@ fn run() -> Result<(), EgtError> {
         generate_all(4, &cli)?;
     } else if cli.generate_all_5 {
         generate_all(5, &cli)?;
+    } else if let Some(ref endgame) = cli.verify {
+        let mut prober = EgtProber::new(&cli.path)?;
+        if let Some(ref input) = cli.input_path {
+            prober.with_input_path(input)?;
+        }
+        prober.verify_internal_consistency(endgame)?;
     } else if let Some(fen) = cli.position {
         let fen_obj: Fen = fen.parse().map_err(|e| EgtError::InvalidPosition(format!("invalid FEN: {e:?}")))?;
         let position = fen_obj.into_position(CastlingMode::Standard)

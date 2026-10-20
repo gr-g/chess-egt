@@ -8,16 +8,19 @@ Goals:
 # Usage
 
 ```sh
-# Generate tables locally.
+# Generate all 3-pieces tables locally.
 cargo run --release -- --path ./tablebases --generate-all-3
 
-# Generate locally using an existing local dependency set.
+# Generate all 4-pieces tables locally using an existing local dependency set.
 cargo run --release -- --path ./tablebases --generate-all-4
 
 # Generate locally using dependencies from an AWS S3 bucket
 # (requires specific environment variables with connection info - see
 # [https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html])
 cargo run --release -- --path ./tablebases --input-path s3://ggegt/ --generate-all-4
+
+# Verify an existing table independently of generation.
+cargo run --release -- --path ./tablebases --verify KQ_KR
 
 # Probe a table.
 cargo run --release -- --path ./tablebases '8/8/8/8/8/2K5/4Q3/7k w - - 0 1'
