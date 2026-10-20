@@ -28,7 +28,6 @@ Size on disk: 3592.53MiB (1.16 bits/pos on average, lowest compression for KBB_K
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
 - Proper memory management and LRU-eviction. Keep track of number of uncompressed frames in EgtFile.
-- Add command to verify a generated file.
 - Visibility and public interface.
 - Add stats without en passant positions to EgtFileStats and implement EgtProber::verify_with_syzygy() to check our stats against the Syzygy stats available on the internet.
 - Experiment with approach using capture/promotion unmoves for initialization.
