@@ -226,7 +226,7 @@ pub struct EgtFile {
     pub stats: Option<EgtFileStats>,
 }
 
-/// Shared dependency files for parallel initialization, without recursive generation.
+/// Shared files for parallel initialization and verification, without recursive generation.
 ///
 /// Move the coordinator's resolved cache here and borrow this reader from scoped
 /// workers. On `DependencyUnavailable`, join all workers, recover the cache with
@@ -254,12 +254,11 @@ impl SharedDependencyReader {
         }
     }
 
-    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
-        let endgame = crate::get_endgame(position);
+    fn file(&self, endgame: &str) -> EgtResult<Arc<RwLock<EgtFile>>> {
         let cached_file = {
             let files = self.files.read()
                 .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-            files.get(&endgame).map(Arc::clone)
+            files.get(endgame).map(Arc::clone)
         };
         let file = if let Some(file) = cached_file {
             file
@@ -267,35 +266,67 @@ impl SharedDependencyReader {
             let mut files = self.files.write()
                 .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
             // Recheck after releasing the read lock: another worker may have loaded it.
-            if !files.contains_key(&endgame) {
+            if !files.contains_key(endgame) {
                 // Serialize loading so racing workers never allocate duplicate files.
                 // This only reads existing files: generation must stay on the coordinator.
                 let file = crate::load_existing_file(
-                    &self.base_path, self.input_path.as_ref(), &endgame,
-                ).map_err(|source| match source {
-                    EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                        dependency: endgame.clone(),
-                        source: Box::new(source),
-                    },
-                    other => other,
-                })?;
-                files.insert(endgame.clone(), Arc::new(RwLock::new(file)));
+                    &self.base_path, self.input_path.as_ref(), endgame,
+                )?;
+                files.insert(endgame.to_string(), Arc::new(RwLock::new(file)));
             }
-            Arc::clone(files.get(&endgame)
+            Arc::clone(files.get(endgame)
                 .ok_or(EgtError::Internal("dependency registry entry missing after insert"))?)
         };
+        Ok(file)
+    }
+
+    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
+        self.probe_indexed(position).map(|(_, outcome)| outcome).map_err(|source| match source {
+            EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
+                dependency: crate::get_endgame(position),
+                source: Box::new(source),
+            },
+            other => other,
+        })
+    }
+
+    pub(crate) fn probe_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
+        let (index, outcome) = self.probe_indexed(position)?;
+        outcome.to_outcome_at(index)
+    }
+
+    fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
+        let file = self.file(&crate::get_endgame(position))?;
         {
             let reader = file.read()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            if let Some(outcome) = reader.probe_cached(position)? {
-                return Ok(outcome);
+            let index = reader.map_position_to_index(position)?;
+            if let Some(outcome) = reader.read_from_index_cached(index)? {
+                return Ok((index, outcome));
             }
         }
         // Release the read guard before acquiring the write guard. `probe` checks
         // the frame state again, so another worker may already have warmed it.
         let mut writer = file.write()
             .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        writer.probe(position)
+        let index = writer.map_position_to_index(position)?;
+        Ok((index, writer.read_from_index(index)?))
+    }
+
+    /// Copies a scan block so no file lock is held while probing successors.
+    /// The range must lie within one frame.
+    pub(crate) fn read_chunk(&self, endgame: &str, start: usize, end: usize) -> EgtResult<Vec<MaybeDtcOutcome>> {
+        let file = self.file(endgame)?;
+        {
+            let reader = file.read()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            if let Some(chunk) = reader.frame_chunk_cached(start, end)? {
+                return Ok(chunk.to_vec());
+            }
+        }
+        let mut writer = file.write()
+            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+        Ok(writer.frame_chunk(start, end)?.to_vec())
     }
 
     /// Recovers owned files, including frames warmed by workers, after they join.
@@ -457,8 +488,12 @@ impl EgtFile {
 
     /// Probes without allocating, decompressing, or reading from disk.
     /// `None` means the frame is cold, not that the outcome is invalid/unknown.
+    #[cfg(test)]
     pub(crate) fn probe_cached(&self, position: &Chess) -> EgtResult<Option<MaybeDtcOutcome>> {
-        let index = self.map_position_to_index(position)?;
+        self.read_from_index_cached(self.map_position_to_index(position)?)
+    }
+
+    fn read_from_index_cached(&self, index: usize) -> EgtResult<Option<MaybeDtcOutcome>> {
         if index >= self.index_range {
             return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
         }
@@ -535,6 +570,23 @@ impl EgtFile {
         }
         let data = self.get_frame_data(frame_idx)?;
         Ok(&data[offset..offset + (end - start)])
+    }
+
+    fn frame_chunk_cached(&self, start: usize, end: usize) -> EgtResult<Option<&[MaybeDtcOutcome]>> {
+        if start > end || end > self.index_range {
+            return Err(EgtError::IndexOutOfRange { index: end, range: self.index_range });
+        }
+        if start == end {
+            return Ok(Some(&[]));
+        }
+        let (frame_idx, offset) = self.locate_frame(start);
+        if end - start > self.frame_layout[frame_idx].len - offset {
+            return Err(EgtError::Internal("frame_chunk range crosses a frame boundary"));
+        }
+        match &self.frames[frame_idx] {
+            FrameState::Uncompressed { uncompressed, .. } => Ok(Some(&uncompressed[offset..offset + end - start])),
+            _ => Ok(None),
+        }
     }
 
     /// Maps a position to the corresponding index. This is used when probing

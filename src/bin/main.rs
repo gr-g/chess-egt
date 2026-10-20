@@ -19,7 +19,7 @@ struct Cli {
     #[arg(long)]
     memory: Option<String>,
 
-    /// Number of generation workers (defaults to one).
+    /// Number of generation and verification workers (defaults to one).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
 
@@ -79,6 +79,7 @@ fn run() -> Result<(), EgtError> {
         generate_all(5, &cli)?;
     } else if let Some(ref endgame) = cli.verify {
         let mut prober = EgtProber::new(&cli.path)?;
+        prober.with_threads(usize::from(cli.threads));
         if let Some(ref input) = cli.input_path {
             prober.with_input_path(input)?;
         }

@@ -541,8 +541,14 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   retain parent working arrays and caches, and repeated initialization has a cost;
   production measurements below use existing dependencies.
 - Finalization consumes atomic arrays into plain outcomes one table at a time.
-  Statistics, compression, ordered publication, verification, and JSON generation
-  remain serial and deterministic. No unsafe array reinterpretation is used.
+  Statistics, compression, ordered publication, and JSON generation remain serial
+  and deterministic. No unsafe array reinterpretation is used.
+- Internal consistency verification uses `--threads N` /
+  `EgtProber::with_threads(N)` (default: one thread); post-generation verification
+  inherits the generator's thread count. Verification workers share the frame
+  cache rather than duplicating loaded frames; there is currently no eviction.
+  Errors fail fast, so parallel verification may report a different failing index
+  than a serial run.
 - **Test coverage:** concurrent CAS contention, concurrent summary maxima,
   ordered loss-conversion phases, multi-block self-twin scans, cached/shared
   dependency probing, dependency failure/recovery, zero-thread rejection, and

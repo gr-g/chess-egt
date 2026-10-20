@@ -27,6 +27,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use crate::storage::Location;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use rayon::prelude::*;
+use crate::egt_file::SharedDependencyReader;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConversionType {
@@ -94,7 +97,7 @@ impl EgtGenerator {
         }
     }
 
-    /// Sets generation workers. Zero is rejected by `generate`.
+    /// Sets generation and verification workers. Zero is rejected by `generate`.
     pub fn with_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
@@ -242,6 +245,7 @@ impl EgtGenerator {
         if self.verify {
             let mut prober = EgtProber::from_location(self.base_path.clone());
             prober.input_path = self.input_path.clone();
+            prober.with_threads(self.threads);
             // Verify the freshly published outputs, not same-named input files.
             prober.cache.insert(file_a.endgame.clone(), file_a);
             if let Some(fb) = file_b {
@@ -264,6 +268,7 @@ pub struct EgtProber {
     input_path: Option<Location>,
     assigned_memory: Option<usize>,
     cache: HashMap<String, EgtFile>,
+    threads: usize,
 }
 
 impl EgtProber {
@@ -282,7 +287,14 @@ impl EgtProber {
             input_path: None,
             assigned_memory: None,
             cache: HashMap::new(),
+            threads: 1,
         }
+    }
+
+    /// Sets verification workers (defaults to one). Zero is rejected by verification.
+    /// Does not change single-position probing.
+    pub fn with_threads(&mut self, threads: usize) {
+        self.threads = threads;
     }
 
     pub fn with_assigned_memory(&mut self, n: usize) {
@@ -321,19 +333,29 @@ impl EgtProber {
     }
 
     /// Verifies the internal consistency of an endgame file, one constituent
-    /// `Egt` sub-table at a time.
+    /// `Egt` sub-table at a time, with index blocks checked by the configured workers.
+    /// Files and decompressed frames are shared between workers without eviction.
+    /// If multiple checks fail, the reported failure may depend on scheduling.
     pub fn verify_internal_consistency(&mut self, endgame: &str) -> EgtResult<()> {
+        if self.threads == 0 {
+            return Err(EgtError::Internal("thread count must be positive"));
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(self.threads).build()
+            .map_err(|_| EgtError::Internal("failed to build verification thread pool"))?;
         // Ensure the main file is in the cache
         if !self.cache.contains_key(endgame) {
             let file = self.load_existing(endgame)?;
             self.cache.insert(endgame.to_string(), file);
         }
 
-        let (n_egts, index_range, sum_of_ranges) = {
+        let (tables, frame_size, index_range, sum_of_ranges) = {
             let file = self.cache.get(endgame)
                 .ok_or(EgtError::Internal("cache entry missing after insert"))?;
             let sum: usize = file.egts.iter().map(|egt| egt.index_range()).sum();
-            (file.egts.len(), file.index_range, sum)
+            let tables: Vec<_> = file.egts.iter().enumerate()
+                .map(|(idx, egt)| (egt.clone(), file.get_global_index(idx, 0)))
+                .collect();
+            (tables, file.frame_size, file.index_range, sum)
         };
 
         if sum_of_ranges != index_range {
@@ -344,12 +366,21 @@ impl EgtProber {
 
         println!(
             "Verifying internal consistency of endgame {} ({} indexes, {} tables)...",
-            endgame, index_range, n_egts
+            endgame, index_range, tables.len()
         );
 
-        for egt_idx in 0..n_egts {
-            self.verify_egt(endgame, egt_idx)?;
-        }
+        let reader = SharedDependencyReader::new(
+            std::mem::take(&mut self.cache), &self.base_path, self.input_path.as_ref(),
+        );
+        let result: EgtResult<()> = pool.install(|| {
+            for (egt, offset) in &tables {
+                Self::verify_egt(&reader, endgame, egt, *offset, frame_size)?;
+            }
+            Ok(())
+        });
+        // Recover warmed frames even when a worker reports a verification error.
+        self.cache = reader.into_cache()?;
+        result?;
 
         println!("Successfully verified internal consistency of endgame {}.", endgame);
         Ok(())
@@ -360,20 +391,50 @@ impl EgtProber {
     /// Indexes are enumerated locally within the sub-table and translated to
     /// global file indexes by adding the sub-table offset, which avoids the
     /// per-index sub-table lookup done by `EgtFile::index_to_position`.
-    fn verify_egt(&mut self, endgame: &str, egt_idx: usize) -> EgtResult<()> {
-        let (tablename, local_range, egt_offset) = {
-            let file = self.cache.get(endgame)
-                .ok_or(EgtError::Internal("cache entry missing after insert"))?;
-            let egt = file.egts.get(egt_idx)
-                .ok_or(EgtError::Internal("egt_idx out of range for this file"))?;
-            (egt.tablename().to_string(), egt.index_range(), file.get_global_index(egt_idx, 0))
-        };
+    fn verify_egt(
+        reader: &SharedDependencyReader,
+        endgame: &str,
+        egt: &egt::Egt,
+        egt_offset: usize,
+        frame_size: usize,
+    ) -> EgtResult<()> {
+        let tablename = egt.tablename();
+        let local_range = egt.index_range();
 
         println!(
             "{}: verifying {} indexes (offset {})...",
             tablename, local_range, egt_offset
         );
 
+        let completed = AtomicUsize::new(0);
+        // Blocks divide frames so copying a block never crosses a frame boundary.
+        let block_size = 4096.min(frame_size);
+        let blocks: Vec<_> = (0..local_range).step_by(frame_size).flat_map(|frame_start| {
+            let frame_end = (frame_start + frame_size).min(local_range);
+            (frame_start..frame_end).step_by(block_size)
+                .map(move |start| (start, (start + block_size).min(frame_end)))
+        }).collect();
+        blocks.into_par_iter().try_for_each(|(start, end)| {
+            Self::verify_block(reader, endgame, egt, egt_offset, start, end)?;
+            let previous = completed.fetch_add(end - start, AtomicOrdering::Relaxed);
+            let done = previous + end - start;
+            if done / 10_000_000 != previous / 10_000_000 {
+                println!("{}: verified {}/{} indexes...", tablename, done, local_range);
+            }
+            Ok(())
+        })
+    }
+
+    fn verify_block(
+        reader: &SharedDependencyReader,
+        endgame: &str,
+        egt: &egt::Egt,
+        egt_offset: usize,
+        start: usize,
+        end: usize,
+    ) -> EgtResult<()> {
+        let tablename = egt.tablename();
+        let outcomes = reader.read_chunk(endgame, egt_offset + start, egt_offset + end)?;
         // Builds the error for a failure at `local_idx`, tagging the reason with
         // the sub-table name and local index. The reported index is the global
         // one, so that it can be fed back to `read_from_index` for debugging.
@@ -383,22 +444,10 @@ impl EgtProber {
             reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
         };
 
-        for local_idx in 0..local_range {
-            if (local_idx + 1) % 10000000 == 0 {
-                println!("{}: verified {}/{} indexes...", tablename, local_idx + 1, local_range);
-            }
-
+        for (relative_idx, outcome_maybe) in outcomes.into_iter().enumerate() {
+            let local_idx = start + relative_idx;
             let global_idx = egt_offset + local_idx;
-
-            // Retrieve the setup and the outcome for this index. The borrow of
-            // the cached file must end before probing successors below.
-            let (position_opt, outcome_maybe) = {
-                let file = self.cache.get_mut(endgame)
-                    .ok_or(EgtError::Internal("cache entry missing after insert"))?;
-                let position_opt = file.egts[egt_idx].position_from_index(local_idx, Color::White);
-                let outcome_maybe = file.read_from_index(global_idx)?;
-                (position_opt, outcome_maybe)
-            };
+            let position_opt = egt.position_from_index(local_idx, Color::White);
 
             if position_opt.is_none() {
                 if !outcome_maybe.is_invalid() {
@@ -431,9 +480,9 @@ impl EgtProber {
                     ));
                 }
             } else {
-                let best = self.best_outcome(&position, &legals)?;
+                let best = Self::best_outcome(reader, &position, &legals)?;
                 if outcome != best {
-                    let details = self.describe_mismatch(&position, &legals, outcome, best);
+                    let details = Self::describe_mismatch(reader, &position, &legals, outcome, best);
                     return Err(fail(local_idx, &details));
                 }
             }
@@ -444,14 +493,14 @@ impl EgtProber {
 
     /// Computes the best outcome reachable from `position` by playing one of
     /// `legals`, probing each successor in the tablebases.
-    fn best_outcome(&mut self, position: &Chess, legals: &MoveList) -> EgtResult<DtcOutcome> {
+    fn best_outcome(reader: &SharedDependencyReader, position: &Chess, legals: &MoveList) -> EgtResult<DtcOutcome> {
         let mut best_value: Option<DtcOutcome> = None;
 
         for m in legals {
             let mut successor_position = position.clone();
             successor_position.play_unchecked(*m);
 
-            let successor_outcome = self.probe(&successor_position)?;
+            let successor_outcome = reader.probe_outcome(&successor_position)?;
             let v_m = move_value(m, successor_outcome);
 
             if let Some(ref mut best) = best_value {
@@ -469,7 +518,7 @@ impl EgtProber {
     /// Builds a human-readable diagnostic for a mismatch between the outcome
     /// stored in the file and the best outcome computed from the legal moves.
     fn describe_mismatch(
-        &mut self,
+        reader: &SharedDependencyReader,
         position: &Chess,
         legals: &MoveList,
         outcome: DtcOutcome,
@@ -484,7 +533,7 @@ impl EgtProber {
             let mut successor_position = position.clone();
             successor_position.play_unchecked(*m);
             // Best-effort diagnostic: skip moves whose successor cannot be probed.
-            if let Ok(successor_outcome) = self.probe(&successor_position) {
+            if let Ok(successor_outcome) = reader.probe_outcome(&successor_position) {
                 let v_m = move_value(m, successor_outcome);
                 reason.push_str(&format!(
                     "\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}",
@@ -657,11 +706,14 @@ mod tests {
         let location = Location::parse(&test_dir.0).unwrap();
         crate::retrograde::retrograde_analysis(&location, endgame, None, true).unwrap();
 
-        let mut prober = EgtProber::new(&test_dir.0).unwrap();
-        prober.verify_internal_consistency(endgame).unwrap();
-        let (a, b) = endgame.split_once('_').unwrap();
-        if a != b {
-            prober.verify_internal_consistency(&format!("{}_{}", b, a)).unwrap();
+        for threads in [1, 4] {
+            let mut prober = EgtProber::new(&test_dir.0).unwrap();
+            prober.with_threads(threads);
+            prober.verify_internal_consistency(endgame).unwrap();
+            let (a, b) = endgame.split_once('_').unwrap();
+            if a != b {
+                prober.verify_internal_consistency(&format!("{}_{}", b, a)).unwrap();
+            }
         }
     }
 
@@ -686,6 +738,27 @@ mod tests {
     }
 
     #[test]
+    fn verification_rejects_invalid_outcomes_and_recovers_cache() {
+        let test_dir = TestDir::new("verify_invalid_outcome");
+        EgtGenerator::new(&test_dir.0).unwrap().generate("K_K").unwrap();
+        let mut prober = EgtProber::new(&test_dir.0).unwrap();
+        let mut file = prober.load_existing("K_K").unwrap();
+        let index = (0..file.index_range)
+            .find(|&index| file.index_to_position(index, Color::White).is_some()).unwrap();
+        file.write_to_index(index, egt_file::MaybeDtcOutcome::INVALID).unwrap();
+        prober.cache.insert("K_K".to_string(), file);
+
+        for threads in [1, 4] {
+            prober.with_threads(threads);
+            assert!(matches!(prober.verify_internal_consistency("K_K"),
+                Err(EgtError::ConsistencyCheckFailed { index: failed, .. }) if failed == index));
+            assert!(prober.cache.contains_key("K_K"));
+        }
+        prober.with_threads(0);
+        assert!(matches!(prober.verify_internal_consistency("K_K"), Err(EgtError::Internal(_))));
+    }
+
+    #[test]
     fn generator_publishes_finalized_stats() {
         use sha2::{Digest, Sha256};
 
@@ -698,6 +771,7 @@ mod tests {
         let mut generator = EgtGenerator::new(&output.0).unwrap();
         generator.with_input_path(&input.0).unwrap();
         generator.with_generate_deps(true);
+        generator.with_threads(4);
         // Default verification also exercises reopening published dependencies.
         let (stats_a, stats_b) = generator.generate("KQ_K").unwrap();
         assert!(output.0.join("K_K.ggegt").exists());
