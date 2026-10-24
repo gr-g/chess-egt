@@ -847,10 +847,10 @@ pub fn retrograde_analysis(
     input_path: Option<&Location>,
     generate_deps: bool,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-    retrograde_analysis_with_threads(base_path, endgame, input_path, generate_deps, 1)
+    retrograde_analysis_with_threads(base_path, endgame, input_path, generate_deps, 0)
 }
 
-/// Generates tables in a dedicated Rayon pool. Zero threads is rejected.
+/// Generates tables in a dedicated Rayon pool. Zero threads uses Rayon's default.
 pub fn retrograde_analysis_with_threads(
     base_path: &Location,
     endgame: &str,
@@ -858,13 +858,14 @@ pub fn retrograde_analysis_with_threads(
     generate_deps: bool,
     threads: usize,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-    if threads == 0 {
-        return Err(EgtError::Internal("thread count must be positive"));
-    }
+
     base_path.ensure_writable()?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()
         .map_err(|_| EgtError::Internal("failed to build retrograde thread pool"))?;
-    pool.install(|| retrograde_analysis_in_pool(base_path, endgame, input_path, generate_deps))
+    pool.install(|| {
+        println!("Using {} threads for generation.", rayon::current_num_threads());
+        retrograde_analysis_in_pool(base_path, endgame, input_path, generate_deps)
+    })
 }
 
 pub(crate) fn retrograde_analysis_in_pool(
@@ -1555,10 +1556,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_threads() {
+    fn zero_threads_uses_rayon_default() {
         let dir = crate::TestDir::new("zero_threads");
         let location = Location::parse(&dir.0).unwrap();
-        assert!(matches!(retrograde_analysis_with_threads(&location, "K_K", None, false, 0), Err(EgtError::Internal(_))));
+        retrograde_analysis_with_threads(&location, "K_K", None, false, 0).unwrap();
+        assert!(dir.0.join("K_K.ggegt").exists());
     }
 
     fn verify_table_generation(

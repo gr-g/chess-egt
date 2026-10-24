@@ -19,8 +19,8 @@ struct Cli {
     #[arg(long)]
     memory: Option<String>,
 
-    /// Number of generation and verification workers (defaults to one).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    /// Number of generation and verification workers (0 uses Rayon's default).
+    #[arg(long, default_value_t = 0)]
     threads: u16,
 
     #[arg(long)]
@@ -52,6 +52,21 @@ struct Cli {
     noverify: bool,
 
     position: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_count_defaults_to_zero_and_accepts_overrides() {
+        let cli = Cli::try_parse_from(["chess-egt", "--path", "."]).unwrap();
+        assert_eq!(cli.threads, 0);
+        for threads in ["0", "1", "4"] {
+            let cli = Cli::try_parse_from(["chess-egt", "--path", ".", "--threads", threads]).unwrap();
+            assert_eq!(cli.threads, threads.parse::<u16>().unwrap());
+        }
+    }
 }
 
 fn main() {

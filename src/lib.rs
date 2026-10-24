@@ -95,11 +95,11 @@ impl EgtGenerator {
             input_path: None,
             generate_deps: false,
             verify: true,
-            threads: 1,
+            threads: 0,
         }
     }
 
-    /// Sets generation and verification workers. Zero is rejected by `generate`.
+    /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
     pub fn with_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
@@ -217,7 +217,7 @@ impl EgtGenerator {
             crate::retrograde::retrograde_analysis_in_pool(
                 &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
             )?
-        } else if self.threads == 1 {
+        } else if self.threads == 0 {
             crate::retrograde::retrograde_analysis(
                 &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
             )?
@@ -286,11 +286,11 @@ impl EgtProber {
             input_path: None,
             assigned_memory: None,
             cache: HashMap::new(),
-            threads: 1,
+            threads: 0,
         }
     }
 
-    /// Sets verification workers (defaults to one). Zero is rejected by verification.
+    /// Sets verification workers. Zero (the default) uses Rayon's default.
     /// Does not change single-position probing.
     pub fn with_threads(&mut self, threads: usize) {
         self.threads = threads;
@@ -336,9 +336,7 @@ impl EgtProber {
     /// Files and decompressed frames are shared between workers without eviction.
     /// If multiple checks fail, the reported failure may depend on scheduling.
     pub fn verify_internal_consistency(&mut self, endgame: &str) -> EgtResult<()> {
-        if self.threads == 0 {
-            return Err(EgtError::Internal("thread count must be positive"));
-        }
+
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.threads).build()
             .map_err(|_| EgtError::Internal("failed to build verification thread pool"))?;
         // Ensure the main file is in the cache
@@ -363,15 +361,15 @@ impl EgtProber {
             ));
         }
 
-        println!(
-            "Verifying internal consistency of endgame {} ({} indexes, {} tables)...",
-            endgame, index_range, tables.len()
-        );
 
         let reader = SharedDependencyReader::new(
             std::mem::take(&mut self.cache), &self.base_path, self.input_path.as_ref(),
         );
         let result: EgtResult<()> = pool.install(|| {
+            println!(
+                "Verifying internal consistency of endgame {} ({} indexes, {} tables) using {} threads...",
+                endgame, index_range, tables.len(), rayon::current_num_threads()
+            );
             for (egt, offset) in &tables {
                 Self::verify_egt(&reader, endgame, egt, *offset, frame_size)?;
             }
@@ -705,7 +703,7 @@ mod tests {
         let location = Location::parse(&test_dir.0).unwrap();
         crate::retrograde::retrograde_analysis(&location, endgame, None, true).unwrap();
 
-        for threads in [1, 4] {
+        for threads in [0, 1, 4] {
             let mut prober = EgtProber::new(&test_dir.0).unwrap();
             prober.with_threads(threads);
             prober.verify_internal_consistency(endgame).unwrap();
@@ -747,14 +745,30 @@ mod tests {
         file.write_to_index(index, egt_file::MaybeDtcOutcome::INVALID).unwrap();
         prober.cache.insert("K_K".to_string(), file);
 
-        for threads in [1, 4] {
+        for threads in [0, 1, 4] {
             prober.with_threads(threads);
             assert!(matches!(prober.verify_internal_consistency("K_K"),
                 Err(EgtError::ConsistencyCheckFailed { index: failed, .. }) if failed == index));
             assert!(prober.cache.contains_key("K_K"));
         }
-        prober.with_threads(0);
-        assert!(matches!(prober.verify_internal_consistency("K_K"), Err(EgtError::Internal(_))));
+
+    }
+
+    #[test]
+    fn default_and_zero_threads_generate_and_verify() {
+        for threads in [None, Some(0)] {
+            let dir = TestDir::new(&format!("default_threads_{threads:?}"));
+            let mut generator = EgtGenerator::new(&dir.0).unwrap();
+            let mut prober = EgtProber::new(&dir.0).unwrap();
+            assert_eq!(generator.threads, 0);
+            assert_eq!(prober.threads, 0);
+            if let Some(threads) = threads {
+                generator.with_threads(threads);
+                prober.with_threads(threads);
+            }
+            generator.generate("K_K").unwrap();
+            prober.verify_internal_consistency("K_K").unwrap();
+        }
     }
 
     #[test]

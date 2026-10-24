@@ -130,12 +130,9 @@ Retrograde analysis is the recursive algorithm used to generate endgame tablebas
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis is run on both tables simultaneously in a single unified loop. Both tables are initialized and propagated together.
 
 Generation supports shared-memory parallelism through Rayon. Use `--threads N`
-(or `EgtGenerator::with_threads(N)` in the library); the default is one thread.
-For example:
-
-```sh
-cargo run --release -- --path ./tables --input-path ~/tablebases --generate KQB_KQ --threads 4 --noverify
-```
+(or `EgtGenerator::with_threads(N)` in the library). Omitting `--threads` or
+setting it to `0` uses Rayon's default: `RAYON_NUM_THREADS` if set, otherwise
+the number of available logical CPUs.
 
 Draw finalization, statistics, and compression run in frame batches.
 Publication, SHA-256, and JSON remain serial, with JSON written after both

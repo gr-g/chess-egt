@@ -509,7 +509,7 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   implementation-era behavior, not fresh validation of the current dependency
   and solver configuration.
 - `--threads N` / `EgtGenerator::with_threads(N)` selects a dedicated Rayon pool;
-  the default remains one thread. Zero is rejected. Pairs are solved serially,
+  zero (the default) uses Rayon's default thread count. Pairs are solved serially,
   using the same pool throughout an endgame. Recursive dependency generation
   explicitly reuses that pool rather than constructing nested pools.
 - Working values are `AtomicU16`. `mark_win` and `decrement` use CAS loops over
@@ -548,14 +548,14 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   with thread count (roughly 90 MiB per active level-19 context, source-derived
   estimate).
 - Internal consistency verification uses `--threads N` /
-  `EgtProber::with_threads(N)` (default: one thread); post-generation verification
+  `EgtProber::with_threads(N)` (zero/default: Rayon's default); post-generation verification
   inherits the generator's thread count. Verification workers share the frame
   cache rather than duplicating loaded frames; there is currently no eviction.
   Errors fail fast, so parallel verification may report a different failing index
   than a serial run.
 - **Test coverage:** concurrent CAS contention, concurrent summary maxima,
   ordered loss-conversion phases, multi-block self-twin scans, cached/shared
-  dependency probing, dependency failure/recovery, zero-thread rejection, and
+  dependency probing, dependency failure/recovery, default/zero-thread support, and
   1-vs-4-thread output/statistics equality. Run tests with `cargo test --release`.
 - **Reference evidence:** implementation-time generation of all 3/4-piece
   endgames produced **132 `.ggegt`/`.json` files** matching the table-aligned
