@@ -469,10 +469,11 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   self-twin). Encoded values are interpreted as `MaybeDtcOutcome` on load.
   Predecessor callbacks use table-local indices, and `PlySummary` blocks are
   independent of the file's frame layout.
-- Finalization consumes each atomic array into plain outcomes, marks remaining
-  unknowns as draws, records statistics, and compresses the sub-table into
-  **in-memory output segments**. Its plain array is then released before
-  finalizing the twin or allocating the next pair. Frames are table-aligned,
+- Finalization visits one atomic array at a time in parallel frame batches,
+  normalizing unknowns to draws, accumulating local statistics, and compressing
+  into **in-memory output segments**. Only frame-sized plain scratch buffers
+  are allocated. The working array is released before finalizing the twin or
+  allocating the next pair. Frames are table-aligned,
   contain at most `256 * 1024` positions, and end in short, unpadded tails.
   The transposition is unchanged: exactly `2 * N` bytes for a frame of `N`
   positions, including the unused zero tail after packed high bytes.
@@ -540,9 +541,12 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   conservative preflight requiring unused files. Cold recursive generation can
   retain parent working arrays and caches, and repeated initialization has a cost;
   production measurements below use existing dependencies.
-- Finalization consumes atomic arrays into plain outcomes one table at a time.
-  Statistics, compression, ordered publication, and JSON generation remain serial
-  and deterministic. No unsafe array reinterpretation is used.
+- Finalization uses contiguous frame batches in the same Rayon pool, with up to
+  `--threads N` encoders. Each batch reuses an encoder and frame-sized plain
+  scratch, fusing conversion, draw normalization, and statistics collection
+  before compression. Publication and JSON stay serial. Encoder memory grows
+  with thread count (roughly 90 MiB per active level-19 context, source-derived
+  estimate).
 - Internal consistency verification uses `--threads N` /
   `EgtProber::with_threads(N)` (default: one thread); post-generation verification
   inherits the generator's thread count. Verification workers share the frame
@@ -569,11 +573,9 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 
   All four output files are byte-identical across these runs. One-thread overhead
   is 2.2%; end-to-end speedup against the previous binary is 1.56x / 1.94x at
-  2 / 4 threads. Serial finalization limits end-to-end scaling. Peak RSS was
-  measured with Linux `wait4`; wall time with a monotonic clock. These are single
-  runs on Xen virtual CPUs, not bare-metal scaling guarantees. Repeated runs,
-  deep/thin-frontier and dependency-heavy 5-piece samples, and 6-piece scaling
-  remain open.
+  2 / 4 threads. Peak RSS was measured with Linux `wait4`; wall time with a
+  monotonic clock. These are single runs on Xen virtual CPUs, not bare-metal
+  scaling guarantees.
 
 ### Step 5: jobs and object storage
 

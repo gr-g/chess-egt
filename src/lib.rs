@@ -15,6 +15,8 @@ pub mod piece_set;
 mod egt;
 mod egt_file;
 mod egt_writer;
+mod finalization;
+mod finalization_stats;
 mod retrograde;
 mod storage;
 
@@ -225,16 +227,13 @@ impl EgtGenerator {
             )?
         };
 
-        // Publication supplies the size and hash of each output file.
         let stats_a = file_a.stats.take()
             .ok_or(EgtError::Internal("stats missing for file_a after generation"))?;
-        file_a.save_stats(&stats_a)?;
 
         let mut stats_b = None;
         if let Some(ref mut fb) = file_b {
             let s_b = fb.stats.take()
                 .ok_or(EgtError::Internal("stats missing for file_b after generation"))?;
-            fb.save_stats(&s_b)?;
             stats_b = Some(s_b);
         }
 

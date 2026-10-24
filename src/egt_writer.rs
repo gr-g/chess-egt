@@ -7,13 +7,16 @@ use object_store::{buffered::BufWriter, path::Path as ObjectPath};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFile, MaybeDtcOutcome, transpose_frame};
+#[cfg(test)]
+use crate::egt_file::DEFAULT_COMPRESSION_LEVEL;
+use crate::egt_file::{EgtFile, MaybeDtcOutcome, transpose_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 
-struct CompressedTable {
-    data: Bytes,
-    seek_table: zeekstd::SeekTable,
+/// A frame-aligned compressed batch, without a serialized seek-table footer.
+pub(crate) struct CompressedSegment {
+    pub(crate) data: Bytes,
+    pub(crate) seek_table: zeekstd::SeekTable,
 }
 
 pub(crate) struct EgtFileWriter {
@@ -21,7 +24,7 @@ pub(crate) struct EgtFileWriter {
     key: ObjectPath,
     frame_size: usize,
     lengths: Vec<usize>,
-    tables: Vec<Option<CompressedTable>>,
+    tables: Vec<Option<Vec<CompressedSegment>>>,
     footer: Option<Bytes>,
     published: bool,
 }
@@ -43,11 +46,7 @@ impl EgtFileWriter {
         })
     }
 
-    pub(crate) fn write_table(
-        &mut self,
-        egt_idx: usize,
-        values: &[MaybeDtcOutcome],
-    ) -> EgtResult<()> {
+    fn writable_table_length(&self, egt_idx: usize) -> EgtResult<usize> {
         if self.footer.is_some() || self.published {
             return Err(EgtError::Internal("writer is already finished"));
         }
@@ -58,6 +57,59 @@ impl EgtFileWriter {
         if self.tables[egt_idx].is_some() {
             return Err(EgtError::Internal("table has already been written"));
         }
+        Ok(length)
+    }
+
+    /// Retains batches in caller-supplied frame order without concatenating them.
+    pub(crate) fn write_segments(
+        &mut self,
+        egt_idx: usize,
+        segments: Vec<CompressedSegment>,
+    ) -> EgtResult<()> {
+        let length = self.writable_table_length(egt_idx)?;
+        let expected_frames = length.div_ceil(self.frame_size);
+        let mut frames = 0usize;
+        let mut remaining = length;
+        for segment in &segments {
+            let num_frames = segment.seek_table.num_frames();
+            if num_frames == 0 && !(length == 0 && segments.len() == 1 && segment.data.is_empty()) {
+                return Err(EgtError::Internal("compressed segment has no frames"));
+            }
+            let mut compressed_length = 0u64;
+            for index in 0..num_frames {
+                let compressed = segment.seek_table.frame_size_comp(index)?;
+                let decompressed = segment.seek_table.frame_size_decomp(index)?;
+                let frame_length = remaining.min(self.frame_size);
+                if compressed == 0 || frame_length == 0 || decompressed != (frame_length * 2) as u64
+                {
+                    return Err(EgtError::Internal(
+                        "compressed segment has invalid frame lengths",
+                    ));
+                }
+                compressed_length += compressed;
+                remaining -= frame_length;
+                frames += 1;
+            }
+            if compressed_length != segment.data.len() as u64 {
+                return Err(EgtError::Internal(
+                    "compressed segment has wrong data length",
+                ));
+            }
+        }
+        if frames != expected_frames || remaining != 0 {
+            return Err(EgtError::Internal("compressed table has wrong frame count"));
+        }
+        self.tables[egt_idx] = Some(segments);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_table(
+        &mut self,
+        egt_idx: usize,
+        values: &[MaybeDtcOutcome],
+    ) -> EgtResult<()> {
+        let length = self.writable_table_length(egt_idx)?;
         if values.len() != length {
             return Err(EgtError::Internal("finalized table has wrong length"));
         }
@@ -77,11 +129,13 @@ impl EgtFileWriter {
         // into_seek_table consumes the encoder without flushing its output buffer.
         encoder.flush()?;
         let seek_table = encoder.into_seek_table();
-        self.tables[egt_idx] = Some(CompressedTable {
-            data: data.into(),
-            seek_table,
-        });
-        Ok(())
+        self.write_segments(
+            egt_idx,
+            vec![CompressedSegment {
+                data: data.into(),
+                seek_table,
+            }],
+        )
     }
 
     /// Validates completeness and prepares the seek table without publishing.
@@ -97,11 +151,13 @@ impl EgtFileWriter {
             let compressed = compressed
                 .as_ref()
                 .ok_or(EgtError::Internal("cannot finish with missing tables"))?;
-            for index in 0..compressed.seek_table.num_frames() {
-                table.log_frame(
-                    compressed.seek_table.frame_size_comp(index)? as u32,
-                    compressed.seek_table.frame_size_decomp(index)? as u32,
-                )?;
+            for segment in compressed {
+                for index in 0..segment.seek_table.num_frames() {
+                    table.log_frame(
+                        segment.seek_table.frame_size_comp(index)? as u32,
+                        segment.seek_table.frame_size_decomp(index)? as u32,
+                    )?;
+                }
             }
         }
         let mut footer = Vec::new();
@@ -122,7 +178,8 @@ impl EgtFileWriter {
             .tables
             .iter()
             .flatten()
-            .map(|table| table.data.clone())
+            .flatten()
+            .map(|segment| segment.data.clone())
             .chain(std::iter::once(footer.clone()));
         let result = publish_buffers(&self.location, &self.key, buffers)?;
         self.tables.clear();
@@ -186,6 +243,48 @@ mod tests {
     use super::*;
     use object_store::ObjectStoreExt;
     use std::fs;
+
+    #[test]
+    fn mixed_segments_match_serial_encoder_bytes() {
+        let dir = crate::TestDir::new("writer_mixed_segments");
+        let file = EgtFile::new(&dir.0, "K_K").unwrap();
+        let mut writer = EgtFileWriter::new(&file).unwrap();
+        writer.frame_size = 8;
+        let values: Vec<_> = (0..file.egts[0].index_range())
+            .map(|i| [MaybeDtcOutcome::DRAW, MaybeDtcOutcome::INVALID][i % 2])
+            .collect();
+        let options = || zeekstd::EncodeOptions::new().compression_level(DEFAULT_COMPRESSION_LEVEL);
+        let mut expected = Vec::new();
+        let mut serial = options().into_encoder(&mut expected).unwrap();
+        for frame in values.chunks(writer.frame_size) {
+            serial.compress(&transpose_frame(frame)).unwrap();
+            serial.end_frame().unwrap();
+        }
+        serial.flush().unwrap();
+        let table = serial.into_seek_table();
+        table.into_serializer().read_to_end(&mut expected).unwrap();
+        let mut segments = Vec::new();
+        // One-frame, multi-frame, and short-tail batches share the same footer.
+        for batch in values[..8].chunks(8).chain(values[8..].chunks(24)) {
+            let mut data = Vec::new();
+            let mut encoder = options().into_encoder(&mut data).unwrap();
+            for frame in batch.chunks(writer.frame_size) {
+                encode_frame(&mut encoder, frame).unwrap();
+            }
+            encoder.flush().unwrap();
+            let seek_table = encoder.into_seek_table();
+            segments.push(CompressedSegment {
+                data: data.into(),
+                seek_table,
+            });
+        }
+        writer.write_segments(0, segments).unwrap();
+        writer.finish().unwrap();
+        let (bytes, sha256) = writer.publish().unwrap();
+        assert_eq!(bytes, expected.len() as u64);
+        assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
+        assert_eq!(fs::read(dir.0.join("K_K.ggegt")).unwrap(), expected);
+    }
 
     #[test]
     fn publication_roundtrip_in_memory() {
