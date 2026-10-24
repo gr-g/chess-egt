@@ -5,6 +5,7 @@
 - The core loop of the retrograde analysis (`solve_pair` in `retrograde.rs`) uses decremental move counters driven by per-ply table scans (see the module doc and `scaling_and_parallelization.md` 4.2). Changes to the core loop that are not meant to change the output must keep the generated files **byte-identical**: compare sha256 against the reference set of tables in `~/tablebases`.
 - Always run `cargo test --release` for testing, otherwise it takes too much time.
 - Update the documentation after a change if appropriate, but always leave AGENTS.md untouched.
+- Remember that the documentation is intended for humans to quickly grasp what the **current version** of the code is doing and why. It should be simple and to the point. It should **not** be a diary of every change that happened.
 
 Current generation results (with --threads=2, --noverify):
 =============================================================================================
