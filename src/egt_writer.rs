@@ -364,7 +364,7 @@ mod tests {
         }
         writer.finish().unwrap();
         writer.finish().unwrap();
-        let destination = dir.0.join("KP_K.ggegt");
+        let destination = dir.0.join(file.key.filename().unwrap());
         assert!(!destination.exists());
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
         let (bytes, sha256) = writer.publish().unwrap();

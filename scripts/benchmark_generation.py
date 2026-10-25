@@ -3,6 +3,7 @@
 
 Use a fresh output directory. Dependencies are read from --reference; recursive
 creation and internal verification are disabled. Hashing happens after timing.
+Pawnful references must use the current .v2.ggegt/.v2.json indexing namespace.
 """
 
 import argparse
@@ -20,6 +21,11 @@ PHASES = re.compile(
     r"phase timings: init ([\d.]+)s, propagation ([\d.]+)s, finalize ([\d.]+)s"
 )
 ASSEMBLY = re.compile(r"output assembly ([\d.]+)s")
+
+
+def artifact_name(material, extension):
+    version = ".v2" if "P" in material else ""
+    return f"{material}{version}.{extension}"
 
 
 def sha256(path):
@@ -92,7 +98,7 @@ def main():
             parser.error(f"Invalid endgame: {endgame}")
         for name in {endgame, "_".join(reversed(parts))}:
             for extension in ("ggegt", "json"):
-                path = reference / f"{name}.{extension}"
+                path = reference / artifact_name(name, extension)
                 expected[path.name] = sha256(path)
     output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parent.parent
@@ -134,7 +140,7 @@ def main():
                 timing = measure(command, run / "generation.log", args.timeout)
                 hashes = {p.name: sha256(p) for p in sorted(tables.iterdir())}
                 names = {endgame, "_".join(reversed(endgame.split("_")))}
-                expected_names = {f"{name}.{ext}" for name in names for ext in ("ggegt", "json")}
+                expected_names = {artifact_name(name, ext) for name in names for ext in ("ggegt", "json")}
                 if hashes.keys() != expected_names:
                     raise RuntimeError(f"Unexpected output file set in {tables}")
                 stable = hashes == hashes_by_endgame.setdefault(endgame, hashes)

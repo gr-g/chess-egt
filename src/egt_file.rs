@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
 use crate::storage::{Location, block_on};
 use std::sync::{Arc, RwLock};
-use shakmaty::{CastlingMode, Chess, Color, File, Position};
+#[cfg(test)]
+use shakmaty::CastlingMode;
+use shakmaty::{Chess, Color, File, Position};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{EgtRole, EgtSide};
+use crate::piece_set::{EgtElement, EgtRole, EgtSide};
 use serde::{Serialize, Deserialize};
 
 // 256k positions per frame, corresponding to 512kiB per frame.
@@ -156,29 +158,89 @@ pub enum FrameState {
 /// bookkeeping done on every probe stays free of heap allocations.
 pub type FileVec = arrayvec::ArrayVec<File, MAX_PAWNS>;
 
-/// A stack-allocated, copyable key representing the pawn file assignments for both sides.
-/// This avoids all string formatting and heap allocations during tablebase probing.
+/// Allocation-free identity of the pawn color order on every file.
+/// Each byte has a length sentinel above the color bits; low bits come first
+/// in ascending STM-normalized rank, with SNTM represented by one.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PawnKey {
-    files: [u8; 8],  // Up to 8 pawns, padded with 255
+    files: [u8; 8],
 }
 
 impl PawnKey {
-    pub fn new(stm: &[File], sntm: &[File]) -> Self {
-        debug_assert!(stm.len() + sntm.len() <= 8);
+    pub fn from_elements(elements: &[EgtElement]) -> Self {
+        let mut files = [1; 8];
+        for element in elements {
+            let EgtElement::PawnGroup { file, order } = element else {
+                continue;
+            };
+            let mut word = 1 << order.len();
+            for (i, side) in order.iter().enumerate() {
+                if *side == EgtSide::SideNotToMove {
+                    word |= 1 << i;
+                }
+            }
+            files[file.to_usize()] = word;
+        }
+        Self { files }
+    }
 
-        let mut arr = [255; 8];
-        let mut i = 0;
-        for &f in stm {
-            arr[i] = f.to_usize() as u8;
-            i += 1;
+    fn from_position(position: &Chess) -> Self {
+        let mut files = [1; 8];
+        let enemy = position.board().by_color(!position.turn());
+        for file in 0..8 {
+            let pawns = position.board().pawns()
+                & shakmaty::Bitboard::from_file(File::new(file as u32));
+            let mut squares: arrayvec::ArrayVec<_, 6> = pawns.into_iter().collect();
+            if position.turn() == Color::Black {
+                squares.reverse();
+            }
+            let mut word = 1 << squares.len();
+            for (i, square) in squares.into_iter().enumerate() {
+                if enemy.contains(square) {
+                    word |= 1 << i;
+                }
+            }
+            files[file] = word;
         }
-        for &f in sntm {
-            arr[i] = f.to_usize() as u8 + 8;
-            i += 1;
+        Self { files }
+    }
+
+    pub fn reflected(self) -> Self {
+        let mut files = self.files;
+        files.reverse();
+        Self { files }
+    }
+
+    /// Changing STM reverses normalized ranks and exchanges color labels.
+    pub fn twin(self) -> Self {
+        let mut files = [1; 8];
+        for (target, word) in files.iter_mut().zip(self.files) {
+            let len = word.ilog2() as usize;
+            *target = 1 << len;
+            for i in 0..len {
+                if word & (1 << i) == 0 {
+                    *target |= 1 << (len - 1 - i);
+                }
+            }
         }
-        Self {
-            files: arr,
+        Self { files }
+    }
+
+    /// Preserve the file-multiplicity symmetry policy, independent of color order.
+    /// Return the transformation explicitly, including when file counts tie.
+    pub fn canonicalized(self) -> (Self, bool) {
+        let mut stm = FileVec::new();
+        let mut sntm = FileVec::new();
+        for (file, word) in self.files.into_iter().enumerate() {
+            for i in 0..word.ilog2() {
+                let files = if word & (1 << i) == 0 { &mut stm } else { &mut sntm };
+                files.push(File::new(file as u32));
+            }
+        }
+        if is_canonical(&stm, &sntm) {
+            (self, false)
+        } else {
+            (self.reflected(), true)
         }
     }
 }
@@ -360,10 +422,12 @@ impl EgtFile {
         for stm_files in &stm_combos {
             for sntm_files in &sntm_combos {
                 if is_canonical(stm_files, sntm_files) {
-                    let pieces = build_pieces(stm_files, sntm_files, &other_pieces);
-                    let egt = Egt::from_pieces(pieces)?;
-                    let key = PawnKey::new(stm_files, sntm_files);
-                    egt_pairs.push((key, egt));
+                    for mut elements in pawn_order_combinations(stm_files, sntm_files) {
+                        elements.extend_from_slice(&other_pieces);
+                        let key = PawnKey::from_elements(&elements);
+                        let egt = Egt::from_elements(elements)?;
+                        egt_pairs.push((key, egt));
+                    }
                 }
             }
         }
@@ -403,7 +467,7 @@ impl EgtFile {
         Ok(Self {
             endgame: endgame.to_string(),
             location: location.clone(),
-            key: location.prefix.clone().join(format!("{}.ggegt", endgame)),
+            key: location.prefix.clone().join(tablebase_filename(endgame)),
             seek_table: None,
             egts,
             egt_map,
@@ -466,7 +530,11 @@ impl EgtFile {
 
     pub(crate) fn save_stats(&self, stats: &EgtFileStats) -> EgtResult<()> {
         self.location.ensure_writable()?;
-        let key = self.location.prefix.clone().join(format!("{}.json", self.endgame));
+        let key = self.location.prefix.clone().join(if self.endgame.contains('P') {
+                    format!("{}.v2.json", self.endgame)
+                } else {
+                    format!("{}.json", self.endgame)
+                });
         let json = serde_json::to_vec_pretty(stats)?;
         block_on(self.location.store.put(&key, json.into()))
             .map_err(|error| self.location.error(&key, error))?;
@@ -589,32 +657,13 @@ impl EgtFile {
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
-        let stm_color = position.turn();
-        let sntm_color = !stm_color;
-
-        let stm_pawns_bb = position.board().pawns() & position.board().by_color(stm_color);
-        let sntm_pawns_bb = position.board().pawns() & position.board().by_color(sntm_color);
-
-        let mut stm_files: FileVec = stm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
-        let mut sntm_files: FileVec = sntm_pawns_bb.into_iter().map(|sq| sq.file()).collect();
-
-        stm_files.sort_by_key(|f| f.to_usize());
-        sntm_files.sort_by_key(|f| f.to_usize());
-
-        let canonical = is_canonical(&stm_files, &sntm_files);
-
-        let (target_stm_files, target_sntm_files, target_position) = if canonical {
-            (stm_files, sntm_files, position.clone())
-        } else {
-            let stm_ref = reflect_files(&stm_files);
-            let sntm_ref = reflect_files(&sntm_files);
-            let mirrored = mirror_horizontally(position)?;
-            (stm_ref, sntm_ref, mirrored)
-        };
-
-        let key = PawnKey::new(&target_stm_files, &target_sntm_files);
+        let (key, reflected) = PawnKey::from_position(position).canonicalized();
         let &egt_idx = self.egt_map.get(&key).ok_or(EgtError::PositionNotInTable { table: self.endgame.clone() })?;
-        let local_index = self.egts[egt_idx].position_to_index(&target_position);
+        let local_index = if reflected {
+            self.egts[egt_idx].reflected_position_to_index(position)
+        } else {
+            self.egts[egt_idx].position_to_index(position)
+        };
 
         let global_index = self.get_global_index(egt_idx, local_index);
         if global_index >= self.index_range {
@@ -841,11 +890,51 @@ pub fn detranspose_frame(transposed: &[u8], n: usize) -> Vec<MaybeDtcOutcome> {
     output
 }
 
+/// Pawnful layouts use a distinct indexing namespace; legacy files must never
+/// be interpreted using the color-order indexer. Pawnless files are unchanged.
+fn tablebase_filename(endgame: &str) -> String {
+    if endgame.contains('P') {
+        format!("{}.v2.ggegt", endgame)
+    } else {
+        format!("{}.ggegt", endgame)
+    }
+}
+
+/// Enumerates all rank color orders for a fixed pair of pawn-file multisets.
+fn pawn_order_combinations(stm: &[File], sntm: &[File]) -> Vec<Vec<EgtElement>> {
+    let mut counts = [[0usize; 2]; 8];
+    for &file in stm { counts[file.to_usize()][0] += 1; }
+    for &file in sntm { counts[file.to_usize()][1] += 1; }
+    if counts.iter().any(|c| c[0] + c[1] > 6) {
+        return Vec::new();
+    }
+    let mut layouts = vec![Vec::new()];
+    for (file, [n_stm, n_sntm]) in counts.into_iter().enumerate() {
+        let len = n_stm + n_sntm;
+        if len == 0 { continue; }
+        let mut next = Vec::new();
+        for mask in 0u8..(1 << len) {
+            if mask.count_ones() as usize != n_sntm { continue; }
+            let order = (0..len).map(|i| {
+                if mask & (1 << i) == 0 { EgtSide::SideToMove } else { EgtSide::SideNotToMove }
+            }).collect();
+            let group = EgtElement::PawnGroup { file: File::new(file as u32), order };
+            for layout in &layouts {
+                let mut layout = layout.clone();
+                layout.push(group.clone());
+                next.push(layout);
+            }
+        }
+        layouts = next;
+    }
+    layouts
+}
+
 /// Parses the endgame name (e.g., "KRP_KP") to extract:
 /// - Number of pawns for SideToMove
 /// - Number of pawns for SideNotToMove
 /// - List of non-pawn pieces
-fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<(EgtRole, EgtSide, usize)>)> {
+fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<EgtElement>)> {
     let (stm, sntm) = endgame.split_once('_').ok_or(EgtError::InvalidEndgameName {
         name: endgame.to_string(),
         reason: "missing '_' separator",
@@ -883,7 +972,7 @@ fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<(EgtRole, E
             if !piece.is_pawn() {
                 let multiplicity = count[piece.to_index()];
                 if multiplicity > 0 {
-                    other_pieces.push((piece, side, multiplicity));
+                    other_pieces.push(EgtElement::PieceGroup { role: piece, side, multiplicity });
                 }
             }
         }
@@ -911,14 +1000,6 @@ fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
     results
 }
 
-/// Reflects a list of files horizontally (file f becomes 7 - f).
-///
-/// The result is sorted ascending, like the input is expected to be.
-pub fn reflect_files(files: &[File]) -> FileVec {
-    let mut reflected: FileVec = files.iter().map(|f| File::new(7 - f.to_usize() as u32)).collect();
-    reflected.sort_by_key(|f| f.to_usize());
-    reflected
-}
 
 /// Compares an ascending list of files with its own horizontal reflection.
 ///
@@ -947,40 +1028,9 @@ pub fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
     }
 }
 
-/// Builds the pieces vector by combining pawn file assignments and non-pawn pieces.
-fn build_pieces(
-    stm_files: &[File],
-    sntm_files: &[File],
-    other_pieces: &[(EgtRole, EgtSide, usize)],
-) -> Vec<(EgtRole, EgtSide, usize)> {
-    let mut pieces = other_pieces.to_vec();
 
-    // Count stm pawns by file
-    let mut stm_pawn_counts = [0; 8];
-    for f in stm_files {
-        stm_pawn_counts[f.to_usize()] += 1;
-    }
-    for (idx, &count) in stm_pawn_counts.iter().enumerate() {
-        if count > 0 {
-            pieces.push((EgtRole::Pawn(File::new(idx as u32)), EgtSide::SideToMove, count));
-        }
-    }
-
-    // Count sntm pawns by file
-    let mut sntm_pawn_counts = [0; 8];
-    for f in sntm_files {
-        sntm_pawn_counts[f.to_usize()] += 1;
-    }
-    for (idx, &count) in sntm_pawn_counts.iter().enumerate() {
-        if count > 0 {
-            pieces.push((EgtRole::Pawn(File::new(idx as u32)), EgtSide::SideNotToMove, count));
-        }
-    }
-
-    pieces
-}
-
-/// Mirrors a chess position horizontally.
+/// Mirrors a chess position horizontally for independent indexing checks.
+#[cfg(test)]
 pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
     let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
     setup.board.flip_horizontal();
@@ -995,6 +1045,63 @@ mod tests {
     use super::*;
     use shakmaty::fen::Fen;
     use shakmaty::Color;
+
+    #[test]
+    fn pawn_orders_route_to_distinct_tables_and_their_twins() {
+        let dir = crate::TestDir::new("pawn_order_routing");
+        for (material, twin_material) in [("KP_KP", "KP_KP"), ("KPP_KP", "KP_KPP")] {
+            let file = EgtFile::new(&dir.0, material).unwrap();
+            let twin_file = EgtFile::new(&dir.0, twin_material).unwrap();
+            let mut names = std::collections::HashSet::new();
+            for (egt_idx, table) in file.egts.iter().enumerate() {
+                assert!(names.insert(table.tablename()));
+                let key = PawnKey::from_elements(&table.elements);
+                assert_eq!(key.reflected().reflected(), key);
+                assert_eq!(key.twin().twin(), key);
+                let (twin_key, reflected) = key.twin().canonicalized();
+                let twin = &twin_file.egts[twin_file.egt_map[&twin_key]];
+                assert_eq!(twin_key.twin().canonicalized().0, key);
+                let stride = (table.index_range() / 16).max(1);
+                for turn in [Color::White, Color::Black] {
+                    for index in (0..table.index_range()).step_by(stride) {
+                        let Some(position) = table.position_from_index(index, turn) else { continue; };
+                        assert_eq!(file.map_position_to_index(&position).unwrap(), file.egt_offsets[egt_idx] + index);
+                        let mirrored = mirror_horizontally(&position).unwrap();
+                        // File-count ties retain both orientations, so only compare
+                        // the descriptor selected by the documented symmetry policy.
+                        let (mirror_key, _) = PawnKey::from_position(&mirrored).canonicalized();
+                        let mirror_idx = file.map_position_to_index(&mirrored).unwrap();
+                        let mirror_table = file.egt_map[&mirror_key];
+                        assert!(mirror_idx >= file.egt_offsets[mirror_table]);
+                        for mv in position.legal_moves() {
+                            if mv.is_capture() || mv.is_promotion() { continue; }
+                            let successor = position.clone().play(mv).unwrap();
+                            assert_eq!(PawnKey::from_position(&successor).canonicalized().0, twin_key);
+                            let local = if reflected { twin.reflected_position_to_index(&successor) } else { twin.position_to_index(&successor) };
+                            assert_eq!(twin.position_from_index(local, successor.turn()).unwrap(),
+                                if reflected { mirror_horizontally(&successor).unwrap() } else { successor });
+                        }
+                    }
+                }
+            }
+        }
+        let file = EgtFile::new(&dir.0, "KP_KP").unwrap();
+        assert!(file.egts.iter().any(|t| t.tablename() == "KPa_KPa"));
+        assert!(file.egts.iter().any(|t| t.tablename() == "KPao_KPao"));
+    }
+
+    #[test]
+    fn pawnful_namespace_does_not_read_or_overwrite_legacy_files() {
+        let dir = crate::TestDir::new("pawn_order_namespace");
+        let legacy = dir.0.join("KP_K.ggegt");
+        std::fs::write(&legacy, b"legacy indexing").unwrap();
+        assert!(matches!(EgtFile::new_from_file(&dir.0, "KP_K"), Err(EgtError::FileNotFound(_))));
+        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        file.save_to_file().unwrap();
+        assert!(dir.0.join("KP_K.v2.ggegt").exists());
+        assert_eq!(std::fs::read(legacy).unwrap(), b"legacy indexing");
+        assert!(EgtFile::new_from_file(&dir.0, "KP_K").is_ok());
+    }
 
     #[test]
     fn cached_probe_does_not_warm_frames() {
@@ -1075,7 +1182,7 @@ mod tests {
         assert!(matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
             dependency, source,
         }) if dependency == "KP_K" && matches!(*source, EgtError::FileNotFound(_))));
-        assert!(!dir.0.join("KP_K.ggegt").exists());
+        assert!(!dir.0.join("KP_K.v2.ggegt").exists());
         assert!(reader.into_cache().unwrap().is_empty());
     }
 
@@ -1084,12 +1191,10 @@ mod tests {
         let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name("KRP_KP").unwrap();
         assert_eq!(stm_pawns, 1);
         assert_eq!(sntm_pawns, 1);
-        assert_eq!(other_pieces.len(), 3); // King STM, King SNTM, Rook STM
-        // Wait, other_pieces has King STM, Rook STM, King SNTM.
-        // Let's check the exact pieces
-        assert!(other_pieces.contains(&(EgtRole::King, EgtSide::SideToMove, 1)));
-        assert!(other_pieces.contains(&(EgtRole::Rook, EgtSide::SideToMove, 1)));
-        assert!(other_pieces.contains(&(EgtRole::King, EgtSide::SideNotToMove, 1)));
+        assert_eq!(other_pieces.len(), 3);
+        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::King, side: EgtSide::SideToMove, multiplicity: 1 }));
+        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::Rook, side: EgtSide::SideToMove, multiplicity: 1 }));
+        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::King, side: EgtSide::SideNotToMove, multiplicity: 1 }));
     }
 
     #[test]
@@ -1118,10 +1223,10 @@ mod tests {
         // Files for STM pawn: a, b, c, d are canonical. e, f, g, h are reflected.
         // So we expect exactly 4 Egts: KPa_K, KPb_K, KPc_K, KPd_K
         assert_eq!(egt_file.egts.len(), 4);
-        assert!(egt_file.egt_map.contains_key(&PawnKey::new(&[File::A], &[])));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::new(&[File::B], &[])));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::new(&[File::C], &[])));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::new(&[File::D], &[])));
+        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPa_K").unwrap().elements)));
+        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPb_K").unwrap().elements)));
+        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPc_K").unwrap().elements)));
+        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPd_K").unwrap().elements)));
     }
 
     #[test]

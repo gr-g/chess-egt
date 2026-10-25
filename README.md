@@ -65,22 +65,36 @@ The 16 bits of a `DtcOutcome` are structured as follows:
 ## 3. Indexing & Symmetries
 
 ### 3.1 `Egt` and `Indexer`
-An `Egt` represents a tablebase with all positions with a given set of pieces and where pawns are fixed on specific files. These tablebases are identified by names such as `KQ_KPc`, where the left part represents the pieces for the side-to-move (one king and one queen) and the right part represents the pieces for the side-not-to-move (one king and one c-file pawn).
+An `Egt` contains positions with fixed material, pawn files, and the exact color order of pawns on each file. An `Egt` has a name such as `KQ_KPc` (king and queen versus king and pawn on the c file). The name has the side-to-move (STM) on the left and the side-not-to-move (SNTM) on the right.
+
+Pawn tokens are `Pa` through `Ph`, with a trailing `o` ("opposed") if the **nearest pawn ahead on that file** is an enemy pawn. A friendly pawn ahead, or no pawn ahead, leaves the token unmarked. Within each file, each side's tokens run from its own backrank toward promotion. For example:
+
+| Pawn order from the STM backrank on file a | Table |
+| --- | --- |
+| SNTM, STM | `KPa_KPa` |
+| STM, SNTM | `KPao_KPao` |
+| SNTM, STM, STM | `KPaPa_KPa` |
+| STM, STM, SNTM | `KPaPao_KPao` |
+| STM, SNTM, STM | `KPaoPa_KPao` |
+
+For each file, both sides must have the same number of `o` markers. Together with the token order this uniquely determines the color sequence.
+
 The `Indexer` handles the mapping of positions to a contiguous local index range `[0, index_range)`.
+
 En-passant positions are encoded separately in different ranges of indices (sub-tables) managed internally by the `Indexer`. The `Indexer` exposes a single unified index range for the entire `Egt`.
 
 #### Local Indexing Algorithm (`board_to_index`)
 The `Indexer` maps a chess position to a unique integer in `[0, index_range)` using a multi-step compaction and combinatorial encoding process:
 
    - The indexer checks whether a legal en-passant capture is available. A raw EP square without a legal capture is equivalent to no EP.
-   - If so, it selects the corresponding sub-table and adjusts the `index_offset`. In this sub-table, the pawn on the 5th rank that can be captured en-passant is fixed and not encoded, reducing the number of combinations.
+   - If so, it selects the corresponding sub-table and adjusts the `index_offset`. The SNTM victim is the highest pawn on its file in STM-normalized ranks, fixed on rank 5. The remaining $k-1$ pawns on that file occupy ranks 2–4, contributing $\binom{3}{k-1}$ combinations. The sequence must end in SNTM and contain at most four pawns. Decoding still checks that an en-passant capture is legal.
    - The board position is converted into coordinates `(rank, file)` for each piece.
-   - To avoid duplicate indexing of identical positions for indistinguishable pieces (e.g., two white knights, or multiple pawns of the same color on the same file), their coordinates are sorted in a descending standard order.
+   - Coordinates are sorted descending within each group: identical non-pawn pieces share a group, while all pawns on one file share a group regardless of color. Pawn colors are assigned to sorted rank slots by the stored sequence.
    - If there are no pawns, the first king's position is restricted to 10 canonical squares (representing one octant of the board) using horizontal, vertical, and diagonal reflections. All other pieces are reflected accordingly to preserve relative positions.
    - Each coordinate is converted to a raw square index in `0..64` (rank x 8 + file).
    - Since no two pieces can occupy the same square, the raw square indices are compacted to remove "holes" caused by already occupied squares. For each piece, its index is adjusted by subtracting the number of preceding pieces that occupy a lower square index. This maps the indices sequentially to ranges `[0..64, 0..63, 0..62, 0..61, ...]`.
    - Pawns are restricted to ranks 2-7 (6 possible squares on their designated file). Their positions are converted to compact indices in `0..6` ($rank - 1$).
-   - If multiple pawns of the same color are on the same file, their indices are compacted relative to each other (mapping them to `[0..6, 0..5, ...]`).
+   - A file containing $k$ pawns contributes $\binom{6}{k}$ rank subsets, with its fixed color sequence supplying the colors.
    - For pawnless endgames, the positions of the two kings are mapped together. Since they cannot stand on adjacent or identical squares, a precomputed lookup table (`kings_map_to_index`) maps the valid joint positions of both kings to a single index in `0..462`.
    - The compacted indices of each piece group are aggregated into a single integer using a mixed-radix system. For a group of $k$ identical pieces of a type that can occupy $n$ available squares, the number of combinations is given by the binomial coefficient $\binom{n}{k}$ (using a precomputed table).
    - The combination index for these $k$ pieces with compacted indices $c_0 > c_1 > \dots > c_{k-1}$ is computed using the combinatorial number system (combinadics):
@@ -92,13 +106,17 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
 
 ### 3.2 `EgtFile` Composition
 An `EgtFile` represents a stored `.ggegt` object (local or cloud), storing the outcomes for a specific combination of pieces on the board (e.g., `KP_K`) and is composed of multiple `Egt` objects (e.g., `KPa_K`, `KPb_K`, `KPc_K`, `KPd_K`).
-- The `EgtFile` maps its global index space sequentially to the constituent `Egt` objects.
+- Material files always contain **all** their pawn-order subdivisions; partial publication is not supported. The writer requires every sub-table before publishing.
+- Routing extracts each file's color sequence from the board. Horizontal canonicalization still compares STM and SNTM file multisets, retaining both orientations when those multisets tie. A twin reverses each sequence and exchanges STM/SNTM, then applies horizontal canonicalization; its reflection flag is derived from that transformation.
+- Sub-tables are sorted deterministically by a packed pawn-order key. The `EgtFile` maps its global index space sequentially to the constituent `Egt` objects.
 - The global index is computed as:
   $$\text{global\_index} = \text{egt\_offset} + \text{local\_index}$$
   where $\text{egt\_offset}$ is the sum of the index ranges of all preceding `Egt` objects in a stable order.
 
 ## 4. File Format & Compression
 An `EgtFile` is stored using a seekable Zstd format (via the `zeekstd` library).
+
+Pawnful material files use the indexing-version namespace `<material>.v2.ggegt`, with statistics in `<material>.v2.json`. For example, `KP_KP.v2.ggegt` contains both passed and opposed same-file pawn tables. Legacy pawnful `<material>.ggegt` files are not read or overwritten: regenerate them, including pawnful dependencies. Renaming a legacy file does not convert its indexing. Pawnless files retain their original `.ggegt`/`.json` names and encoding.
 - Files use **table-aligned frames** of at most `256 * 1024` positions. Frames never cross an `Egt` boundary.
 - Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the table lengths and validates it against the seek table.
 - Seek tables are checksum-free: `17 + 8 * num_frames` bytes. Checksum-bearing seek tables are not supported. The footer frame count is checked before parsing to bound allocation; compressed and decompressed lengths are also validated.
@@ -128,6 +146,8 @@ Retrograde analysis is the recursive algorithm used to generate endgame tablebas
 
 ### 6.1 Simultaneous Propagation
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis is run on both tables simultaneously in a single unified loop. Both tables are initialized and propagated together.
+
+Quiet moves preserve the pawn color order on every file, so propagation stays within one table/twin pair. Captures (including en passant) and promotions probe dependency files during initialization. Smaller order-specific pairs reduce the active working arrays; compressed output for the complete material files is still retained until publication.
 
 Generation supports shared-memory parallelism through Rayon. Use `--threads N`
 (or `EgtGenerator::with_threads(N)` in the library). Omitting `--threads` or

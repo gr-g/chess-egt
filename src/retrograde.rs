@@ -42,10 +42,10 @@
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
-use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical};
+use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey};
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
-use crate::piece_set::{EgtRole, EgtSide};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
@@ -230,23 +230,6 @@ where
     }).reduce(Found::default, Found::merge)
 }
 
-fn get_pawn_files(pieces: &[(EgtRole, EgtSide, usize)]) -> (FileVec, FileVec) {
-    let mut stm_files = FileVec::new();
-    let mut sntm_files = FileVec::new();
-    for &(piece, side, multiplicity) in pieces {
-        if let EgtRole::Pawn(file) = piece {
-            for _ in 0..multiplicity {
-                match side {
-                    EgtSide::SideToMove => stm_files.push(file),
-                    EgtSide::SideNotToMove => sntm_files.push(file),
-                }
-            }
-        }
-    }
-    stm_files.sort_by_key(|f| f.to_usize());
-    sntm_files.sort_by_key(|f| f.to_usize());
-    (stm_files, sntm_files)
-}
 
 // Whether both kings stand on one of the two long diagonals. Kings on the h1-a8
 // diagonal end up on the a1-h8 diagonal after canonicalization, so both
@@ -260,13 +243,12 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
     kings_on_long_diagonal(position.board().by_role(Role::King))
 }
 
-// Whether predecessors generated from `table` have to be mirrored horizontally
-// before being indexed in `twin`. This depends only on the pawn files of the two
-// sub-tables, so it is computed once per table pair rather than per unmove.
+// Derive the reflection from the twin transformation, not from material counts.
+// This is computed once per table pair rather than per unmove.
 fn is_mirrored(table: &Egt, twin: &Egt) -> bool {
-    let (stm_files_a, sntm_files_a) = get_pawn_files(table.pieces());
-    let (stm_files_b, sntm_files_b) = get_pawn_files(twin.pieces());
-    stm_files_b != sntm_files_a || sntm_files_b != stm_files_a
+    let (key, reflected) = PawnKey::from_elements(&table.elements).twin().canonicalized();
+    debug_assert_eq!(key, PawnKey::from_elements(&twin.elements));
+    reflected
 }
 
 /// Quiet predecessors of a pawnless tablebase position, without castling rights.
@@ -801,13 +783,7 @@ fn retrograde_analysis_in_pool(
     let mut table_pairs = Vec::new();
 
     for (egt_idx_a, egt_a) in solver.files[0].egts.iter().enumerate() {
-        let (stm_files, sntm_files) = get_pawn_files(egt_a.pieces());
-        let (twin_stm, twin_sntm) = if is_canonical(&sntm_files, &stm_files) {
-            (sntm_files, stm_files)
-        } else {
-            (reflect_files(&sntm_files), reflect_files(&stm_files))
-        };
-        let twin_key = PawnKey::new(&twin_stm, &twin_sntm);
+        let (twin_key, _) = PawnKey::from_elements(&egt_a.elements).twin().canonicalized();
 
         let (file_idx_b, egt_idx_b) = if solver.is_symmetric {
             let egt_idx_b = *solver.files[0].egt_map.get(&twin_key)
@@ -1438,7 +1414,7 @@ mod tests {
             let (a, b) = retrograde_analysis_with_threads(&serial_location, endgame, None, 1).unwrap();
             let (pa, pb) = retrograde_analysis_with_threads(&parallel_location, endgame, None, 4).unwrap();
             for (file, parallel_file) in std::iter::once((a, pa)).chain(b.into_iter().zip(pb)) {
-                let name = format!("{}.ggegt", file.endgame);
+                let name = file.key.filename().unwrap().to_string();
                 assert_eq!(std::fs::read(serial.0.join(&name)).unwrap(), std::fs::read(parallel.0.join(&name)).unwrap(), "{name}");
                 let stats = file.stats.unwrap();
                 let parallel_stats = parallel_file.stats.unwrap();
