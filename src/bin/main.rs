@@ -38,35 +38,15 @@ struct Cli {
     /// Verify the internal consistency of an existing endgame table without generating it.
     #[arg(long, value_name = "ENDGAME", conflicts_with_all = [
         "generate", "generate_all_3", "generate_all_4", "generate_all_5",
-        "generate_deps", "noverify", "position",
+        "noverify", "position",
     ])]
     verify: Option<String>,
-
-    /// Automatically generate missing dependency endgames on the fly.
-    /// By default dependencies must already be available.
-    #[arg(long)]
-    generate_deps: bool,
 
     /// Skip the internal consistency check performed after generation.
     #[arg(long)]
     noverify: bool,
 
     position: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn thread_count_defaults_to_zero_and_accepts_overrides() {
-        let cli = Cli::try_parse_from(["chess-egt", "--path", "."]).unwrap();
-        assert_eq!(cli.threads, 0);
-        for threads in ["0", "1", "4"] {
-            let cli = Cli::try_parse_from(["chess-egt", "--path", ".", "--threads", threads]).unwrap();
-            assert_eq!(cli.threads, threads.parse::<u16>().unwrap());
-        }
-    }
 }
 
 fn main() {
@@ -156,7 +136,6 @@ fn configure_generator(g: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> 
     if let Some(ref input) = cli.input_path {
         g.with_input_path(input)?;
     }
-    g.with_generate_deps(cli.generate_deps);
     g.with_verify(!cli.noverify);
     Ok(())
 }

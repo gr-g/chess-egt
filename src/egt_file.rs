@@ -226,11 +226,9 @@ pub struct EgtFile {
     pub stats: Option<EgtFileStats>,
 }
 
-/// Shared files for parallel initialization and verification, without recursive generation.
+/// Shared files for parallel initialization and verification.
 ///
-/// Move the coordinator's resolved cache here and borrow this reader from scoped
-/// workers. On `DependencyUnavailable`, join all workers, recover the cache with
-/// `into_cache`, resolve the dependency through `DependencyCache`, and retry.
+/// Existing dependencies are loaded lazily; missing tables are reported as errors.
 /// Frames are shared, not copied per worker; no eviction is performed.
 #[derive(Debug)]
 pub(crate) struct SharedDependencyReader {
@@ -268,7 +266,6 @@ impl SharedDependencyReader {
             // Recheck after releasing the read lock: another worker may have loaded it.
             if !files.contains_key(endgame) {
                 // Serialize loading so racing workers never allocate duplicate files.
-                // This only reads existing files: generation must stay on the coordinator.
                 let file = crate::load_existing_file(
                     &self.base_path, self.input_path.as_ref(), endgame,
                 )?;
@@ -1070,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_dependency_missing_can_be_resolved_by_coordinator() {
+    fn shared_dependency_missing_returns_error_without_generating() {
         let dir = crate::TestDir::new("shared_dependency_missing");
         let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
             .into_position(CastlingMode::Standard).unwrap();
@@ -1079,13 +1076,7 @@ mod tests {
             dependency, source,
         }) if dependency == "KP_K" && matches!(*source, EgtError::FileNotFound(_))));
         assert!(!dir.0.join("KP_K.ggegt").exists());
-        let mut cache = reader.into_cache().unwrap();
-        assert!(cache.is_empty());
-        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
-        file.write_to_index(file.map_position_to_index(&position).unwrap(), MaybeDtcOutcome::DRAW).unwrap();
-        cache.insert("KP_K".to_string(), file);
-        let reader = SharedDependencyReader::new(cache, &Location::parse(&dir.0).unwrap(), None);
-        assert_eq!(reader.probe(&position).unwrap(), MaybeDtcOutcome::DRAW);
+        assert!(reader.into_cache().unwrap().is_empty());
     }
 
     #[test]

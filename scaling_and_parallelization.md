@@ -365,8 +365,7 @@ memory for each output file, so solved pairs do not accumulate as uncompressed
 file frames. Working memory is one pair plus **accumulated compressed output**,
 the dependency cache, index metadata, local summaries, statistics, and
 compression/I/O buffers. Compressed output grows until publication; there is no
-disk scratch staging. Recursive dependency generation is an exception: a parent
-pair and its compressed output can remain allocated while a dependency is solved.
+disk scratch staging.
 
 Atomic working values for shared-memory parallelism are implemented in Step 4.
 Memory-mapped arrays for out-of-core runs remain a future option.
@@ -490,8 +489,7 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 - Working memory is one pair plus accumulated compressed output, dependency
   cache, index metadata, summaries, statistics, and compression/I/O buffers.
   Bounded upload concurrency limits in-flight buffers, not retained compressed
-  output. Recursive dependency generation can retain a parent pair and its
-  compressed output while solving a dependency (Section 6.1).
+  output.
 - **Validation criterion:** per-index outcome/DTC equality and logical
   statistics equality, excluding `bytes`, `sha256`, and `num_frames`, because
   the table-aligned frame layout changes physical output. At implementation
@@ -510,8 +508,7 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   and solver configuration.
 - `--threads N` / `EgtGenerator::with_threads(N)` selects a dedicated Rayon pool;
   zero (the default) uses Rayon's default thread count. Pairs are solved serially,
-  using the same pool throughout an endgame. Recursive dependency generation
-  explicitly reuses that pool rather than constructing nested pools.
+  using the same pool throughout an endgame.
 - Working values are `AtomicU16`. `mark_win` and `decrement` use CAS loops over
   the entire encoded value. A win can upgrade its same-ply conversion preference;
   only the successful unknown-to-resolved transition increments the task-local
@@ -534,13 +531,10 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   acquire write access, rechecking the frame before loading. Initial file loads
   are serialized under the registry write lock; cold frame loads serialize only
   within the affected file. Finer-grained frame synchronization remains optional.
-- Workers only load existing dependencies. If an encountered dependency is missing,
-  all initialization tasks join, warmed files return to `DependencyCache`, and the
-  coordinator generates it if enabled. Initialization then retries with reset
-  values and counts. This preserves lazy dependency requirements without a
-  conservative preflight requiring unused files. Cold recursive generation can
-  retain parent working arrays and caches, and repeated initialization has a cost;
-  production measurements below use existing dependencies.
+- A single `SharedDependencyReader` is retained across all pairs and lazily loads
+  existing dependencies, keeping loaded files and frames cached. A missing
+  dependency returns `DependencyUnavailable`; there is no recursive generation
+  or initialization retry.
 - Finalization uses contiguous frame batches in the same Rayon pool, with up to
   `--threads N` encoders. Each batch reuses an encoder and frame-sized plain
   scratch, fusing conversion, draw normalization, and statistics collection
@@ -555,7 +549,7 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   than a serial run.
 - **Test coverage:** concurrent CAS contention, concurrent summary maxima,
   ordered loss-conversion phases, multi-block self-twin scans, cached/shared
-  dependency probing, dependency failure/recovery, default/zero-thread support, and
+  dependency probing, missing-dependency errors, default/zero-thread support, and
   1-vs-4-thread output/statistics equality. Run tests with `cargo test --release`.
 - **Reference evidence:** implementation-time generation of all 3/4-piece
   endgames produced **132 `.ggegt`/`.json` files** matching the table-aligned

@@ -73,7 +73,6 @@ pub struct EgtGenerator {
     base_path: Location,
     assigned_memory: Option<usize>,
     input_path: Option<Location>,
-    generate_deps: bool,
     verify: bool,
     threads: usize,
 }
@@ -93,7 +92,6 @@ impl EgtGenerator {
             base_path: location,
             assigned_memory: None,
             input_path: None,
-            generate_deps: false,
             verify: true,
             threads: 0,
         }
@@ -118,13 +116,6 @@ impl EgtGenerator {
     pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         self.input_path = Some(Location::parse(path)?);
         Ok(())
-    }
-
-    /// Enables automatic generation of missing dependencies on the fly.
-    /// Disabled by default: when disabled, a missing dependency causes
-    /// `generate()` to return a `DependencyUnavailable` error.
-    pub fn with_generate_deps(&mut self, generate_deps: bool) {
-        self.generate_deps = generate_deps;
     }
 
     /// Enables or disables the internal consistency check performed after
@@ -195,15 +186,6 @@ impl EgtGenerator {
     }
 
     pub fn generate(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
-        self.generate_impl(endgame, false)
-    }
-
-    /// Recursive dependencies reuse the explicitly installed solver pool.
-    pub(crate) fn generate_in_pool(&self, endgame: &str) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
-        self.generate_impl(endgame, true)
-    }
-
-    fn generate_impl(&self, endgame: &str, in_pool: bool) -> EgtResult<(EgtFileStats, Option<EgtFileStats>)> {
         let start_time = std::time::Instant::now();
         println!("Generating endgame {} at {}", endgame, self.base_path.display);
 
@@ -213,17 +195,13 @@ impl EgtGenerator {
         //}
 
         // Run retrograde analysis
-        let (mut file_a, mut file_b) = if in_pool {
-            crate::retrograde::retrograde_analysis_in_pool(
-                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
-            )?
-        } else if self.threads == 0 {
+        let (mut file_a, mut file_b) = if self.threads == 0 {
             crate::retrograde::retrograde_analysis(
-                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps,
+                &self.base_path, endgame, self.input_path.as_ref(),
             )?
         } else {
             crate::retrograde::retrograde_analysis_with_threads(
-                &self.base_path, endgame, self.input_path.as_ref(), self.generate_deps, self.threads,
+                &self.base_path, endgame, self.input_path.as_ref(), self.threads,
             )?
         };
 
@@ -701,7 +679,15 @@ mod tests {
     fn verify_internal_consistency(endgame: &str) {
         let test_dir = TestDir::new(&format!("verify_internal_consistency_{}", endgame));
         let location = Location::parse(&test_dir.0).unwrap();
-        crate::retrograde::retrograde_analysis(&location, endgame, None, true).unwrap();
+        if endgame != "K_K" {
+            crate::retrograde::retrograde_analysis(&location, "K_K", None).unwrap();
+        }
+        if endgame == "KP_K" {
+            for dependency in ["KQ_K", "KR_K", "KB_K", "KN_K"] {
+                crate::retrograde::retrograde_analysis(&location, dependency, None).unwrap();
+            }
+        }
+        crate::retrograde::retrograde_analysis(&location, endgame, None).unwrap();
 
         for threads in [0, 1, 4] {
             let mut prober = EgtProber::new(&test_dir.0).unwrap();
@@ -783,8 +769,8 @@ mod tests {
         }
         let mut generator = EgtGenerator::new(&output.0).unwrap();
         generator.with_input_path(&input.0).unwrap();
-        generator.with_generate_deps(true);
         generator.with_threads(4);
+        generator.generate("K_K").unwrap();
         // Default verification also exercises reopening published dependencies.
         let (stats_a, stats_b) = generator.generate("KQ_K").unwrap();
         assert!(output.0.join("K_K.ggegt").exists());
@@ -810,8 +796,8 @@ mod tests {
 
     #[test]
     fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
-        let mut generator = EgtGenerator::new("memory:///nested/tables").unwrap();
-        generator.with_generate_deps(true);
+        let generator = EgtGenerator::new("memory:///nested/tables").unwrap();
+        generator.generate("K_K").unwrap();
         let (stats_a, stats_b) = generator.generate("KQ_K").unwrap();
 
         let mut prober = EgtProber::from_location(generator.base_path.clone());

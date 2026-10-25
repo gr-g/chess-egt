@@ -31,8 +31,8 @@
 //!
 //! Rayon parallelizes disjoint initialization chunks and propagation blocks.
 //! Joined scans provide phase barriers; relaxed atomic CAS updates and summary
-//! fetch-max operations are sufficient within each phase. Dependency generation
-//! remains on the coordinator after failed initialization tasks have joined.
+//! fetch-max operations are sufficient within each phase. Initialization lazily
+//! loads existing dependency tables through a shared reader.
 //!
 //! Completed sub-tables are finalized in bounded parallel frame batches and
 //! compressed segments are retained in RAM until ordered publication.
@@ -41,12 +41,12 @@
 
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
-use crate::{ConversionType, EgtGenerator};
+use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, EgtFile, FileVec, PawnKey, reflect_files, is_canonical};
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
 use crate::piece_set::{EgtRole, EgtSide};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
 use crate::egt_file::SharedDependencyReader;
@@ -485,71 +485,6 @@ fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) -> u16 {
     counter
 }
 
-pub struct DependencyCache {
-    pub cache: HashMap<String, EgtFile>,
-    pub base_path: Location,
-    /// Additional path used to look up dependency files. If `None`, only
-    /// `base_path` is consulted.
-    pub input_path: Option<Location>,
-    /// Whether missing dependencies should be generated on the fly. When
-    /// `false`, a missing dependency results in a `DependencyUnavailable`
-    /// error instead of triggering a recursive generation.
-    pub generate_deps: bool,
-}
-
-impl DependencyCache {
-    pub fn with_options(
-        base_path: &Location,
-        input_path: Option<&Location>,
-        generate_deps: bool,
-    ) -> Self {
-        Self {
-            cache: HashMap::new(),
-            base_path: base_path.clone(),
-            input_path: input_path.cloned(),
-            generate_deps,
-        }
-    }
-
-    /// Attempts to load an existing dependency table, looking it up first in
-    /// `input_path` (if set) and then in `base_path`.
-    fn load_existing(&self, endgame: &str) -> EgtResult<EgtFile> {
-        crate::load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)
-    }
-
-    pub fn get_or_load(&mut self, endgame: &str) -> EgtResult<&mut EgtFile> {
-        if !self.cache.contains_key(endgame) {
-            let file = match self.load_existing(endgame) {
-                Ok(f) => f,
-                Err(source @ EgtError::FileNotFound(_)) => {
-                    if !self.generate_deps {
-                        return Err(EgtError::DependencyUnavailable {
-                            dependency: endgame.to_string(),
-                            source: Box::new(source),
-                        });
-                    }
-                    println!("Dependency endgame {} not found. Generating on the fly...", endgame);
-                    let mut g = EgtGenerator::from_location(self.base_path.clone());
-                    // Propagate lookup options so transitively-missing
-                    // dependencies can also be resolved. Generated files are
-                    // always written to `base_path` (never to `input_path`).
-                    g.input_path = self.input_path.clone();
-                    g.with_generate_deps(self.generate_deps);
-                    g.generate_in_pool(endgame).map_err(|source| EgtError::DependencyUnavailable {
-                        dependency: endgame.to_string(),
-                        source: Box::new(source),
-                    })?;
-                    // The freshly generated file lives under `base_path`.
-                    EgtFile::open_in(&self.base_path, endgame)?
-                }
-                Err(e) => return Err(e),
-            };
-            self.cache.insert(endgame.to_string(), file);
-        }
-        self.cache.get_mut(endgame).ok_or(EgtError::Internal("cache entry missing after insert"))
-    }
-}
-
 /// Number of positions of a table resolved at a given ply.
 #[derive(Clone, Copy, Default)]
 struct Found {
@@ -675,7 +610,7 @@ fn solve_pair(
     solver: &RetrogradeSolver,
     table_a: EgtHandle,
     table_b: EgtHandle,
-    dep_cache: &mut DependencyCache,
+    reader: &SharedDependencyReader,
 ) -> EgtResult<PairResult> {
     let init_start = std::time::Instant::now();
     let egt = |table: EgtHandle| &solver.files[table.file_idx].egts[table.egt_idx];
@@ -698,44 +633,13 @@ fn solve_pair(
     };
 
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
-    let mut previous;
-    let mut found_by_conversion;
-    let mut attempted = HashSet::new();
-    loop {
-        // A failed attempt may leave partially initialized chunks. Reset all
-        // slots and counts, including tables completed before the failure.
-        previous = [Found::default(); 2];
-        found_by_conversion = [Found::default(); 2];
-        for values in &mut working.values {
-            for cell in values {
-                *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
-            }
-        }
-        let reader = SharedDependencyReader::new(
-            std::mem::take(&mut dep_cache.cache), &dep_cache.base_path,
-            dep_cache.input_path.as_ref(),
-        );
-        let result = (|| -> EgtResult<()> {
-            for &(table, _, _, slot, _) in &tables {
-                let counts = initialize_table(egt(table), &mut working.values[slot], &reader)?;
-                println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
-                previous[slot].losses = counts.checkmates;
-                found_by_conversion[slot] = counts.found;
-            }
-            Ok(())
-        })();
-        // Rayon has joined every task before ownership of warmed files returns.
-        dep_cache.cache = reader.into_cache()?;
-        match result {
-            Ok(()) => break,
-            Err(EgtError::DependencyUnavailable { dependency, source }) if dep_cache.generate_deps => {
-                if !attempted.insert(dependency.clone()) {
-                    return Err(EgtError::DependencyUnavailable { dependency, source });
-                }
-                dep_cache.get_or_load(&dependency)?;
-            }
-            Err(error) => return Err(error),
-        }
+    let mut previous = [Found::default(); 2];
+    let mut found_by_conversion = [Found::default(); 2];
+    for &(table, _, _, slot, _) in &tables {
+        let counts = initialize_table(egt(table), &mut working.values[slot], reader)?;
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
+        previous[slot].losses = counts.checkmates;
+        found_by_conversion[slot] = counts.found;
     }
 
     let init_time = init_start.elapsed();
@@ -845,9 +749,8 @@ pub fn retrograde_analysis(
     base_path: &Location,
     endgame: &str,
     input_path: Option<&Location>,
-    generate_deps: bool,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-    retrograde_analysis_with_threads(base_path, endgame, input_path, generate_deps, 0)
+    retrograde_analysis_with_threads(base_path, endgame, input_path, 0)
 }
 
 /// Generates tables in a dedicated Rayon pool. Zero threads uses Rayon's default.
@@ -855,7 +758,6 @@ pub fn retrograde_analysis_with_threads(
     base_path: &Location,
     endgame: &str,
     input_path: Option<&Location>,
-    generate_deps: bool,
     threads: usize,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
 
@@ -864,15 +766,14 @@ pub fn retrograde_analysis_with_threads(
         .map_err(|_| EgtError::Internal("failed to build retrograde thread pool"))?;
     pool.install(|| {
         println!("Using {} threads for generation.", rayon::current_num_threads());
-        retrograde_analysis_in_pool(base_path, endgame, input_path, generate_deps)
+        retrograde_analysis_in_pool(base_path, endgame, input_path)
     })
 }
 
-pub(crate) fn retrograde_analysis_in_pool(
+fn retrograde_analysis_in_pool(
     base_path: &Location,
     endgame: &str,
     input_path: Option<&Location>,
-    generate_deps: bool,
 ) -> EgtResult<(EgtFile, Option<EgtFile>)> {
     let parts: Vec<&str> = endgame.split('_').collect();
     if parts.len() != 2 {
@@ -936,13 +837,13 @@ pub(crate) fn retrograde_analysis_in_pool(
     }
 
     // Initialization & Propagation Phase for each independent pair
-    let mut dep_cache = DependencyCache::with_options(base_path, input_path, generate_deps);
+    let reader = SharedDependencyReader::new(HashMap::new(), base_path, input_path);
     let mut init_time = std::time::Duration::ZERO;
     let mut propagation_time = std::time::Duration::ZERO;
     let mut finalize_time = std::time::Duration::ZERO;
 
     for &(table_a, table_b) in &table_pairs {
-        let mut pair = solve_pair(&solver, table_a, table_b, &mut dep_cache)?;
+        let mut pair = solve_pair(&solver, table_a, table_b, &reader)?;
         init_time += pair.init_time;
         propagation_time += pair.propagation_time;
         let finalize_start = std::time::Instant::now();
@@ -1349,8 +1250,8 @@ mod tests {
         let solver = RetrogradeSolver::new(EgtFile::new(&dir.0, "K_K").unwrap(), None);
         let table = EgtHandle { file_idx: 0, egt_idx: 0 };
         let location = Location::parse(&dir.0).unwrap();
-        let mut deps = DependencyCache::with_options(&location, None, false);
-        let pair = solve_pair(&solver, table, table, &mut deps).unwrap();
+        let reader = SharedDependencyReader::new(HashMap::new(), &location, None);
+        let pair = solve_pair(&solver, table, table, &reader).unwrap();
         assert_eq!(pair.working.values.len(), 1);
         assert_eq!(pair.working.values[0].len(), solver.files[0].egts[0].index_range());
         assert!(plain_values(&pair.working.values[0]).iter().all(|v| v.is_unknown() || v.is_draw()));
@@ -1529,13 +1430,13 @@ mod tests {
 
     #[test]
     fn parallel_generation_is_byte_identical() {
-        for endgame in ["K_K", "KQ_K", "KP_K"] {
-            let serial = crate::TestDir::new(&format!("serial_{endgame}"));
-            let parallel = crate::TestDir::new(&format!("parallel_{endgame}"));
-            let serial_location = Location::parse(&serial.0).unwrap();
-            let parallel_location = Location::parse(&parallel.0).unwrap();
-            let (a, b) = retrograde_analysis_with_threads(&serial_location, endgame, None, true, 1).unwrap();
-            let (pa, pb) = retrograde_analysis_with_threads(&parallel_location, endgame, None, true, 4).unwrap();
+        let serial = crate::TestDir::new("serial_generation");
+        let parallel = crate::TestDir::new("parallel_generation");
+        let serial_location = Location::parse(&serial.0).unwrap();
+        let parallel_location = Location::parse(&parallel.0).unwrap();
+        for endgame in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"] {
+            let (a, b) = retrograde_analysis_with_threads(&serial_location, endgame, None, 1).unwrap();
+            let (pa, pb) = retrograde_analysis_with_threads(&parallel_location, endgame, None, 4).unwrap();
             for (file, parallel_file) in std::iter::once((a, pa)).chain(b.into_iter().zip(pb)) {
                 let name = format!("{}.ggegt", file.endgame);
                 assert_eq!(std::fs::read(serial.0.join(&name)).unwrap(), std::fs::read(parallel.0.join(&name)).unwrap(), "{name}");
@@ -1547,11 +1448,12 @@ mod tests {
     }
 
     #[test]
-    fn parallel_missing_dependency_does_not_generate_when_disabled() {
+    fn parallel_missing_dependency_returns_error_without_generating() {
         let dir = crate::TestDir::new("parallel_missing_dependency");
         let location = Location::parse(&dir.0).unwrap();
-        let result = retrograde_analysis_with_threads(&location, "KQ_K", None, false, 4);
-        assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, .. }) if dependency == "K_K"));
+        let result = retrograde_analysis_with_threads(&location, "KQ_K", None, 4);
+        assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
+            if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_))));
         assert!(!dir.0.join("K_K.ggegt").exists());
     }
 
@@ -1559,7 +1461,7 @@ mod tests {
     fn zero_threads_uses_rayon_default() {
         let dir = crate::TestDir::new("zero_threads");
         let location = Location::parse(&dir.0).unwrap();
-        retrograde_analysis_with_threads(&location, "K_K", None, false, 0).unwrap();
+        retrograde_analysis_with_threads(&location, "K_K", None, 0).unwrap();
         assert!(dir.0.join("K_K.ggegt").exists());
     }
 
@@ -1578,7 +1480,15 @@ mod tests {
     ) {
         let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
         let location = Location::parse(&test_dir.0).unwrap();
-        let (file_a, file_b) = retrograde_analysis(&location, endgame, None, true).unwrap();
+        if endgame != "K_K" {
+            retrograde_analysis(&location, "K_K", None).unwrap();
+        }
+        if endgame == "KP_K" {
+            for dependency in ["KQ_K", "KR_K", "KB_K", "KN_K"] {
+                retrograde_analysis(&location, dependency, None).unwrap();
+            }
+        }
+        let (file_a, file_b) = retrograde_analysis(&location, endgame, None).unwrap();
 
         let stats_a = file_a.stats.as_ref().expect("file_a should have stats");
         println!("{} stats:", file_a.endgame);

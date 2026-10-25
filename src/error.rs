@@ -58,7 +58,7 @@ pub enum EgtError {
         reason: String,
     },
 
-    /// A dependency table could not be loaded or generated.
+    /// A required dependency table is missing.
     #[error("dependency table {dependency:?} could not be resolved: {source}")]
     DependencyUnavailable {
         dependency: String,
