@@ -1,8 +1,6 @@
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
-#[cfg(test)]
-use crate::piece_set::EgtRole;
 use crate::error::EgtResult;
 use std::cmp::Reverse;
 
@@ -550,7 +548,7 @@ impl Indexer {
                 }
                 EgtElement::PieceGroup { role, side, .. } => {
                     let color = if *side == EgtSide::SideToMove { position.turn() } else { !position.turn() };
-                    let bb = position.board().by_role(role.to_role()) & position.board().by_color(color);
+                    let bb = position.board().by_role(*role) & position.board().by_color(color);
                     assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
                     for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
                         let square = if REFLECTED { square.flip_horizontal() } else { square };
@@ -583,7 +581,7 @@ impl Indexer {
             for i in p.span.0..p.span.1 {
                 let (role, side) = match &p.element {
                     EgtElement::PawnGroup { order, .. } => (Role::Pawn, order[p.span.1 - 1 - i]),
-                    EgtElement::PieceGroup { role, side, .. } => (role.to_role(), *side),
+                    EgtElement::PieceGroup { role, side, .. } => (*role, *side),
                 };
                 let color = match side {
                     EgtSide::SideToMove => side_to_move,
@@ -783,8 +781,8 @@ mod tests {
     fn indexer(groups: &[EgtElement]) -> Indexer {
         // Deliberately unsorted: the indexer must retain the old group order.
         let mut elements = vec![
-            EgtElement::PieceGroup { role: EgtRole::King, side: SNTM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: EgtRole::King, side: STM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
         ];
         elements.extend_from_slice(groups);
         Indexer::from_elements(&elements).unwrap()
@@ -912,15 +910,15 @@ mod tests {
     #[test]
     fn indexer_rejects_invalid_elements() {
         let kings = [
-            EgtElement::PieceGroup { role: EgtRole::King, side: STM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: EgtRole::King, side: SNTM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
         ];
         for extra in [
             vec![pawn_group(File::E, &[])],
             vec![pawn_group(File::E, &[STM]), pawn_group(File::E, &[SNTM])],
-            vec![EgtElement::PieceGroup { role: EgtRole::Pawn(File::E), side: STM, multiplicity: 1 }],
-            vec![EgtElement::PieceGroup { role: EgtRole::Queen, side: STM, multiplicity: 0 }],
-            vec![EgtElement::PieceGroup { role: EgtRole::Queen, side: STM, multiplicity: usize::MAX }],
+            vec![EgtElement::PieceGroup { role: Role::Pawn, side: STM, multiplicity: 1 }],
+            vec![EgtElement::PieceGroup { role: Role::Queen, side: STM, multiplicity: 0 }],
+            vec![EgtElement::PieceGroup { role: Role::Queen, side: STM, multiplicity: usize::MAX }],
         ] {
             let mut elements = kings.to_vec();
             elements.extend(extra);
@@ -934,9 +932,9 @@ mod tests {
         use shakmaty::fen::Fen;
 
         let elements = [
-            EgtElement::PieceGroup { role: EgtRole::Rook, side: STM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: EgtRole::King, side: SNTM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: EgtRole::King, side: STM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::Rook, side: STM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
         ];
         let indexer = Indexer::from_elements(&elements).unwrap();
         assert_eq!(indexer.index_range, 462 * 62);

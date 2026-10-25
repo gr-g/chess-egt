@@ -1,7 +1,7 @@
-use shakmaty::{Chess, Color, File};
+use shakmaty::{ByRole, Chess, Color, File, Role};
 mod indexer;
 use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{ALL_EGT_ROLES, EgtElement, EgtRole, EgtSide};
+use crate::piece_set::{EgtElement, EgtSide};
 use indexer::Indexer;
 
 #[derive(Clone, Debug)]
@@ -77,15 +77,15 @@ impl Egt {
             .into_iter()
             .enumerate()
         {
-            let mut counts = [0usize; ALL_EGT_ROLES.len()];
+            let mut counts = ByRole::new_with(|_| 0usize);
             let mut chars = text.chars().peekable();
             while let Some(c) = chars.next() {
                 let role = match c {
-                    'K' => EgtRole::King,
-                    'Q' => EgtRole::Queen,
-                    'R' => EgtRole::Rook,
-                    'B' => EgtRole::Bishop,
-                    'N' => EgtRole::Knight,
+                    'K' => Role::King,
+                    'Q' => Role::Queen,
+                    'R' => Role::Rook,
+                    'B' => Role::Bishop,
+                    'N' => Role::Knight,
                     'P' => {
                         let file = match chars.next() {
                             Some(c @ 'a'..='h') => File::new(c as u32 - 'a' as u32),
@@ -93,21 +93,21 @@ impl Egt {
                         };
                         let opposed = chars.next_if_eq(&'o').is_some();
                         flags[side_idx][file.to_usize()].push(opposed);
-                        EgtRole::Pawn(file)
+                        continue;
                     }
                     _ => return Err(invalid("invalid piece character")),
                 };
-                counts[role.to_index()] += 1;
+                counts[role] += 1;
             }
-            if counts[EgtRole::King.to_index()] != 1 {
+            if counts.king != 1 {
                 return Err(invalid("each side must have exactly one king"));
             }
-            for role in ALL_EGT_ROLES {
-                if !role.is_pawn() && counts[role.to_index()] != 0 {
+            for role in Role::ALL.into_iter().rev() {
+                if counts[role] != 0 {
                     elements.push(EgtElement::PieceGroup {
                         role,
                         side,
-                        multiplicity: counts[role.to_index()],
+                        multiplicity: counts[role],
                     });
                 }
             }
@@ -220,23 +220,11 @@ fn compute_tablename(elements: &[EgtElement]) -> String {
     let mut sides = Vec::new();
     for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
         let mut name = String::from("K");
-        for (role, symbol) in [
-            (EgtRole::Queen, 'Q'),
-            (EgtRole::Rook, 'R'),
-            (EgtRole::Bishop, 'B'),
-            (EgtRole::Knight, 'N'),
-        ] {
-            for element in elements {
-                if let EgtElement::PieceGroup {
-                    role: piece_role,
-                    side: piece_side,
-                    multiplicity,
-                } = element
-                    && *piece_role == role
-                    && *piece_side == side
-                {
-                    name.extend(std::iter::repeat_n(symbol, *multiplicity));
-                }
+        for element in elements {
+            if let EgtElement::PieceGroup { role, side: piece_side, multiplicity } = element
+                && *role != Role::King && *piece_side == side
+            {
+                name.extend(std::iter::repeat_n(role.upper_char(), *multiplicity));
             }
         }
         for element in elements {
@@ -268,7 +256,7 @@ mod tests {
         }
     }
 
-    fn piece_group(role: EgtRole, side: EgtSide, multiplicity: usize) -> EgtElement {
+    fn piece_group(role: Role, side: EgtSide, multiplicity: usize) -> EgtElement {
         EgtElement::PieceGroup {
             role,
             side,
@@ -278,8 +266,8 @@ mod tests {
 
     fn kings() -> Vec<EgtElement> {
         vec![
-            piece_group(EgtRole::King, Stm, 1),
-            piece_group(EgtRole::King, Sntm, 1),
+            piece_group(Role::King, Stm, 1),
+            piece_group(Role::King, Sntm, 1),
         ]
     }
 
@@ -329,13 +317,38 @@ mod tests {
     }
 
     #[test]
+    fn element_order_preserves_canonical_indexing_order() {
+        let mut expected = vec![
+            pawn_group(File::A, &[Stm]),
+            pawn_group(File::A, &[Stm, Sntm]),
+            pawn_group(File::A, &[Sntm]),
+            pawn_group(File::B, &[Stm]),
+        ];
+        for role in [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight] {
+            for side in [Stm, Sntm] {
+                expected.extend([piece_group(role, side, 1), piece_group(role, side, 2)]);
+            }
+        }
+        let mut shuffled = expected.clone();
+        shuffled.reverse();
+        shuffled.sort();
+        assert_eq!(shuffled, expected);
+        for (i, a) in expected.iter().enumerate() {
+            for (j, b) in expected.iter().enumerate() {
+                assert_eq!(a.cmp(b), i.cmp(&j));
+                assert_eq!(a.partial_cmp(b), Some(i.cmp(&j)));
+            }
+        }
+    }
+
+    #[test]
     fn naming_sorts_files_and_preserves_nonpawn_names() {
         let mut elements = kings();
         elements.extend([
             pawn_group(File::H, &[Stm]),
-            piece_group(EgtRole::Knight, Stm, 1),
+            piece_group(Role::Knight, Stm, 1),
             pawn_group(File::B, &[Stm, Sntm]),
-            piece_group(EgtRole::Queen, Stm, 1),
+            piece_group(Role::Queen, Stm, 1),
         ]);
         let egt = Egt::from_elements(elements).unwrap();
         assert_eq!(egt.tablename(), "KQNPboPh_KPbo");
@@ -344,10 +357,10 @@ mod tests {
             &[
                 pawn_group(File::B, &[Stm, Sntm]),
                 pawn_group(File::H, &[Stm]),
-                piece_group(EgtRole::King, Stm, 1),
-                piece_group(EgtRole::King, Sntm, 1),
-                piece_group(EgtRole::Queen, Stm, 1),
-                piece_group(EgtRole::Knight, Stm, 1),
+                piece_group(Role::King, Stm, 1),
+                piece_group(Role::King, Sntm, 1),
+                piece_group(Role::Queen, Stm, 1),
+                piece_group(Role::Knight, Stm, 1),
             ]
         );
         for name in ["K_K", "KQQ_K", "KQRBN_KR", "KPaPa_KPh"] {
@@ -363,8 +376,8 @@ mod tests {
             &[
                 pawn_group(File::D, &[Stm]),
                 pawn_group(File::E, &[Sntm, Sntm, Sntm, Stm]),
-                piece_group(EgtRole::King, Stm, 1),
-                piece_group(EgtRole::King, Sntm, 1),
+                piece_group(Role::King, Stm, 1),
+                piece_group(Role::King, Sntm, 1),
             ]
         );
     }
@@ -414,16 +427,16 @@ mod tests {
         for extra in [
             vec![pawn_group(File::A, &[])],
             vec![pawn_group(File::A, &[Stm]), pawn_group(File::A, &[Sntm])],
-            vec![piece_group(EgtRole::Pawn(File::A), Stm, 1)],
-            vec![piece_group(EgtRole::Queen, Stm, 0)],
+            vec![piece_group(Role::Pawn, Stm, 1)],
+            vec![piece_group(Role::Queen, Stm, 0)],
             vec![
-                piece_group(EgtRole::Queen, Stm, 1),
-                piece_group(EgtRole::Queen, Stm, 2),
+                piece_group(Role::Queen, Stm, 1),
+                piece_group(Role::Queen, Stm, 2),
             ],
-            vec![piece_group(EgtRole::King, Stm, 1)],
-            vec![piece_group(EgtRole::Queen, Stm, 7)],
+            vec![piece_group(Role::King, Stm, 1)],
+            vec![piece_group(Role::Queen, Stm, 7)],
             vec![pawn_group(File::A, &[Stm; 6]), pawn_group(File::B, &[Sntm])],
-            vec![piece_group(EgtRole::Queen, Stm, usize::MAX)],
+            vec![piece_group(Role::Queen, Stm, usize::MAX)],
         ] {
             let mut elements = kings();
             elements.extend(extra);
@@ -434,15 +447,15 @@ mod tests {
         }
         for elements in [
             vec![],
-            vec![piece_group(EgtRole::King, Stm, 1)],
-            vec![piece_group(EgtRole::King, Sntm, 1)],
+            vec![piece_group(Role::King, Stm, 1)],
+            vec![piece_group(Role::King, Sntm, 1)],
             vec![
-                piece_group(EgtRole::King, Stm, 2),
-                piece_group(EgtRole::King, Sntm, 1),
+                piece_group(Role::King, Stm, 2),
+                piece_group(Role::King, Sntm, 1),
             ],
             vec![
-                piece_group(EgtRole::King, Stm, 1),
-                piece_group(EgtRole::King, Sntm, 2),
+                piece_group(Role::King, Stm, 1),
+                piece_group(Role::King, Sntm, 2),
             ],
         ] {
             assert!(matches!(
@@ -455,9 +468,9 @@ mod tests {
     #[test]
     fn elements_count_physical_pieces() {
         assert_eq!(pawn_group(File::A, &[Stm, Sntm, Stm]).multiplicity(), 3);
-        assert_eq!(piece_group(EgtRole::Queen, Stm, 2).multiplicity(), 2);
+        assert_eq!(piece_group(Role::Queen, Stm, 2).multiplicity(), 2);
         let mut elements = kings();
-        elements.push(piece_group(EgtRole::Knight, Stm, 6));
+        elements.push(piece_group(Role::Knight, Stm, 6));
         let egt = Egt::from_elements(elements).unwrap();
         assert_eq!(
             egt.elements()

@@ -8,11 +8,11 @@ use crate::storage::{Location, block_on};
 use std::sync::{Arc, RwLock};
 #[cfg(test)]
 use shakmaty::CastlingMode;
-use shakmaty::{Chess, Color, File, Position};
+use shakmaty::{ByRole, Chess, Color, File, Position, Role};
 use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{EgtElement, EgtRole, EgtSide};
+use crate::piece_set::{EgtElement, EgtSide};
 use serde::{Serialize, Deserialize};
 
 // 256k positions per frame, corresponding to 512kiB per frame.
@@ -947,33 +947,26 @@ fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<EgtElement>
         (stm, EgtSide::SideToMove, &mut stm_pawns),
         (sntm, EgtSide::SideNotToMove, &mut sntm_pawns),
     ] {
-        let mut count = [0; crate::piece_set::ALL_EGT_ROLES.len()];
+        let mut count = ByRole::<usize>::default();
         for c in s.chars() {
-            match c {
-                'P' => *pawns += 1,
-                'K' => count[EgtRole::King.to_index()] += 1,
-                'Q' => count[EgtRole::Queen.to_index()] += 1,
-                'R' => count[EgtRole::Rook.to_index()] += 1,
-                'B' => count[EgtRole::Bishop.to_index()] += 1,
-                'N' => count[EgtRole::Knight.to_index()] += 1,
-                _ => return Err(EgtError::InvalidEndgameName {
+            let role = Role::from_char(c).filter(|_| c.is_ascii_uppercase())
+                .ok_or_else(|| EgtError::InvalidEndgameName {
                     name: endgame.to_string(),
                     reason: "invalid piece character",
-                }),
-            }
+                })?;
+            count[role] += 1;
         }
-        if count[EgtRole::King.to_index()] != 1 {
+        *pawns = count[Role::Pawn];
+        if count[Role::King] != 1 {
             return Err(EgtError::InvalidEndgameName {
                 name: endgame.to_string(),
                 reason: "each side must have exactly one king",
             });
         }
-        for piece in crate::piece_set::ALL_EGT_ROLES {
-            if !piece.is_pawn() {
-                let multiplicity = count[piece.to_index()];
-                if multiplicity > 0 {
-                    other_pieces.push(EgtElement::PieceGroup { role: piece, side, multiplicity });
-                }
+        for role in Role::ALL.into_iter().rev() {
+            let multiplicity = count[role];
+            if role != Role::Pawn && multiplicity > 0 {
+                other_pieces.push(EgtElement::PieceGroup { role, side, multiplicity });
             }
         }
     }
@@ -1192,9 +1185,21 @@ mod tests {
         assert_eq!(stm_pawns, 1);
         assert_eq!(sntm_pawns, 1);
         assert_eq!(other_pieces.len(), 3);
-        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::King, side: EgtSide::SideToMove, multiplicity: 1 }));
-        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::Rook, side: EgtSide::SideToMove, multiplicity: 1 }));
-        assert!(other_pieces.contains(&EgtElement::PieceGroup { role: EgtRole::King, side: EgtSide::SideNotToMove, multiplicity: 1 }));
+        assert_eq!(other_pieces, vec![
+            EgtElement::PieceGroup { role: Role::King, side: EgtSide::SideToMove, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::Rook, side: EgtSide::SideToMove, multiplicity: 1 },
+            EgtElement::PieceGroup { role: Role::King, side: EgtSide::SideNotToMove, multiplicity: 1 },
+        ]);
+
+        let (_, _, pieces) = parse_endgame_name("NBRQK_K").unwrap();
+        assert_eq!(pieces.iter().map(|piece| match piece {
+            EgtElement::PieceGroup { role, .. } => *role,
+            _ => unreachable!(),
+        }).collect::<Vec<_>>(), vec![Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::King]);
+
+        for name in ["Kk", "k_K", "K_qK", "K_XK", "K_K_K", "_K", "K_", "KK_K", "K_KK"] {
+            assert!(matches!(parse_endgame_name(name), Err(EgtError::InvalidEndgameName { .. })), "{name}");
+        }
     }
 
     #[test]

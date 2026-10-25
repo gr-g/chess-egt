@@ -79,6 +79,8 @@ Pawn tokens are `Pa` through `Ph`, with a trailing `o` ("opposed") if the **near
 
 For each file, both sides must have the same number of `o` markers. Together with the token order this uniquely determines the color sequence.
 
+Internally, material is represented by a vector of `EgtElement`: an element encodes either a group of pawns on the same file with a specific sequence of colors, or a group of non-pawn pieces of one type and color.
+
 The `Indexer` handles the mapping of positions to a contiguous local index range `[0, index_range)`.
 
 En-passant positions are encoded separately in different ranges of indices (sub-tables) managed internally by the `Indexer`. The `Indexer` exposes a single unified index range for the entire `Egt`.
