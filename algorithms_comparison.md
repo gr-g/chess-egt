@@ -18,8 +18,8 @@ Scaling to 6+ pieces (shared-memory vs. distributed parallelization) and the res
 | **Working Representation** | `u16` (16 bits): 3-bit status + 13-bit counter / DTC | `uint8_t` (8 bits): tightly packed status & ply codes | `int16_t` (16 bits): signed mate distance + flags | Custom bit-packed struct / byte per slice group |
 | **Memory Footprint (per pos)** | 2 bytes/pos (both STM tables live in memory) | **1 byte/pos** (tightly packed, fits 6-man in ~16 GB) | 2 bytes/pos (WTM + BTM tables) | **Configurable Soft Cap (`--mem`)**: pages groups to disk |
 | **Loss Resolution Mechanism** | **Decremental Move Counter** (stored in `UNKNOWN` bits) | **`CHANGED` flag + forward `check_loss` verification** | **`MAYBELOSS` flag + forward `check_loss` verification** | **`CHANGED` flag + bound check + forward `check_loss`** |
-| **Propagation Engine** | **BFS Queues** (`DepthQueues` of `usize` indices) | **Table Iteration Scans** (flat array sweeps per ply) | **Table Iteration Scans** (OpenMP flat parallel loops) | **Group Paging & Chunked Parallel Iterators** |
-| **Parallelization** | None currently (single-threaded) | Pthreads / C11 threads + atomic CAS (`lock cmpxchgb`) | OpenMP (`#pragma omp parallel for`) | Custom thread pool (`Thread_Pool`) with work-stealing chunks |
+| **Propagation Engine** | **Per-ply table scans** with block summaries, no queues | **Table Iteration Scans** (flat array sweeps per ply) | **Table Iteration Scans** (OpenMP flat parallel loops) | **Group Paging & Chunked Parallel Iterators** |
+| **Parallelization** | Rayon scans and atomic updates; serial pair jobs share a pool/cache | Pthreads / C11 threads + atomic CAS (`lock cmpxchgb`) | OpenMP (`#pragma omp parallel for`) | Custom thread pool (`Thread_Pool`) with work-stealing chunks |
 | **Dependency Resolution** | Forward scanning during init (probes children) | Scans sub-tables & reverse-marks into parent table | Forward scanning during init (or `retrograde_promotion_tbs`) | Forward & reverse hybrid, topological pawn slice ordering |
 | **Output Compression** | Seekable Zstd (`zeekstd`) with bit-transposition | Custom Huffman + rank compression + LZ4 / Zstd | Block-compressed Zstd (32K pos / block) | LZ4-HC (WDL) / LZMA rank streams (DTZ/DTM), 64KB/1MB blocks |
 
@@ -33,13 +33,13 @@ This is the **single most fundamental algorithmic difference**:
 
 1. **`chess-egt` (Decremental Move Counters)**:
    - When initialized, every unresolved position stores the number of legal moves $C$ in its unused 13 bits (`0b000 | (C << 3)`).
-   - During propagation, whenever a successor position is proved to be a win for the opponent, the predecessor’s index is queued, and its move counter is decremented by 1.
+   - Per-ply scans find resolved successors; reverse moves decrement unresolved predecessors' move counters. Block summaries skip regions that cannot contain the scanned ply.
    - When the counter reaches 0, all legal moves have been proven losing, so the position is marked as a Loss.
    - *Challenges*:
      - **Symmetry hazards**: With diagonal reflections in pawnless tables, moves transitioning between 8-way and 4-way orbits require artificial $+2$ counter weighting, mirror decrements, and unmove deduplication. If a single unmove is duplicated or missed, the counter never reaches 0 (turning a loss into a draw) or drops too fast (false loss).
      - **Parallelism contention**: Decrementing shared counters is inherently non-idempotent. Every unmove reaching a predecessor $P$ must execute an atomic read-modify-write (`fetch_sub` or CAS loop). If multiple worker threads hit positions on the same cache line, the line is constantly invalidated and bounced across CPU cores.
-       *(Re-assessed in [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.1: the workload is compute-bound and the tables are accessed at scattered locations, so collisions should be rare and an uncontended atomic is cheap next to an unmove. The sweep also needs atomic writes in its propagation step. Not measured yet.)*
-     - **Queue memory spikes**: Depth queues holding millions of `usize` indices can consume gigabytes of heap memory at peak iteration depths.
+       *(Re-assessed in [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.1: scattered accesses make collisions less likely, and an uncontended atomic is cheap next to an unmove. Section 7 records historical shared-memory scaling; the sweep also needs atomic propagation writes.)*
+     - **Scan overhead**: Unlike the former queue-based implementation, the current solver stores no frontier indices; deep, thin frontiers can still require many scans.
 
 2. **Syzygy (`tb`), Prophet, and `chesstb` (Candidate Flag + Forward Verification)**:
    - **None of the other three engines use decremental move counters.**
@@ -56,9 +56,13 @@ This is the **single most fundamental algorithmic difference**:
        - **Early Exit**: As soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`.
        - If and only if **all** legal forward moves lead to opponent wins in $\le p$, the position is promoted to confirmed `LOSS_IN(p)`.
 
-#### Measured comparison in `chess-egt` (single-threaded)
+#### Historical comparison in `chess-egt` (single-threaded)
 
 To get hard numbers, the Changed-Flag approach was re-implemented in `chess-egt` (`src/retrograde_sweep.rs`, selected with `--algorithm sweep`; since removed, together with the queue-based counters, in favor of the scan-driven counters, see the follow-up below and the git history), sharing everything else with the counter implementation: indexing, `quiet_unmoves`, dependency probing, statistics and file output.
+
+These measurements predate the current individual-table storage layout. The
+removed algorithms and flags below describe that experiment, not current CLI
+options.
 
 *Implementation notes:*
 - The 13 spare bits of an `UNKNOWN` value hold a `CHANGED` flag, a `NO_LOSS` flag and two 2-bit conversion types. Initialization probes captures/promotions once (as the counter version does): if any conversion move does not lose, the position gets `NO_LOSS` and can never become a candidate; otherwise all conversions are known to lose, so forward verification only plays **quiet** moves against the pair tables and never probes dependency tables.
@@ -122,7 +126,7 @@ To get hard numbers, the Changed-Flag approach was re-implemented in `chess-egt`
 ### D. Capture & Promotion Dependencies (Sub-Tables)
 
 1. **`chess-egt`**:
-   - Currently, during table initialization, every valid position is decoded, legal captures and promotions are played forward, and the lower-order dependency table is probed (`dep_cache.get_or_load()?.probe()`).
+   - During initialization, valid positions play captures/promotions forward and probe lower-order tables through a shared dependency reader. Dependencies must already exist unless explicitly selected for earlier generation; the cache and Rayon pool are reused across selected pair jobs.
 2. **Syzygy (`rtbgen.c` / `tbgenp.c`)**:
    - Instead of scanning all parent positions and doing forward probes into child tables, it iterates over the possible captured pieces in the already-generated child table (`probe_captures_w`, `probe_captures_b`), doing reverse captures to directly mark predecessors in the parent table.
 3. **Prophet (`retrograde_promotion_tbs`)**:
@@ -150,21 +154,23 @@ Studying these three mature projects offers several high-value insights directly
 In `chess-egt`'s `AGENTS.md`, the complex interaction between move counters and diagonal symmetries is noted as a tricky area requiring special counter doubling ($+2$) and mirror decrements.
 - **Insight**: If `chess-egt` replaces decremental counters with a `CHANGED` flag + forward `check_loss` (or uses candidate flags alongside counters):
   - Symmetry handling becomes trivial and robust: marking `CHANGED` or `WIN` is idempotent (multiple identical or symmetric reverse moves can mark the same cell without causing corruption).
-  - Eliminates the need for large heap queues (`DepthQueues` vectors): measured 4x lower peak memory on 5-piece tables.
+  - Compared with the historical queue-driven counters, the experiment used roughly 4x less peak memory on the 5-piece sample. The current scan-driven counters already avoid those queues.
   - Avoids atomic subtracts in multi-threading (idempotent marks still need a CAS/TTAS).
 - **Measured trade-off** (see Section 2.A): single-threaded, the sweep is 13% (4-piece) to 23% (5-piece sample) slower, up to +53% on deep thin-frontier tables. The decision therefore hinges on parallel scaling and on memory for 6-piece tables, not on single-threaded speed.
-- **Possible middle grounds not yet measured**:
+- **Other combinations and the current choice**:
   - Candidate flags + forward verification, but with a queue (e.g. of chunk-relative `u32` indices) instead of full sweeps, which would remove the per-ply scans on deep tables while keeping idempotent marking.
-  - **Decremental counters driven by per-ply table scans instead of queues** (the direction proposed in [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2). The positions to propagate at ply `p` are exactly those stored with distance `p - 1`, so the queues can be dropped. This keeps the counters' low work per edge (no forward verification of candidates) and has the sweep's memory footprint. Its updates never read remote state, so it also carries over to separate-memory workers. A per-block "last resolved ply" summary lets scans skip untouched blocks on deep tables.
+  - **Decremental counters driven by per-ply table scans instead of queues** are the current implementation ([`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2). The positions to propagate at ply `p` are exactly those stored with distance `p - 1`, so the queues can be dropped. This keeps the counters' low work per edge (no forward verification of candidates) and has the sweep's memory footprint. Its updates never read remote state, so it also carries over to separate-memory workers. A per-block "last resolved ply" summary lets scans skip untouched blocks on deep tables.
 
 ### 2. Multi-Threading & Rayon Parallelization
-Currently, `chess-egt` is single-threaded.
+`chess-egt` uses Rayon for initialization, per-ply scans, and finalization, with
+atomic updates to the active pair. One pool and shared dependency cache are
+reused across serial jobs; cached frames have no LRU eviction yet.
 - **Insight**: Prophet and Syzygy demonstrate that flat array sweeps over index chunks (`[chunk_start..chunk_end]`) parallelize exceptionally well.
 - In Rust, with `rayon`, an entire iteration step can be written as:
   ```rust
   table.par_chunks_mut(CHUNK_SIZE).for_each(|chunk| { ... });
   ```
-  Using `AtomicU16` with `fetch_update` or CAS (like Syzygy's `lock cmpxchgb`) makes the propagation loop lock-free. Near-linear scaling is expected for this compute-bound workload but has not been measured. The same holds for atomic counter decrements. The output stays byte-identical only if the updates within a phase give the same result in any order. For counters, this requires resolving the conversion type of new losses per phase (see [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2).
+  `AtomicU16` CAS loops handle scattered propagation updates. Historical scaling measurements are in [`scaling_and_parallelization.md`](scaling_and_parallelization.md), Step 4; they are not a guarantee of near-linear scaling. Deterministic output requires updates within each phase to give the same result in any order. For counters, this requires resolving the conversion type of new losses per phase (see [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2).
 
 ### 3. Topological Slicing for Pawnful Tables
 - **Insight**: Since pawns cannot move backward, pawn configurations form a Directed Acyclic Graph (DAG).
@@ -176,5 +182,6 @@ In `chess-egt`'s `TODO`, there is an item: *"Experiment with approach using capt
 - **Insight**: Both Syzygy and Prophet validate this approach. By iterating over the (much smaller) dependency tables and unmoving captures/promotions into the target table, you eliminate the overhead of forward legality checking and sub-table probe searching for the vast majority of non-capture positions during initialization.
 
 ### 5. Probing and Storage Footprint (STM Dropping)
-- **Insight**: In `chess-egt`, an `EgtFile` currently stores all positions for both sides. For 5-piece and upcoming 6-piece tables, dropping one side-to-move for asymmetric endgames (reconstructing via 1-ply search in the prober) will immediately reduce **final disk storage and prober memory footprint** by roughly 40–50%.
+- **Current storage**: `Egt` is logical indexing; `EgtFileReader` and `EgtFileWriter` read/publish one exact oriented table. Each table has its own `n/maxvmin/opK/Npawns/name.ggegt` and JSON sidecar, with root `format.json` identifying format/indexing/layout version 1 and frame size 262144. Tables publish immediately, without accumulating a material selection's outputs.
+- **Possible optimization**: omitting one quiet-move twin for asymmetric endgames and reconstructing it through 1-ply search could reduce final storage and prober memory. The actual saving depends on the two tables' compressed sizes; this is not implemented.
 - Note that during the retrograde generation process itself, both sides must remain active in memory to propagate alternating plies, so this optimization does not reduce generation-time memory pressure.

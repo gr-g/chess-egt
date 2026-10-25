@@ -8,24 +8,38 @@ Goals:
 # Usage
 
 ```sh
-# Generate all 3-pieces tables locally.
-cargo run --release -- --path ./tablebases --generate-all-3
+# Generate the prerequisites and all 3-piece tables locally.
+cargo run --release -- --generate 2/ 3/
 
-# Generate all 4-pieces tables locally using an existing local
-# dependency set, using 4 threads.
-cargo run --release -- --path ./tablebases --generate-all-4 --threads 4
+# Generate all 4-piece tables once their dependencies exist, using 4 threads.
+cargo run --release -- --path ./ggegt --generate 4/ --threads 4
 
-# Generate locally using dependencies from an AWS S3 bucket
-# (requires specific environment variables with connection info - see
-# [https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html])
-cargo run --release -- --path ./tablebases --input-path s3://ggegt/ --generate-all-4
+# Generate selected tables using existing dependencies from S3.
+cargo run --release -- --path ./ggegt --input-path s3://ggegt/ --generate KQ_KR KP_K
 
-# Verify an existing table independently of generation.
-cargo run --release -- --path ./tablebases --verify KQ_KR
+# Verify existing tables.
+cargo run --release -- --verify KQ_KR KR_KQ
+
+# Enumerate theoretical tables.
+cargo run --release -- --list KP_K 4/2v2/op1
 
 # Probe a table.
-cargo run --release -- --path ./tablebases '8/8/8/8/8/2K5/4Q3/7k w - - 0 1'
+cargo run --release -- --path ./ggegt '8/8/8/8/8/2K5/4Q3/7k w - - 0 1'
 ```
+
+`--generate`, `--verify`, `--stats`, and `--list` each accept multiple `SELECTOR`s:
+
+- **Exact name**, e.g. `KPa_K`: one canonical table, with STM on the left.
+- **Oriented material**, e.g. `KP_K`: all tables for that material balance (`K_KP` is not included).
+- **Hierarchy prefix**, e.g. `3/`, `4/2v2/op1`, or `4/2v2/op1/2pawns`. A material or exact name may follow a prefix to intersect the selections.
+
+Generating a table such as `KPa_K` will also generate the twin table `K_KPa`.
+Verification and stats do not add twins.
+
+Cloud credentials/configuration come from environment variables supported by
+[`object_store`](https://docs.rs/object_store/latest/object_store/). HTTP roots
+are read-only. `--input-path` is searched before `--path`, falling back only for
+missing objects.
 
 Run the test suite with:
 
@@ -43,8 +57,8 @@ is implemented locally for the tablebase solver.
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt` & `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFile`, `EgtFileWriter`)**: Manages local/cloud objects through `object_store`, seekable Zstd compression/decompression, in-memory compressed sub-tables, buffered publication, and the in-memory frame cache.
-4. **Retrograde Analysis** (`RetrogradeSolver`): The recursive algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
+3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`)**: Stores each canonical table separately through `object_store`, with seekable Zstd compression, buffered publication, and a shared dependency frame cache. Storage is separate from the logical `Egt`.
+4. **Retrograde Analysis** (`RetrogradeSolver`): The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
 Each position's outcome is represented by a 16-bit `DtcOutcome` value.
@@ -106,21 +120,31 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
    - The final index is:
      $$\text{local\_index} = \text{index\_offset} + \text{aggregated\_combinations}$$
 
-### 3.2 `EgtFile` Composition
-An `EgtFile` represents a stored `.ggegt` object (local or cloud), storing the outcomes for a specific combination of pieces on the board (e.g., `KP_K`) and is composed of multiple `Egt` objects (e.g., `KPa_K`, `KPb_K`, `KPc_K`, `KPd_K`).
-- Material files always contain **all** their pawn-order subdivisions; partial publication is not supported. The writer requires every sub-table before publishing.
-- Routing extracts each file's color sequence from the board. Horizontal canonicalization still compares STM and SNTM file multisets, retaining both orientations when those multisets tie. A twin reverses each sequence and exchanges STM/SNTM, then applies horizontal canonicalization; its reflection flag is derived from that transformation.
-- Sub-tables are sorted deterministically by a packed pawn-order key. The `EgtFile` maps its global index space sequentially to the constituent `Egt` objects.
-- The global index is computed as:
-  $$\text{global\_index} = \text{egt\_offset} + \text{local\_index}$$
-  where $\text{egt\_offset}$ is the sum of the index ranges of all preceding `Egt` objects in a stable order.
+### 3.2 Table identity and storage
+`TableId` identifies one canonical table without storage or a full indexing plan.
+`Egt` supplies its logical indexing; `EgtFileReader` holds one `Egt`, its identity,
+and its storage/frame cache.
 
 ## 4. File Format & Compression
-An `EgtFile` is stored using a seekable Zstd format (via the `zeekstd` library).
+Each canonical table is one seekable Zstd object (via `zeekstd`), with an optional
+JSON statistics file at the same relative path:
 
-Pawnful material files use the indexing-version namespace `<material>.v2.ggegt`, with statistics in `<material>.v2.json`. For example, `KP_KP.v2.ggegt` contains both passed and opposed same-file pawn tables. Legacy pawnful `<material>.ggegt` files are not read or overwritten: regenerate them, including pawnful dependencies. Renaming a legacy file does not convert its indexing. Pawnless files retain their original `.ggegt`/`.json` names and encoding.
-- Files use **table-aligned frames** of at most `256 * 1024` positions. Frames never cross an `Egt` boundary.
-- Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the table lengths and validates it against the seek table.
+```text
+<root>/format.json
+<root>/<n>/<max>v<min>/op<K>/<N>pawns/<tablename>.ggegt
+<root>/<n>/<max>v<min>/op<K>/<N>pawns/<tablename>.json
+```
+
+Here `n` counts all pieces including kings, `max`/`min` are the two side piece
+counts in descending order, `K` counts mutually opposing pawn pairs (once per
+pair), and `N` counts pawns.
+
+The immutable root `format.json` declares `format: "chess-egt"`,
+`format_version: 1`, `indexing_version: 1`, `layout_version: 1`, and
+`frame_size: 262144`.
+
+- Frames contain at most `256 * 1024` positions, with a short, unpadded final frame.
+- Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the single table's index range and validates it against the seek table.
 - Seek tables are checksum-free: `17 + 8 * num_frames` bytes. Checksum-bearing seek tables are not supported. The footer frame count is checked before parsing to bound allocation; compressed and decompressed lengths are also validated.
 - Readers cache the seek table and fetch one compressed range per cold frame.
 Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOutcome` values are transposed to maximize compressibility. They are reshaped as a sequence of bytes by taking:
@@ -129,27 +153,30 @@ Before applying Zstd compression to a frame of $N$ positions, the 16-bit `DtcOut
 
 The transposed buffer is always exactly `2 * N` bytes: high bytes for non-invalid, non-drawn outcomes are packed after the low bytes, and the unused tail remains zero.
 
-During generation, each finalized sub-table is compressed and retained in memory for its output file. Publication streams the compressed segments in stable `Egt` order without recompression and appends one final seek table through the `object_store` buffered writer. SHA-256 covers these exact published bytes.
+`EgtFileWriter` retains one table's compressed frame batches, then streams them
+in frame order without recompression and appends one seek table through the
+`object_store` buffered writer.
 
 ## 5. Memory Management
 
 Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved. Finalization processes one table at a time in parallel frame batches. Batches use the same Rayon pool as generation, with at most one encoder per configured thread; level-19 encoder memory therefore grows with `--threads`.
 
-`retrograde_analysis` publishes its in-memory compressed output through `object_store` before returning. The buffered uploader bounds in-flight upload concurrency, but does not remove the memory cost of accumulated compressed sub-tables.
+Selected jobs run serially while reusing one Rayon pool and a shared dependency
+reader/cache across jobs within each material family.
 
 ### 5.1 Frame States
-Each frame in an `EgtFile` can be in one of three states:
-1. **Unallocated**: The frame is not loaded or has not been calculated yet (all outcomes default to invalid/unknown).
-2. **Compressed**: Only the compressed representation of the frame is stored in memory.
-3. **Uncompressed**: The frame is fully uncompressed in memory as a contiguous array of `u16` values.
+Each frame in an `EgtFileReader` can be empty, compressed on storage, compressed
+in memory, or uncompressed in memory. Cold stored frames are fetched and decoded
+on demand. Empty frames default to invalid outcomes; generation's active working
+arrays are separate from this cache.
 
 ## 6. Retrograde Analysis
-Retrograde analysis is the recursive algorithm used to generate endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.
+Retrograde analysis generates endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.
 
 ### 6.1 Simultaneous Propagation
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis is run on both tables simultaneously in a single unified loop. Both tables are initialized and propagated together.
 
-Quiet moves preserve the pawn color order on every file, so propagation stays within one table/twin pair. Captures (including en passant) and promotions probe dependency files during initialization. Smaller order-specific pairs reduce the active working arrays; compressed output for the complete material files is still retained until publication.
+Quiet moves preserve the pawn color order on every file, so propagation stays within one table/twin pair. Captures (including en passant) and promotions probe existing dependency tables during initialization. Only one pair's working arrays are active; each finalized table is published independently.
 
 Generation supports shared-memory parallelism through Rayon. Use `--threads N`
 (or `EgtGenerator::with_threads(N)` in the library). Omitting `--threads` or
@@ -157,9 +184,9 @@ setting it to `0` uses Rayon's default: `RAYON_NUM_THREADS` if set, otherwise
 the number of available logical CPUs.
 
 Draw finalization, statistics, and compression run in frame batches.
-Publication, SHA-256, and JSON remain serial, with JSON written after both
-tablebases. Verification checks independent 4096-position blocks in a separate
-pool using the same thread count. See Step 4 in
+Publication, SHA-256, and JSON remain serial, with JSON written after its
+individual tablebase. Post-generation verification checks independent 4096-position
+blocks in the generation pool; standalone verification creates its own pool. See Step 4 in
 [`scaling_and_parallelization.md`](scaling_and_parallelization.md) for
 validation and measured scaling.
 

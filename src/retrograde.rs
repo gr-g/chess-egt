@@ -34,55 +34,41 @@
 //! fetch-max operations are sufficient within each phase. Initialization lazily
 //! loads existing dependency tables through a shared reader.
 //!
-//! Completed sub-tables are finalized in bounded parallel frame batches and
-//! compressed segments are retained in RAM until ordered publication.
-//! All writers validate that every sub-table is complete before either file in
-//! an endgame pair is published.
+//! The solver holds only the logical table pair and its working arrays. After
+//! propagation joins, each exact table is finalized in bounded parallel frame
+//! batches and published separately. Generation uses the caller's Rayon pool
+//! and shared dependency reader; it does not generate missing prerequisites.
 
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
-use crate::egt_file::{MaybeDtcOutcome, EgtFile, PawnKey};
-use crate::error::{EgtError, EgtResult};
+use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
+use crate::table_id::{PawnKey, TableId};
+use crate::error::EgtResult;
 use crate::egt::Egt;
 
-use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
 use crate::egt_file::SharedDependencyReader;
 use crate::storage::Location;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EgtHandle {
-    pub file_idx: usize,
-    pub egt_idx: usize,
-}
+type EgtHandle = usize;
 
-// Returns the tablename of the sub-table referenced by `handle` within `solver`.
-// Used for logging; the name is not stored on the handle itself.
 fn table_name(solver: &RetrogradeSolver, handle: EgtHandle) -> &str {
-    solver.files[handle.file_idx].egts[handle.egt_idx].tablename()
+    solver.tables[handle].tablename()
 }
 
-pub struct RetrogradeSolver {
-    pub files: Vec<EgtFile>,
-    pub is_symmetric: bool,
+struct RetrogradeSolver {
+    tables: Vec<Egt>,
 }
 
 impl RetrogradeSolver {
-    pub fn new(file_a: EgtFile, file_b: Option<EgtFile>) -> Self {
-        let is_symmetric = file_b.is_none();
-        let mut files = vec![file_a];
-        if let Some(fb) = file_b {
-            files.push(fb);
-        }
-        Self {
-            files,
-            is_symmetric,
-        }
+    fn new(table_a: Egt, table_b: Option<Egt>) -> Self {
+        let mut tables = vec![table_a];
+        tables.extend(table_b);
+        Self { tables }
     }
-
-
 }
 
 /// Mutable values for only the current pair; a self-pair has one shared array.
@@ -586,8 +572,8 @@ struct PairResult {
     propagation_time: std::time::Duration,
 }
 
-/// Solves the pair of sub-tables `table_a` and `table_b` (the same sub-table
-/// with the other side to move), leaving the draws as unknown.
+/// Solves the logical tables `table_a` and `table_b` (twins under changing
+/// the side to move), leaving the draws as unknown.
 fn solve_pair(
     solver: &RetrogradeSolver,
     table_a: EgtHandle,
@@ -595,7 +581,7 @@ fn solve_pair(
     reader: &SharedDependencyReader,
 ) -> EgtResult<PairResult> {
     let init_start = std::time::Instant::now();
-    let egt = |table: EgtHandle| &solver.files[table.file_idx].egts[table.egt_idx];
+    let egt = |table: EgtHandle| &solver.tables[table];
 
     // (table, twin, mirrored, slot of the table, slot of the twin), where the
     // slot indexes the per-table counts (0 for A, 1 for B).
@@ -727,151 +713,80 @@ fn solve_pair(
     })
 }
 
-pub fn retrograde_analysis(
-    base_path: &Location,
-    endgame: &str,
-    input_path: Option<&Location>,
-) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-    retrograde_analysis_with_threads(base_path, endgame, input_path, 0)
-}
-
-/// Generates tables in a dedicated Rayon pool. Zero threads uses Rayon's default.
-pub fn retrograde_analysis_with_threads(
-    base_path: &Location,
-    endgame: &str,
-    input_path: Option<&Location>,
-    threads: usize,
-) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-
-    base_path.ensure_writable()?;
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()
-        .map_err(|_| EgtError::Internal("failed to build retrograde thread pool"))?;
-    pool.install(|| {
-        println!("Using {} threads for generation.", rayon::current_num_threads());
-        retrograde_analysis_in_pool(base_path, endgame, input_path)
-    })
-}
-
-fn retrograde_analysis_in_pool(
-    base_path: &Location,
-    endgame: &str,
-    input_path: Option<&Location>,
-) -> EgtResult<(EgtFile, Option<EgtFile>)> {
-    let parts: Vec<&str> = endgame.split('_').collect();
-    if parts.len() != 2 {
-        return Err(EgtError::InvalidEndgameName {
-            name: endgame.to_string(),
-            reason: "expected exactly one '_' separator",
-        });
-    }
-    let twin_endgame = format!("{}_{}", parts[1], parts[0]);
-
-    let is_symmetric = endgame == twin_endgame;
-
-    base_path.ensure_writable()?;
-    let file_a = EgtFile::new_in(base_path, endgame)?;
-    let file_b = if is_symmetric {
+/// Generates one exact table and its twin in the caller's Rayon pool.
+///
+/// The shared reader lazily opens existing conversion dependencies, including
+/// outputs of earlier jobs. Missing dependencies are errors, not generation
+/// requests. A self-twin is solved and published once. Readers are returned in
+/// requested-table/twin order with their per-table statistics attached.
+pub(crate) fn generate_pair(
+    base: &Location,
+    table: &TableId,
+    reader: &SharedDependencyReader,
+) -> EgtResult<Vec<EgtFileReader>> {
+    base.ensure_writable()?;
+    let (twin, _) = table.twin()?;
+    let mut ids = vec![table.clone()];
+    let table_a = Egt::from_elements(table.elements().to_vec())?;
+    let table_b = if twin == *table {
         None
     } else {
-        Some(EgtFile::new_in(base_path, &twin_endgame)?)
+        let egt = Egt::from_elements(twin.elements().to_vec())?;
+        ids.push(twin);
+        Some(egt)
     };
+    let solver = RetrogradeSolver::new(table_a, table_b);
+    let pair = solve_pair(&solver, 0, ids.len() - 1, reader)?;
+    // Readers construct their own descriptors. Release the solver's indexers
+    // before finalizing so only this pair's descriptors and arrays are retained.
+    drop(solver);
 
-    let solver = RetrogradeSolver::new(file_a, file_b);
-    let mut finalizer = crate::finalization::Finalizer::new(&solver.files)?;
-
-    // Match Egt sub-tables into pairs
-    let mut table_pairs = Vec::new();
-
-    for (egt_idx_a, egt_a) in solver.files[0].egts.iter().enumerate() {
-        let (twin_key, _) = PawnKey::from_elements(&egt_a.elements).twin().canonicalized();
-
-        let (file_idx_b, egt_idx_b) = if solver.is_symmetric {
-            let egt_idx_b = *solver.files[0].egt_map.get(&twin_key)
-                .expect("twin sub-table must exist in symmetric endgame");
-            (0, egt_idx_b)
-        } else {
-            let egt_idx_b = *solver.files[1].egt_map.get(&twin_key)
-                .expect("twin sub-table must exist in asymmetric endgame");
-            (1, egt_idx_b)
-        };
-
-        if solver.is_symmetric && egt_idx_a > egt_idx_b {
-            continue;
-        }
-
-        let table_a = EgtHandle {
-            file_idx: 0,
-            egt_idx: egt_idx_a,
-        };
-
-        let table_b = EgtHandle {
-            file_idx: file_idx_b,
-            egt_idx: egt_idx_b,
-        };
-
-        table_pairs.push((table_a, table_b));
+    let finalize_start = std::time::Instant::now();
+    let maxima = [
+        [pair.max_win_dtc_a, pair.max_loss_dtc_a],
+        [pair.max_win_dtc_b, pair.max_loss_dtc_b],
+    ];
+    let mut files = Vec::with_capacity(ids.len());
+    for ((id, values), maxima) in ids.iter().zip(pair.working.values).zip(maxima) {
+        println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
+        let file = EgtFileReader::new_in(base, id.tablename())?;
+        let stats = crate::finalization::finalize_table(&file, values, maxima)?;
+        drop(file);
+        let mut published = EgtFileReader::open_in(base, id.tablename())?;
+        published.stats = Some(stats);
+        files.push(published);
     }
-
-    // Initialization & Propagation Phase for each independent pair
-    let reader = SharedDependencyReader::new(HashMap::new(), base_path, input_path);
-    let mut init_time = std::time::Duration::ZERO;
-    let mut propagation_time = std::time::Duration::ZERO;
-    let mut finalize_time = std::time::Duration::ZERO;
-
-    for &(table_a, table_b) in &table_pairs {
-        let mut pair = solve_pair(&solver, table_a, table_b, &reader)?;
-        init_time += pair.init_time;
-        propagation_time += pair.propagation_time;
-        let finalize_start = std::time::Instant::now();
-        let visits = [
-            (table_a, [pair.max_win_dtc_a, pair.max_loss_dtc_a]),
-            (table_b, [pair.max_win_dtc_b, pair.max_loss_dtc_b]),
-        ];
-        for (table_idx, (table, maxima)) in visits.into_iter().enumerate() {
-            if table_idx == 1 && table_a == table_b {
-                continue;
-            }
-            println!("{}: finalizing outcomes, statistics and compression...", table_name(&solver, table));
-            finalizer.accept_table(
-                table.file_idx,
-                &solver.files[table.file_idx],
-                table.egt_idx,
-                std::mem::take(&mut pair.working.values[table_idx]),
-                maxima,
-            )?;
-        }
-        // The pair arrays are dropped here, before allocating the next pair.
-        finalize_time += finalize_start.elapsed();
-    }
-
     println!(
-        "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize {:.3}s",
-        endgame,
-        init_time.as_secs_f64(),
-        propagation_time.as_secs_f64(),
-        finalize_time.as_secs_f64(),
+        "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
+        table.tablename(),
+        pair.init_time.as_secs_f64(),
+        pair.propagation_time.as_secs_f64(),
+        finalize_start.elapsed().as_secs_f64(),
     );
-
-    let assembly_start = std::time::Instant::now();
-    let mut files = solver.files;
-    finalizer.finish_and_publish(&mut files)?;
-    println!("{}: output assembly {:.3}s", endgame, assembly_start.elapsed().as_secs_f64());
-    let file_a = files.remove(0);
-    let file_b = if is_symmetric { None } else { Some(files.remove(0)) };
-
-    Ok((file_a, file_b))
+    Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use crate::{EgtError, EgtGenerator};
+    use crate::selection::{GenerationPlan, TableSelector};
+
+    fn tables(material: &str) -> Vec<Egt> {
+        TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
+            .map(|id| Egt::from_elements(id.elements().to_vec()).unwrap())
+            .collect()
+    }
+
+    fn table(name: &str) -> Egt {
+        Egt::from_elements(TableId::parse(name).unwrap().elements().to_vec()).unwrap()
+    }
 
     #[test]
     fn pawnless_unmoves_match_forward_play() {
-        let dir = crate::TestDir::new("pawnless_unmoves_match_forward_play");
         for endgame in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KQ_KR", "KNN_K", "KQR_KB"] {
-            let file = EgtFile::new(&dir.0, endgame).unwrap();
-            for egt in &file.egts {
+            for egt in tables(endgame) {
                 for turn in [Color::White, Color::Black] {
                     let mut checked = 0;
                     let stride = (egt.index_range() / 512).max(1);
@@ -964,11 +879,9 @@ mod tests {
 
     #[test]
     fn pawnful_unmoves_match_forward_play() {
-        let dir = crate::TestDir::new("pawnful_unmoves_match_forward_play");
         let mut ep_checked = 0;
         for endgame in ["KP_K", "KQ_KP", "KP_KP", "KPP_K", "KPP_KP", "KRP_KP"] {
-            let file = EgtFile::new(&dir.0, endgame).unwrap();
-            for egt in &file.egts {
+            for egt in tables(endgame) {
                 for turn in [Color::White, Color::Black] {
                     let mut checked = 0;
                     let stride = (egt.index_range() / 64).max(1);
@@ -1115,16 +1028,13 @@ mod tests {
 
         // Exercise the indexed propagation path without generating the
         // five-piece table; the edge must retain its multiplicity.
-        let dir = crate::TestDir::new("krp_kp_double_push_in_check");
-        let before_file = EgtFile::new(&dir.0, "KRP_KP").unwrap();
-        let after_file = EgtFile::new(&dir.0, "KP_KRP").unwrap();
-        let before = before_file.egts.iter().find(|table| table.tablename() == "KRPb_KPc").unwrap();
-        let after = after_file.egts.iter().find(|table| table.tablename() == "KPc_KRPb").unwrap();
+        let before = table("KRPb_KPc");
+        let after = table("KPc_KRPb");
         let predecessor_idx = before.position_to_index(&predecessor);
         assert_eq!(predecessor_idx, 479947);
         let successor_idx = after.position_to_index(&successor);
         let mut hits = 0;
-        quiet_unmoves(after, before, successor_idx, false, |idx| {
+        quiet_unmoves(&after, &before, successor_idx, false, |idx| {
             if idx == predecessor_idx { hits += 1; }
         });
         assert_eq!(hits, 1, "missing the b2-b4 predecessor edge");
@@ -1223,15 +1133,36 @@ mod tests {
     #[test]
     fn pair_local_self_twin_uses_one_working_array() {
         let dir = crate::TestDir::new("pair_local_self_twin");
-        let solver = RetrogradeSolver::new(EgtFile::new(&dir.0, "K_K").unwrap(), None);
-        let table = EgtHandle { file_idx: 0, egt_idx: 0 };
+        let solver = RetrogradeSolver::new(table("K_K"), None);
+        let table = 0;
         let location = Location::parse(&dir.0).unwrap();
         let reader = SharedDependencyReader::new(HashMap::new(), &location, None);
         let pair = solve_pair(&solver, table, table, &reader).unwrap();
         assert_eq!(pair.working.values.len(), 1);
-        assert_eq!(pair.working.values[0].len(), solver.files[0].egts[0].index_range());
+        assert_eq!(pair.working.values[0].len(), solver.tables[0].index_range());
         assert!(plain_values(&pair.working.values[0]).iter().all(|v| v.is_unknown() || v.is_draw()));
         assert_eq!((pair.max_win_dtc_a, pair.max_loss_dtc_a, pair.max_win_dtc_b, pair.max_loss_dtc_b), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn logical_pairs_preserve_exact_twins_and_reflection() {
+        for (name, twin_name, reflected) in [
+            ("KQ_K", "K_KQ", false),
+            ("KPd_KPe", "KPd_KPe", true),
+            ("KPa_KPa", "KPa_KPa", false),
+            ("KPao_KPao", "KPao_KPao", false),
+            ("KPaPa_KPh", "KPa_KPhPh", true),
+        ] {
+            let id = TableId::parse(name).unwrap();
+            let (twin, actual_reflection) = id.twin().unwrap();
+            assert_eq!(twin.tablename(), twin_name);
+            assert_eq!(actual_reflection, reflected);
+            let solver = RetrogradeSolver::new(table(name), (id != twin).then(|| table(twin_name)));
+            let twin_slot = solver.tables.len() - 1;
+            assert_eq!(is_mirrored(&solver.tables[0], &solver.tables[twin_slot]), reflected);
+            assert_eq!(table_name(&solver, twin_slot), twin_name);
+            assert_eq!(solver.tables.len(), if id == twin { 1 } else { 2 });
+        }
     }
 
     #[test]
@@ -1408,17 +1339,27 @@ mod tests {
     fn parallel_generation_is_byte_identical() {
         let serial = crate::TestDir::new("serial_generation");
         let parallel = crate::TestDir::new("parallel_generation");
-        let serial_location = Location::parse(&serial.0).unwrap();
-        let parallel_location = Location::parse(&parallel.0).unwrap();
-        for endgame in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"] {
-            let (a, b) = retrograde_analysis_with_threads(&serial_location, endgame, None, 1).unwrap();
-            let (pa, pb) = retrograde_analysis_with_threads(&parallel_location, endgame, None, 4).unwrap();
-            for (file, parallel_file) in std::iter::once((a, pa)).chain(b.into_iter().zip(pb)) {
-                let name = file.key.filename().unwrap().to_string();
-                assert_eq!(std::fs::read(serial.0.join(&name)).unwrap(), std::fs::read(parallel.0.join(&name)).unwrap(), "{name}");
-                let stats = file.stats.unwrap();
-                let parallel_stats = parallel_file.stats.unwrap();
-                assert_eq!(serde_json::to_value(stats).unwrap(), serde_json::to_value(parallel_stats).unwrap());
+        let mut serial_generator = EgtGenerator::new(&serial.0).unwrap();
+        serial_generator.with_threads(1);
+        serial_generator.with_verify(false);
+        let mut parallel_generator = EgtGenerator::new(&parallel.0).unwrap();
+        parallel_generator.with_threads(4);
+        parallel_generator.with_verify(false);
+        for material in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"] {
+            serial_generator.generate(material).unwrap();
+            parallel_generator.generate(material).unwrap();
+            let plan = GenerationPlan::new(TableSelector::parse(material).unwrap().resolve().unwrap()).unwrap();
+            for id in plan.pairs.into_iter().flat_map(|(a, b)| std::iter::once(a).chain(b)) {
+                for extension in ["ggegt", "json"] {
+                    let path = id.relative_path(extension);
+                    assert_eq!(std::fs::read(serial.0.join(&path)).unwrap(),
+                        std::fs::read(parallel.0.join(&path)).unwrap(), "{path}");
+                }
+                let location = Location::parse(&serial.0).unwrap();
+                let stats = crate::stats::read_stats(&location, &id).unwrap();
+                use sha2::{Digest, Sha256};
+                let bytes = std::fs::read(serial.0.join(id.relative_path("ggegt"))).unwrap();
+                assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(bytes)));
             }
         }
     }
@@ -1426,19 +1367,24 @@ mod tests {
     #[test]
     fn parallel_missing_dependency_returns_error_without_generating() {
         let dir = crate::TestDir::new("parallel_missing_dependency");
-        let location = Location::parse(&dir.0).unwrap();
-        let result = retrograde_analysis_with_threads(&location, "KQ_K", None, 4);
+        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        generator.with_threads(4);
+        let result = generator.generate("KQ_K");
         assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
             if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_))));
-        assert!(!dir.0.join("K_K.ggegt").exists());
+        for name in ["K_K", "KQ_K", "K_KQ"] {
+            let id = TableId::parse(name).unwrap();
+            assert!(!dir.0.join(id.relative_path("ggegt")).exists());
+        }
     }
 
     #[test]
     fn zero_threads_uses_rayon_default() {
         let dir = crate::TestDir::new("zero_threads");
-        let location = Location::parse(&dir.0).unwrap();
-        retrograde_analysis_with_threads(&location, "K_K", None, 0).unwrap();
-        assert!(dir.0.join("K_K.ggegt").exists());
+        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        generator.with_threads(0);
+        generator.generate("K_K").unwrap();
+        assert!(dir.0.join(TableId::parse("K_K").unwrap().relative_path("ggegt")).exists());
     }
 
     fn verify_table_generation(
@@ -1456,45 +1402,37 @@ mod tests {
     ) {
         let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
         let location = Location::parse(&test_dir.0).unwrap();
+        let mut generator = EgtGenerator::new(&test_dir.0).unwrap();
+        generator.with_threads(2);
+        generator.with_verify(false);
         if endgame != "K_K" {
-            retrograde_analysis(&location, "K_K", None).unwrap();
+            generator.generate("K_K").unwrap();
         }
         if endgame == "KP_K" {
             for dependency in ["KQ_K", "KR_K", "KB_K", "KN_K"] {
-                retrograde_analysis(&location, dependency, None).unwrap();
+                generator.generate(dependency).unwrap();
             }
         }
-        let (file_a, file_b) = retrograde_analysis(&location, endgame, None).unwrap();
+        generator.generate(endgame).unwrap();
 
-        let stats_a = file_a.stats.as_ref().expect("file_a should have stats");
-        println!("{} stats:", file_a.endgame);
-        println!("  Draws: {}", stats_a.draw);
-        println!("  Wins: {}", stats_a.win);
-        println!("  Losses: {}", stats_a.loss);
-        println!("  Invalids: {}", stats_a.invalid_or_redundant);
-
-        assert_eq!(file_a.index_range, expected_range_a);
-        assert_eq!(stats_a.win, expected_wins_a);
-        assert_eq!(stats_a.draw, expected_draws_a);
-        assert_eq!(stats_a.loss, expected_losses_a);
-        assert_eq!(stats_a.invalid_or_redundant, expected_invalid_a);
-
+        // Check the established outcome totals by summing individual sidecars,
+        // not by constructing a composite table or comparing legacy artifacts.
+        let totals = |material: &str| {
+            let mut totals = [0usize; 5];
+            for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
+                let stats = crate::stats::read_stats(&location, &id).unwrap();
+                let counts = [stats.index_range, stats.win, stats.draw, stats.loss, stats.invalid_or_redundant];
+                for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
+            }
+            totals
+        };
+        assert_eq!(totals(endgame), [expected_range_a, expected_wins_a, expected_draws_a, expected_losses_a, expected_invalid_a]);
         if let Some(expected_range_b) = expected_range_b {
-            let file_b = file_b.expect("file_b should be present");
-            let stats_b = file_b.stats.as_ref().expect("file_b should have stats");
-            println!("{} stats:", file_b.endgame);
-            println!("  Draws: {}", stats_b.draw);
-            println!("  Wins: {}", stats_b.win);
-            println!("  Losses: {}", stats_b.loss);
-            println!("  Invalids: {}", stats_b.invalid_or_redundant);
-
-            assert_eq!(file_b.index_range, expected_range_b);
-            assert_eq!(stats_b.win, expected_wins_b.unwrap());
-            assert_eq!(stats_b.draw, expected_draws_b.unwrap());
-            assert_eq!(stats_b.loss, expected_losses_b.unwrap());
-            assert_eq!(stats_b.invalid_or_redundant, expected_invalid_b.unwrap());
+            let (a, b) = endgame.split_once('_').unwrap();
+            assert_eq!(totals(&format!("{b}_{a}")), [expected_range_b, expected_wins_b.unwrap(), expected_draws_b.unwrap(), expected_losses_b.unwrap(), expected_invalid_b.unwrap()]);
         } else {
-            assert!(file_b.is_none());
+            let ids = TableSelector::parse(endgame).unwrap().resolve().unwrap();
+            assert!(ids.iter().all(|id| id.twin().unwrap().0 == *id));
         }
     }
 

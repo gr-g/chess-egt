@@ -9,9 +9,11 @@ It builds on [`algorithms_comparison.md`](algorithms_comparison.md), in
 particular the single-threaded measurements of the counters and sweep core
 loops in its Section 2.A.
 
-**Status:** Steps 1-4, the object-storage prerequisite of Step 5, and the local
-per-position optimizations in Step 6 are implemented. The job runner in Step 5
-and distributed backend in Step 7 remain proposals.
+**Status:** Steps 1-4, selector-based serial job scheduling and object storage in
+Step 5, and the local per-position optimizations in Step 6 are implemented.
+Distributed job scheduling/completion manifests and the worker backend in Step 7
+remain proposals. Timing and reference results below are historical measurements,
+not validation of the current individual-table storage layout.
 
 ---
 
@@ -104,12 +106,14 @@ cloud deployment.
 
 The work already splits into independent units:
 
-1. **Endgames** form a dependency graph (by number of pieces, then by material
-   reached through captures and promotions).
-2. **`Egt` pairs** within an endgame are independent: a pawn capture changes
-   the material and therefore goes to a different endgame.
-   `retrograde_analysis` already solves pairs one after the other with no shared
-   state apart from the dependency cache.
+1. **Canonical tables** form a dependency graph: captures reduce piece count;
+   promotions preserve piece count but reduce pawn count.
+2. **`Egt`/quiet-twin pairs** are the current serial jobs. Selection adds twins,
+   deduplicates pairs, and sorts by piece count, then pawn count. Only explicitly
+   selected prerequisites are scheduled; all other dependencies must already
+   exist. Jobs reuse one Rayon pool and shared dependency reader/cache. Each
+   finalized table publishes immediately, independently of the rest of its
+   material selection.
 3. **Pawn-rank slices** within a pair: pawn pushes cannot be undone, so pawn
    configurations form a dependency graph as well (the "topological slicing"
    of `chesstb`, `algorithms_comparison.md` Section 3.3).
@@ -127,8 +131,8 @@ predecessor has to be handled at ply `d + 1`, not during initialization.
 
 The planned result is thousands of **idempotent, retryable jobs** that read inputs
 from object storage and write outputs to it. This needs a scheduler, not MPI.
-The storage prerequisite is implemented, but the job graph, scheduler, and
-completion manifests are not (see Step 6).
+The storage backend and local serial pair plan are implemented; a distributed
+scheduler, slice jobs, and completion manifests are not (see Step 5).
 
 ### Level 2: shared-memory multi-threading
 
@@ -187,7 +191,7 @@ The properties that do matter:
 | Order-independent output | yes (serial) | yes | yes, with conversion-type phases (4.3) |
 | Symmetry handling | +2 counters, mirrored decrements (done and verified) | simpler | same as counters (reused) |
 
-### 4.2 The proposed hybrid: counters driven by table scans
+### 4.2 The implemented hybrid: counters driven by table scans
 
 Each resolved position already stores its distance, so the set of positions
 to propagate at ply `p` is exactly "values whose distance is `p`". The queues
@@ -351,21 +355,22 @@ else it adds complexity without reducing cost.
 
 ## 6. Other design choices to revisit
 
-### 6.1 Separate the working table from `EgtFile` (implemented in Step 3)
+### 6.1 Separate working arrays from `EgtFileReader` (implemented in Step 3)
 
-`EgtFile`'s frame model (Unallocated / Compressed / Uncompressed, with LRU
-eviction planned) suits **dependency tables and probing**, whose accesses are
+`EgtFileReader`'s frame model (empty / compressed on storage / compressed in
+memory / uncompressed, with LRU eviction still unimplemented) suits **dependency tables and probing**, whose accesses are
 sparse and repeated. Retrograde unmoves instead hit the whole working set at
 scattered locations, making frame-cache lookup and eviction inappropriate for
 **the tables being solved**.
 
-The solver now uses flat `Vec<AtomicU16>` arrays for the active pair,
-separate from `EgtFile`. Finalized sub-tables are compressed and retained in
-memory for each output file, so solved pairs do not accumulate as uncompressed
-file frames. Working memory is one pair plus **accumulated compressed output**,
-the dependency cache, index metadata, local summaries, statistics, and
-compression/I/O buffers. Compressed output grows until publication; there is no
-disk scratch staging.
+The solver uses flat `Vec<AtomicU16>` arrays for the active pair, separate from
+`Egt`'s logical indexing and `EgtFileReader`'s storage cache. Finalization
+compresses and publishes each individual table before moving on. Working memory
+is the active pair plus the current table's compressed output, dependency cache,
+index metadata, local summaries, statistics, and compression/I/O buffers. Outputs
+do not accumulate across jobs. Dependency frames are shared with verification
+and retained within a material family, then released when the family changes;
+there is no LRU eviction or disk scratch staging.
 
 Atomic working values for shared-memory parallelism are implemented in Step 4.
 Memory-mapped arrays for out-of-core runs remain a future option.
@@ -461,10 +466,10 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   in positions. Separate win/loss summaries or smaller blocks remain possible
   refinements; these results are not current upstream performance measurements.
 
-### Step 3: flat working table, per-pair output
+### Step 3: flat working arrays, individual-table output
 
 - **Status: implemented.** `WorkingPair` holds flat `Vec<AtomicU16>` arrays
-  separate from `EgtFile`, one per active table (one shared array for a
+  separate from `EgtFileReader`, one per active table (one shared array for a
   self-twin). Encoded values are interpreted as `MaybeDtcOutcome` on load.
   Predecessor callbacks use table-local indices, and `PlySummary` blocks are
   independent of the file's frame layout.
@@ -476,30 +481,26 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   contain at most `256 * 1024` positions, and end in short, unpadded tails.
   The transposition is unchanged: exactly `2 * N` bytes for a frame of `N`
   positions, including the unused zero tail after packed high bytes.
-- Publication streams compressed segments in stable table order, without
-  recompression, and writes **one final seek table** through the `object_store`
-  buffered writer, hashing the bytes as they are published. The encoder is flushed
-  before `into_seek_table`, which does not flush its output buffer. No
-  `RawEncoder` is needed.
-- The reader constructs the table-aligned frame layout from the `Egt` lengths
-  and validates frame counts and decompressed lengths against the seek table.
-- `retrograde_analysis` finishes and publishes the output files before
-  returning. Multi-artifact publication is **nontransactional**: a failure
-  between uploads can update only one output or leave its statistics unpublished.
-- Working memory is one pair plus accumulated compressed output, dependency
-  cache, index metadata, summaries, statistics, and compression/I/O buffers.
-  Bounded upload concurrency limits in-flight buffers, not retained compressed
-  output.
-- **Validation criterion:** per-index outcome/DTC equality and logical
-  statistics equality, excluding `bytes`, `sha256`, and `num_frames`, because
-  the table-aligned frame layout changes physical output. At implementation
-  time, exact outcome values (including conversion type and DTC) and semantic
-  statistics matched `~/tablebases` at every logical index in both orientations
-  of all 3/4-piece endgames, `KNN_KP`, and `KBB_KN`.
-- Those comparisons do not establish full reference validation of the current
-  in-memory publication path. The remaining four endgames in the 5-piece sample
-  and generation-only elapsed-time, peak-RSS, and output-size comparisons remain
-  unmeasured for this layout change.
+- `EgtFileWriter` streams one table's compressed segments in frame order,
+  without recompression, appending **one final seek table** through the
+  `object_store` buffered writer and hashing the published bytes. The encoder
+  is flushed before `into_seek_table`, which does not flush its output buffer.
+- `EgtFileReader` holds one `Egt` and constructs the frame layout from its local
+  index range, validating frame counts and lengths against the seek table.
+- Each table's data and JSON statistics publish immediately after finalization.
+  Multi-artifact publication is **nontransactional**: a failure can leave one
+  twin unpublished or a table without its statistics.
+- Working memory is one pair plus the current table's compressed output,
+  dependency cache, index metadata, summaries, statistics, and compression/I/O
+  buffers. Bounded upload concurrency limits in-flight buffers, not the current
+  table's retained compressed output.
+- **Historical validation evidence (earlier table-aligned material files):**
+  exact outcome values (including conversion type and DTC) and logical statistics
+  matched `~/ggegt` at every index in both orientations of all 3/4-piece
+  endgames, `KNN_KP`, and `KBB_KN`. Physical statistics (`bytes`, `sha256`, and
+  `num_frames`) were excluded because the frame layout had changed.
+  These results predate individual-table objects and do not establish validation
+  or performance of the current storage layout.
 
 ### Step 4: multi-threading (`rayon`)
 
@@ -508,7 +509,7 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   and solver configuration.
 - `--threads N` / `EgtGenerator::with_threads(N)` selects a dedicated Rayon pool;
   zero (the default) uses Rayon's default thread count. Pairs are solved serially,
-  using the same pool throughout an endgame.
+  using the same pool across all selected jobs.
 - Working values are `AtomicU16`. `mark_win` and `decrement` use CAS loops over
   the entire encoded value. A win can upgrade its same-ply conversion preference;
   only the successful unknown-to-resolved transition increments the task-local
@@ -531,10 +532,12 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   acquire write access, rechecking the frame before loading. Initial file loads
   are serialized under the registry write lock; cold frame loads serialize only
   within the affected file. Finer-grained frame synchronization remains optional.
-- A single `SharedDependencyReader` is retained across all pairs and lazily loads
-  existing dependencies, keeping loaded files and frames cached. A missing
-  dependency returns `DependencyUnavailable`; there is no recursive generation
-  or initialization retry.
+- A `SharedDependencyReader` lazily loads existing dependencies, sharing loaded
+  frames between generation and post-generation verification. Verified output
+  frames are released after each pair; the dependency cache is cleared between
+  material families rather than accumulating across an entire piece-count batch.
+  A missing dependency returns `DependencyUnavailable`; there is no recursive
+  generation or initialization retry.
 - Finalization uses contiguous frame batches in the same Rayon pool, with up to
   `--threads N` encoders. Each batch reuses an encoder and frame-sized plain
   scratch, fusing conversion, draw normalization, and statistics collection
@@ -543,19 +546,19 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   estimate).
 - Internal consistency verification uses `--threads N` /
   `EgtProber::with_threads(N)` (zero/default: Rayon's default); post-generation verification
-  inherits the generator's thread count. Verification workers share the frame
-  cache rather than duplicating loaded frames; there is currently no eviction.
+  runs in the generator's pool and shares its dependency cache. Verification
+  workers share frames rather than duplicating them; there is no LRU eviction.
   Errors fail fast, so parallel verification may report a different failing index
   than a serial run.
 - **Test coverage:** concurrent CAS contention, concurrent summary maxima,
   ordered loss-conversion phases, multi-block self-twin scans, cached/shared
   dependency probing, missing-dependency errors, default/zero-thread support, and
   1-vs-4-thread output/statistics equality. Run tests with `cargo test --release`.
-- **Reference evidence:** implementation-time generation of all 3/4-piece
+- **Historical reference evidence (material-file layout):** generation of all 3/4-piece
   endgames produced **132 `.ggegt`/`.json` files** matching the table-aligned
-  references in `~/tablebases` at each of 1, 2, and 4 threads. Generation-only
+  references in `~/ggegt` at each of 1, 2, and 4 threads. Generation-only
   elapsed times were 350.3 s, 232.4 s, and 186.6 s respectively.
-- **Implementation-era scaling measurement:** sequential runs of `KQB_KQ` (both orientations),
+- **Historical scaling measurement (material-file layout):** sequential runs of `KQB_KQ` (both orientations),
   existing dependencies, `--noverify`, same release codegen and compression:
 
   | Implementation | Initialization | Propagation | Finalization | Wall time | Peak RSS |
@@ -585,25 +588,39 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   `ObjectStoreScheme::parse`, not inferred by reparsing the display string.
   Generic HTTP is read-only and rejected early as a generation destination;
   HTTPS cloud URLs recognized by `object_store` retain backend write support.
+- Each exact canonical table has its own
+  `n/maxvmin/opK/Npawns/name.ggegt` object and optional `.json` statistics
+  sidecar, with both orientations sharing a directory split but not a filename.
+  Root `format.json` declares format `chess-egt`, format/indexing/layout versions
+  1, and frame size 262144. Generation conditionally creates or validates this
+  immutable descriptor; reads only validate it, without requiring statistics.
 - Lookups prefer `--input-path`, falling back to `--path` only on `NotFound`;
-  probing also honors the input location. Readers load the checksum-free seek
-  table with one suffix GET, validate its frame count before parsing, and fetch
+  probing also honors the input location. After root format validation, readers
+  load the checksum-free seek table with one suffix GET, validate its frame
+  count before parsing, and fetch
   one compressed frame range per cold miss. The shared in-memory dependency
   cache is unchanged: **no LRU eviction yet**. Remote dependencies warm this
   cache during generation, but cold requests add latency and request/transfer
   costs. Local input with remote output is an alternative; measure these costs
   before deploying a fleet.
-- Compressed sub-tables are retained in memory. Accumulated compressed output adds to the active pair's
-  memory footprint. Publication streams segments and the final seek table through
+- One finalized table's compressed frame batches are retained in memory until
+  its immediate publication. Publication streams segments and the final seek table through
   the `object_store` buffered writer: a small-object PUT or multipart upload with
   bounded concurrency. SHA-256 is computed over bytes as they are published,
   without a second local artifact; JSON statistics are published separately
   afterward. Verification still follows publication. The synchronous library
   uses a shared private Tokio runtime; async applications must call it through
   `spawn_blocking`. See [README.md](README.md#usage) for command-line examples.
-- **Jobs: not implemented.** Still needed: a job graph over (endgame, pair,
-  slice), a simple runner (local first, then instances pulling jobs from a
-  queue), and a validated completion protocol/manifests for idempotent retries.
+- **Local jobs: implemented.** Exact names select one orientation; uppercase
+  material selects all canonical tables for that orientation; hierarchy prefixes
+  select both orientations. `--generate`, `--verify`, `--stats`, and `--list`
+  accept multiple selectors. Listing is theoretical and storage-free; only
+  generation expands quiet twins. Generation deduplicates and sorts pairs by
+  pieces, then pawns, and does not recursively add dependencies. For a fresh
+  root, select `--generate 2/ 3/` before generating `4/`.
+- **Distributed jobs: pending.** Still needed: slice jobs, a fleet scheduler
+  (instances pulling jobs from a queue), and validated completion
+  protocols/manifests for idempotent retries.
   Multi-artifact publication is not transactional, and an existing `.ggegt`
   object is **not proof that a complete job succeeded or passed verification**.
   Job completion must account for both outputs, their statistics, and

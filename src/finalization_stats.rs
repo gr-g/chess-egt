@@ -1,9 +1,12 @@
+//! Deterministic per-table statistics, merged in contiguous batch order.
+
 use std::collections::BTreeMap;
 
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
 use crate::egt::Egt;
-use crate::egt_file::{EgtFile, EgtFileStats, LongestDtcPosition, MaybeDtcOutcome};
+use crate::egt_file::{EgtFileReader, MaybeDtcOutcome};
+use crate::stats::{EgtStats, INDEXING_VERSION, LongestDtcPosition, SCHEMA_VERSION};
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
 #[derive(Default)]
@@ -55,29 +58,22 @@ impl TableStats {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct EgtFileStatsBuilder {
+pub(crate) struct EgtStatsBuilder {
     totals: TableStats,
     maxima: [u16; 2],
-    candidates: [Vec<(usize, usize)>; 2],
 }
 
-impl EgtFileStatsBuilder {
-    /// Merge batches and tables in visitation order, never sorted by table index.
-    pub(crate) fn merge_table(
-        &mut self,
-        egt_idx: usize,
-        max_win: u16,
-        max_loss: u16,
-        parts: impl IntoIterator<Item = TableStats>,
-    ) {
-        let maxima = [max_win, max_loss];
-        for (side, &maximum) in maxima.iter().enumerate() {
-            if maximum > self.maxima[side] {
-                self.maxima[side] = maximum;
-                self.candidates[side].clear();
-            }
+impl EgtStatsBuilder {
+    pub(crate) fn new(maxima: [u16; 2]) -> Self {
+        Self {
+            totals: TableStats::default(),
+            maxima,
         }
+    }
+
+    /// Merge contiguous batches in visitation order to preserve example order.
+    /// All batches belong to this one table and use its fixed maxima.
+    pub(crate) fn merge(&mut self, parts: impl IntoIterator<Item = TableStats>) {
         for part in parts {
             self.totals.win += part.win;
             self.totals.draw += part.draw;
@@ -89,21 +85,18 @@ impl EgtFileStatsBuilder {
                 for (ply, count) in histogram {
                     *self.totals.histograms[side].entry(ply).or_default() += count;
                 }
-                if maxima[side] == self.maxima[side] {
-                    self.candidates[side]
-                        .extend(candidates.into_iter().map(|local_idx| (egt_idx, local_idx)));
-                }
+                self.totals.candidates[side].extend(candidates);
             }
         }
     }
 
-    pub(crate) fn build(self, file: &EgtFile, bytes: u64, sha256: String) -> EgtFileStats {
-        let [win_candidates, loss_candidates] = self.candidates;
-        let materialize = |candidates: Vec<(usize, usize)>, ply| {
+    pub(crate) fn build(self, file: &EgtFileReader, bytes: u64, sha256: String) -> EgtStats {
+        let [win_candidates, loss_candidates] = self.totals.candidates;
+        let materialize = |candidates: Vec<usize>, ply| {
             candidates
                 .into_iter()
-                .filter_map(|(egt_idx, local_idx)| {
-                    file.egts[egt_idx]
+                .filter_map(|local_idx| {
+                    file.egt
                         .position_from_index(local_idx, Color::White)
                         .map(|pos| LongestDtcPosition {
                             epd: Epd::from_position(&pos, EnPassantMode::Legal).to_string(),
@@ -113,8 +106,10 @@ impl EgtFileStatsBuilder {
                 .collect()
         };
         let [histogram_win, histogram_loss] = self.totals.histograms;
-        EgtFileStats {
-            endgame: file.endgame.clone(),
+        EgtStats {
+            schema_version: SCHEMA_VERSION,
+            indexing_version: INDEXING_VERSION,
+            tablename: file.tablename.clone(),
             bytes,
             sha256,
             index_range: file.index_range,
@@ -137,12 +132,15 @@ impl EgtFileStatsBuilder {
 mod tests {
     use super::*;
     use crate::ConversionType;
-    use std::path::Path;
+    use crate::table_id::TableId;
+
+    fn table(name: &str) -> Egt {
+        Egt::from_elements(TableId::parse(name).unwrap().elements().to_vec()).unwrap()
+    }
 
     #[test]
-    fn merge_filters_maxima_and_preserves_visitation_order() {
-        let file = EgtFile::new(Path::new("."), "KQ_K").unwrap();
-        let egt = &file.egts[0];
+    fn merge_uses_table_maxima_and_preserves_batch_visitation_order() {
+        let egt = table("KQ_K");
         let idx: Vec<_> = (0..egt.index_range())
             .filter(|&idx| {
                 !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
@@ -151,45 +149,30 @@ mod tests {
             .take(6)
             .collect();
         assert_eq!(idx.len(), 6);
-        let part = |w, l, max_win, max_loss| {
+        let part = |w, l, win, loss| {
             let mut stats = TableStats::default();
             for (local_idx, outcome) in [
-                (
-                    w,
-                    MaybeDtcOutcome::new_win(ConversionType::Capture, max_win),
-                ),
+                (w, MaybeDtcOutcome::new_win(ConversionType::Capture, win)),
                 (
                     l,
-                    MaybeDtcOutcome::new_loss(ConversionType::Checkmate, max_loss),
+                    MaybeDtcOutcome::new_loss(ConversionType::Checkmate, loss),
                 ),
                 (w, MaybeDtcOutcome::DRAW),
                 (l, MaybeDtcOutcome::INVALID),
             ] {
-                stats.record_outcome(outcome, local_idx, egt, max_win, max_loss);
+                stats.record_outcome(outcome, local_idx, &egt, 5, 3);
             }
             stats
         };
-        let mut builder = EgtFileStatsBuilder::default();
-        builder.merge_table(7, 0, 0, [part(idx[0], idx[1], 0, 0)]);
-        assert!(builder.candidates[0].is_empty());
-        assert_eq!(builder.candidates[1], [(7, idx[1])]);
-        builder.merge_table(
-            7,
-            5,
-            3,
-            [part(idx[4], idx[3], 5, 3), part(idx[2], idx[1], 5, 3)],
-        );
-        builder.merge_table(9, 4, 2, [part(idx[0], idx[1], 4, 2)]);
-        builder.merge_table(3, 5, 3, [part(idx[0], idx[5], 5, 3)]);
-        assert_eq!(builder.maxima, [5, 3]);
-        assert_eq!(
-            builder.candidates[0],
-            [(7, idx[4]), (7, idx[2]), (3, idx[0])]
-        );
-        assert_eq!(
-            builder.candidates[1],
-            [(7, idx[3]), (7, idx[1]), (3, idx[5])]
-        );
+        let mut builder = EgtStatsBuilder::new([5, 3]);
+        builder.merge([
+            part(idx[0], idx[1], 0, 0),
+            part(idx[4], idx[3], 5, 3),
+            part(idx[2], idx[1], 5, 3),
+        ]);
+        builder.merge([part(idx[0], idx[1], 4, 2), part(idx[0], idx[5], 5, 3)]);
+        assert_eq!(builder.totals.candidates[0], [idx[4], idx[2], idx[0]]);
+        assert_eq!(builder.totals.candidates[1], [idx[3], idx[1], idx[5]]);
         let totals = builder.totals;
         assert_eq!(
             (
@@ -208,5 +191,57 @@ mod tests {
             totals.histograms[1],
             BTreeMap::from([(0, 1), (2, 1), (3, 3)])
         );
+    }
+
+    #[test]
+    fn checkmate_examples_include_zero_but_zero_distance_wins_do_not() {
+        let egt = table("KQ_K");
+        let idx = (0..egt.index_range())
+            .find(|&idx| {
+                !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
+                    && egt.position_from_index(idx, Color::White).is_some()
+            })
+            .unwrap();
+        let mut stats = TableStats::default();
+        stats.record_outcome(
+            MaybeDtcOutcome::new_win(ConversionType::Capture, 0),
+            idx,
+            &egt,
+            0,
+            0,
+        );
+        stats.record_outcome(
+            MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
+            idx,
+            &egt,
+            0,
+            0,
+        );
+        assert!(stats.candidates[0].is_empty());
+        assert_eq!(stats.candidates[1], [idx]);
+        assert_eq!(
+            stats.histograms,
+            [BTreeMap::from([(0, 1)]), BTreeMap::from([(0, 1)])]
+        );
+    }
+
+    #[test]
+    fn diagonal_redundancy_is_excluded_from_histograms_and_candidates() {
+        let egt = table("KQ_K");
+        let idx = (0..egt.index_range())
+            .find(|&idx| egt.diagonal_symmetric(idx).is_some_and(|other| idx > other))
+            .unwrap();
+        let mut stats = TableStats::default();
+        stats.record_outcome(
+            MaybeDtcOutcome::new_win(ConversionType::Checkmate, 5),
+            idx,
+            &egt,
+            5,
+            0,
+        );
+        assert_eq!(stats.invalid_or_redundant, 1);
+        assert_eq!(stats.win, 0);
+        assert!(stats.histograms[0].is_empty());
+        assert!(stats.candidates[0].is_empty());
     }
 }

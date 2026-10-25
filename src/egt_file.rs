@@ -1,53 +1,24 @@
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
-use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
-use crate::storage::{Location, block_on};
-use std::sync::{Arc, RwLock};
-#[cfg(test)]
-use shakmaty::CastlingMode;
-use shakmaty::{ByRole, Chess, Color, File, Position, Role};
-use crate::{ConversionType, DtcOutcome};
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{EgtElement, EgtSide};
-use serde::{Serialize, Deserialize};
+use crate::stats::EgtStats;
+use crate::storage::{Location, block_on};
+use crate::table_id::TableId;
+use crate::{ConversionType, DtcOutcome};
+use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
+#[cfg(test)]
+use shakmaty::CastlingMode;
+#[cfg(test)]
+use shakmaty::Position;
+use shakmaty::{Chess, Color};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
-// 256k positions per frame, corresponding to 512kiB per frame.
-const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
+use crate::storage::DEFAULT_FRAME_SIZE;
 
-// The maximum number of pawns in an endgame.
-const MAX_PAWNS: usize = 8;
-
-// Compression level used when storing data on disk
+// Compression level used when storing data on disk.
 pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LongestDtcPosition {
-    pub epd: String,
-    pub ply: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EgtFileStats {
-    pub endgame: String,
-    pub bytes: u64,
-    pub sha256: String,
-    pub index_range: usize,
-    pub frame_size: usize,
-    pub num_frames: usize,
-    pub unique_positions: usize,
-    pub win: usize,
-    pub draw: usize,
-    pub loss: usize,
-    pub invalid_or_redundant: usize,
-    pub histogram_win: BTreeMap<u16, usize>,
-    pub histogram_loss: BTreeMap<u16, usize>,
-    pub longest_dtc_win: Vec<LongestDtcPosition>,
-    pub longest_dtc_loss: Vec<LongestDtcPosition>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaybeDtcOutcome(pub u16);
@@ -124,12 +95,15 @@ impl MaybeDtcOutcome {
             0b011 => Ok(DtcOutcome::Loss(ConversionType::Checkmate, n)),
             0b101 => Ok(DtcOutcome::Loss(ConversionType::Capture, n)),
             0b111 => Ok(DtcOutcome::Loss(ConversionType::Promotion, n)),
-            _ => Err(EgtError::CorruptedOutcome { value: self.0, index }),
+            _ => Err(EgtError::CorruptedOutcome {
+                value: self.0,
+                index,
+            }),
         }
     }
 }
 
-/// Represents the state of a single frame in an EgtFile.
+/// Represents the state of a single frame in an EgtFileReader.
 ///
 /// The `Compressed` variant (and `ensure_compressed`) are not reached yet: they
 /// exist for the planned LRU eviction of in-memory frames, which is what will
@@ -154,97 +128,6 @@ pub enum FrameState {
     },
 }
 
-/// A short list of pawn files. Sized to `MAX_PAWNS`, so that the pawn-file
-/// bookkeeping done on every probe stays free of heap allocations.
-pub type FileVec = arrayvec::ArrayVec<File, MAX_PAWNS>;
-
-/// Allocation-free identity of the pawn color order on every file.
-/// Each byte has a length sentinel above the color bits; low bits come first
-/// in ascending STM-normalized rank, with SNTM represented by one.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct PawnKey {
-    files: [u8; 8],
-}
-
-impl PawnKey {
-    pub fn from_elements(elements: &[EgtElement]) -> Self {
-        let mut files = [1; 8];
-        for element in elements {
-            let EgtElement::PawnGroup { file, order } = element else {
-                continue;
-            };
-            let mut word = 1 << order.len();
-            for (i, side) in order.iter().enumerate() {
-                if *side == EgtSide::SideNotToMove {
-                    word |= 1 << i;
-                }
-            }
-            files[file.to_usize()] = word;
-        }
-        Self { files }
-    }
-
-    fn from_position(position: &Chess) -> Self {
-        let mut files = [1; 8];
-        let enemy = position.board().by_color(!position.turn());
-        for file in 0..8 {
-            let pawns = position.board().pawns()
-                & shakmaty::Bitboard::from_file(File::new(file as u32));
-            let mut squares: arrayvec::ArrayVec<_, 6> = pawns.into_iter().collect();
-            if position.turn() == Color::Black {
-                squares.reverse();
-            }
-            let mut word = 1 << squares.len();
-            for (i, square) in squares.into_iter().enumerate() {
-                if enemy.contains(square) {
-                    word |= 1 << i;
-                }
-            }
-            files[file] = word;
-        }
-        Self { files }
-    }
-
-    pub fn reflected(self) -> Self {
-        let mut files = self.files;
-        files.reverse();
-        Self { files }
-    }
-
-    /// Changing STM reverses normalized ranks and exchanges color labels.
-    pub fn twin(self) -> Self {
-        let mut files = [1; 8];
-        for (target, word) in files.iter_mut().zip(self.files) {
-            let len = word.ilog2() as usize;
-            *target = 1 << len;
-            for i in 0..len {
-                if word & (1 << i) == 0 {
-                    *target |= 1 << (len - 1 - i);
-                }
-            }
-        }
-        Self { files }
-    }
-
-    /// Preserve the file-multiplicity symmetry policy, independent of color order.
-    /// Return the transformation explicitly, including when file counts tie.
-    pub fn canonicalized(self) -> (Self, bool) {
-        let mut stm = FileVec::new();
-        let mut sntm = FileVec::new();
-        for (file, word) in self.files.into_iter().enumerate() {
-            for i in 0..word.ilog2() {
-                let files = if word & (1 << i) == 0 { &mut stm } else { &mut sntm };
-                files.push(File::new(file as u32));
-            }
-        }
-        if is_canonical(&stm, &sntm) {
-            (self, false)
-        } else {
-            (self.reflected(), true)
-        }
-    }
-}
-
 /// Logical extent of an unpadded, table-local transposed Zstd frame.
 #[derive(Debug, Clone, Copy)]
 struct FrameDescriptor {
@@ -252,40 +135,21 @@ struct FrameDescriptor {
     len: usize,
 }
 
-/// Represents a file with endgame tablebases for a specific configuration of chess pieces.
+/// Storage and frame cache for one exact canonical table.
 #[derive(Debug)]
-pub struct EgtFile {
-    /// The name of this endgame file (e.g. "KQ_KP").
-    pub endgame: String,
-
+pub struct EgtFileReader {
+    pub egt: Egt,
+    pub id: TableId,
+    pub tablename: String,
     pub(crate) location: Location,
     pub(crate) key: ObjectPath,
     seek_table: Option<zeekstd::SeekTable>,
-
-    /// The sub-tables (Egt objects) that compose this file.
-    pub egts: Vec<Egt>,
-
-    /// Map from PawnKey to its index in the `egts` vector.
-    pub egt_map: HashMap<PawnKey, usize>,
-
-    /// Prefix sums of the sub-table index ranges: `egt_offsets[i]` is the global
-    /// index at which `egts[i]` starts. Has `egts.len() + 1` entries, the last
-    /// one being `index_range`. Precomputed because translating a local index
-    /// into a global one happens on every single read and write.
-    egt_offsets: Vec<usize>,
-
-    /// The frames of the file.
     frames: Vec<FrameState>,
     frame_layout: Vec<FrameDescriptor>,
-
-    /// Maximum number of indexed locations per frame; tails may be shorter.
+    /// Maximum number of indexed locations per frame; the tail may be shorter.
     pub frame_size: usize,
-
-    /// Total number of indexed locations across all Egts in this file.
     pub index_range: usize,
-
-    /// Statistics about the generated endgame.
-    pub stats: Option<EgtFileStats>,
+    pub stats: Option<EgtStats>,
 }
 
 /// Shared files for parallel initialization and verification.
@@ -294,59 +158,60 @@ pub struct EgtFile {
 /// Frames are shared, not copied per worker; no eviction is performed.
 #[derive(Debug)]
 pub(crate) struct SharedDependencyReader {
-    files: RwLock<HashMap<String, Arc<RwLock<EgtFile>>>>,
+    files: RwLock<HashMap<String, Arc<RwLock<EgtFileReader>>>>,
     base_path: Location,
     input_path: Option<Location>,
 }
 
 impl SharedDependencyReader {
     pub(crate) fn new(
-        files: HashMap<String, EgtFile>,
+        files: HashMap<String, EgtFileReader>,
         base_path: &Location,
         input_path: Option<&Location>,
     ) -> Self {
         Self {
-            files: RwLock::new(files.into_iter()
-                .map(|(name, file)| (name, Arc::new(RwLock::new(file))))
-                .collect()),
+            files: RwLock::new(
+                files
+                    .into_iter()
+                    .map(|(name, file)| (name, Arc::new(RwLock::new(file))))
+                    .collect(),
+            ),
             base_path: base_path.clone(),
             input_path: input_path.cloned(),
         }
     }
 
-    fn file(&self, endgame: &str) -> EgtResult<Arc<RwLock<EgtFile>>> {
+    fn file(&self, endgame: &str) -> EgtResult<Arc<RwLock<EgtFileReader>>> {
         let cached_file = {
-            let files = self.files.read()
+            let files = self
+                .files
+                .read()
                 .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
             files.get(endgame).map(Arc::clone)
         };
         let file = if let Some(file) = cached_file {
             file
         } else {
-            let mut files = self.files.write()
+            let mut files = self
+                .files
+                .write()
                 .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
             // Recheck after releasing the read lock: another worker may have loaded it.
             if !files.contains_key(endgame) {
                 // Serialize loading so racing workers never allocate duplicate files.
-                let file = crate::load_existing_file(
-                    &self.base_path, self.input_path.as_ref(), endgame,
-                )?;
+                let file =
+                    crate::load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)?;
                 files.insert(endgame.to_string(), Arc::new(RwLock::new(file)));
             }
-            Arc::clone(files.get(endgame)
-                .ok_or(EgtError::Internal("dependency registry entry missing after insert"))?)
+            Arc::clone(files.get(endgame).ok_or(EgtError::Internal(
+                "dependency registry entry missing after insert",
+            ))?)
         };
         Ok(file)
     }
 
     pub(crate) fn probe(&self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
-        self.probe_indexed(position).map(|(_, outcome)| outcome).map_err(|source| match source {
-            EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                dependency: crate::get_endgame(position),
-                source: Box::new(source),
-            },
-            other => other,
-        })
+        self.probe_indexed(position).map(|(_, outcome)| outcome)
     }
 
     pub(crate) fn probe_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
@@ -355,123 +220,140 @@ impl SharedDependencyReader {
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
-        let file = self.file(&crate::get_endgame(position))?;
-        {
-            let reader = file.read()
+        let (id, reflected) = TableId::from_position(position)?;
+        let result = (|| {
+            let file = self.file(id.tablename())?;
+            let index = {
+                let reader = file
+                    .read()
+                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+                let index = reader.map_routed_position_to_index(position, reflected)?;
+                if let Some(outcome) = reader.read_from_index_cached(index)? {
+                    return Ok((index, outcome));
+                }
+                index
+            };
+            // Metadata is immutable: retain the index while upgrading to a write
+            // guard. read_from_index rechecks whether another worker warmed it.
+            let mut writer = file
+                .write()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            let index = reader.map_position_to_index(position)?;
-            if let Some(outcome) = reader.read_from_index_cached(index)? {
-                return Ok((index, outcome));
-            }
-        }
-        // Release the read guard before acquiring the write guard. `probe` checks
-        // the frame state again, so another worker may already have warmed it.
-        let mut writer = file.write()
-            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        let index = writer.map_position_to_index(position)?;
-        Ok((index, writer.read_from_index(index)?))
+            Ok((index, writer.read_from_index(index)?))
+        })();
+        result.map_err(|source| match source {
+            EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
+                dependency: id.tablename().to_owned(),
+                source: Box::new(source),
+            },
+            other => other,
+        })
     }
 
     /// Copies a scan block so no file lock is held while probing successors.
     /// The range must lie within one frame.
-    pub(crate) fn read_chunk(&self, endgame: &str, start: usize, end: usize) -> EgtResult<Vec<MaybeDtcOutcome>> {
+    pub(crate) fn read_chunk(
+        &self,
+        endgame: &str,
+        start: usize,
+        end: usize,
+    ) -> EgtResult<Vec<MaybeDtcOutcome>> {
         let file = self.file(endgame)?;
         {
-            let reader = file.read()
+            let reader = file
+                .read()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
             if let Some(chunk) = reader.frame_chunk_cached(start, end)? {
                 return Ok(chunk.to_vec());
             }
         }
-        let mut writer = file.write()
+        let mut writer = file
+            .write()
             .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
         Ok(writer.frame_chunk(start, end)?.to_vec())
     }
 
-    /// Recovers owned files, including frames warmed by workers, after they join.
-    pub(crate) fn into_cache(self) -> EgtResult<HashMap<String, EgtFile>> {
-        let files = self.files.into_inner()
+    /// Pins freshly published output ahead of configured input lookup.
+    pub(crate) fn insert(&self, file: EgtFileReader) -> EgtResult<()> {
+        self.files
+            .write()
+            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
+            .insert(file.tablename.clone(), Arc::new(RwLock::new(file)));
+        Ok(())
+    }
+
+    /// Releases completed outputs after verification without discarding warmed dependencies.
+    pub(crate) fn remove(&self, names: &[String]) -> EgtResult<()> {
+        let mut files = self
+            .files
+            .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-        files.into_iter().map(|(name, file)| {
-            let file = Arc::try_unwrap(file)
-                .map_err(|_| EgtError::Internal("dependency file still shared"))?
-                .into_inner()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            Ok((name, file))
-        }).collect()
+        for name in names {
+            files.remove(name);
+        }
+        Ok(())
+    }
+
+    /// Bounds cache lifetime between material families; call after workers join.
+    pub(crate) fn clear(&self) -> EgtResult<()> {
+        self.files
+            .write()
+            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    /// Recovers owned files, including frames warmed by workers, after they join.
+    pub(crate) fn into_cache(self) -> EgtResult<HashMap<String, EgtFileReader>> {
+        let files = self
+            .files
+            .into_inner()
+            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
+        files
+            .into_iter()
+            .map(|(name, file)| {
+                let file = Arc::try_unwrap(file)
+                    .map_err(|_| EgtError::Internal("dependency file still shared"))?
+                    .into_inner()
+                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+                Ok((name, file))
+            })
+            .collect()
     }
 }
 
-impl EgtFile {
-    /// Creates a new EgtFile for a given piece configuration and path.
-    ///
-    /// The file starts with no memory allocated.
-    pub fn new(base_path: &Path, endgame: &str) -> EgtResult<Self> {
-        Self::new_in(&Location::parse(base_path)?, endgame)
+impl EgtFileReader {
+    /// Creates an empty single-table cache and ensures the writable root format.
+    pub fn new(base_path: &Path, tablename: &str) -> EgtResult<Self> {
+        Self::new_in(&Location::parse(base_path)?, tablename)
     }
 
-    pub(crate) fn new_in(location: &Location, endgame: &str) -> EgtResult<Self> {
+    pub(crate) fn new_in(location: &Location, tablename: &str) -> EgtResult<Self> {
+        let file = Self::construct(location, tablename)?;
+        location.ensure_format()?;
+        Ok(file)
+    }
 
-        let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name(endgame)?;
-
-        let stm_combos = get_file_combinations(stm_pawns);
-        let sntm_combos = get_file_combinations(sntm_pawns);
-
-        let mut egt_pairs = Vec::new();
-
-        for stm_files in &stm_combos {
-            for sntm_files in &sntm_combos {
-                if is_canonical(stm_files, sntm_files) {
-                    for mut elements in pawn_order_combinations(stm_files, sntm_files) {
-                        elements.extend_from_slice(&other_pieces);
-                        let key = PawnKey::from_elements(&elements);
-                        let egt = Egt::from_elements(elements)?;
-                        egt_pairs.push((key, egt));
-                    }
-                }
-            }
-        }
-
-        // Sort by PawnKey to ensure a stable, deterministic order
-        egt_pairs.sort_by_key(|(key, _)| *key);
-
-        let mut egts = Vec::with_capacity(egt_pairs.len());
-        let mut egt_map = HashMap::with_capacity(egt_pairs.len());
-
-        for (idx, (key, egt)) in egt_pairs.into_iter().enumerate() {
-            egt_map.insert(key, idx);
-            egts.push(egt);
-        }
-
-        let mut egt_offsets = Vec::with_capacity(egts.len() + 1);
-        let mut acc = 0;
-        for egt in &egts {
-            egt_offsets.push(acc);
-            acc += egt.index_range();
-        }
-        egt_offsets.push(acc);
-        let index_range = acc;
-
+    // Construction itself performs no storage I/O, so opening never writes.
+    fn construct(location: &Location, tablename: &str) -> EgtResult<Self> {
+        let id = TableId::parse(tablename)?;
+        let egt = Egt::from_elements(id.elements().to_vec())?;
+        let index_range = egt.index_range();
         let frame_size = DEFAULT_FRAME_SIZE;
-        let mut frame_layout = Vec::new();
-        for (egt_idx, egt) in egts.iter().enumerate() {
-            for local_start in (0..egt.index_range()).step_by(frame_size) {
-                frame_layout.push(FrameDescriptor {
-                    start: egt_offsets[egt_idx] + local_start,
-                    len: frame_size.min(egt.index_range() - local_start),
-                });
-            }
-        }
+        let frame_layout: Vec<_> = (0..index_range)
+            .step_by(frame_size)
+            .map(|start| FrameDescriptor {
+                start,
+                len: frame_size.min(index_range - start),
+            })
+            .collect();
         let frames = vec![FrameState::Empty; frame_layout.len()];
-
         Ok(Self {
-            endgame: endgame.to_string(),
+            key: location.key(&id.relative_path("ggegt")),
+            tablename: id.tablename().to_owned(),
+            id,
+            egt,
             location: location.clone(),
-            key: location.prefix.clone().join(tablebase_filename(endgame)),
             seek_table: None,
-            egts,
-            egt_map,
-            egt_offsets,
             frames,
             frame_layout,
             frame_size,
@@ -480,16 +362,16 @@ impl EgtFile {
         })
     }
 
-    /// Creates an EgtFile representing an existing file.
-    ///
-    /// Data is read on demand. The object must not be replaced while this reader
-    /// is in use; reads are not pinned to an object version.
-    pub fn new_from_file(base_path: &Path, endgame: &str) -> EgtResult<Self> {
-        Self::open_in(&Location::parse(base_path)?, endgame)
+    /// Opens an existing table without modifying storage. Data is read on demand.
+    /// Objects must not be replaced while this reader is in use: reads are not
+    /// pinned to an object version.
+    pub fn new_from_file(base_path: &Path, tablename: &str) -> EgtResult<Self> {
+        Self::open_in(&Location::parse(base_path)?, tablename)
     }
 
-    pub(crate) fn open_in(location: &Location, endgame: &str) -> EgtResult<Self> {
-        let mut file = Self::new_in(location, endgame)?;
+    pub(crate) fn open_in(location: &Location, tablename: &str) -> EgtResult<Self> {
+        let mut file = Self::construct(location, tablename)?;
+        location.validate_format()?;
         file.load_seek_table()?;
         file.frames.fill(FrameState::CompressedOnFile);
         Ok(file)
@@ -502,8 +384,8 @@ impl EgtFile {
         let result = block_on(self.location.store.get_opts(&self.key, options))
             .map_err(|error| self.location.error(&self.key, error))?;
         let table_start = result.range.start;
-        let bytes = block_on(result.bytes())
-            .map_err(|error| self.location.error(&self.key, error))?;
+        let bytes =
+            block_on(result.bytes()).map_err(|error| self.location.error(&self.key, error))?;
         if bytes.len() as u64 != table_size {
             return Err(EgtError::Internal("truncated tablebase seek table"));
         }
@@ -528,13 +410,9 @@ impl EgtFile {
         Ok(())
     }
 
-    pub(crate) fn save_stats(&self, stats: &EgtFileStats) -> EgtResult<()> {
-        self.location.ensure_writable()?;
-        let key = self.location.prefix.clone().join(if self.endgame.contains('P') {
-                    format!("{}.v2.json", self.endgame)
-                } else {
-                    format!("{}.json", self.endgame)
-                });
+    pub(crate) fn save_stats(&self, stats: &EgtStats) -> EgtResult<()> {
+        self.location.ensure_format()?;
+        let key = self.location.key(&self.id.relative_path("json"));
         let json = serde_json::to_vec_pretty(stats)?;
         block_on(self.location.store.put(&key, json.into()))
             .map_err(|error| self.location.error(&key, error))?;
@@ -560,7 +438,10 @@ impl EgtFile {
 
     fn read_from_index_cached(&self, index: usize) -> EgtResult<Option<MaybeDtcOutcome>> {
         if index >= self.index_range {
-            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
+            return Err(EgtError::IndexOutOfRange {
+                index,
+                range: self.index_range,
+            });
         }
         let (frame_idx, offset) = self.locate_frame(index);
         match &self.frames[frame_idx] {
@@ -569,15 +450,15 @@ impl EgtFile {
         }
     }
 
-    /// Save the entire EgtFile using seekable Zstd compression.
+    /// Save the entire table using seekable Zstd compression.
     ///
     /// Afterwards all frames are left in the `CompressedOnFile` state: the
     /// in-memory data is released and re-read from the object on demand.
     pub fn save_to_file(&mut self) -> EgtResult<u64> {
+        use crate::egt_writer::{encode_frame, publish_buffers};
         use std::io::{Read, Write};
         use zeekstd::EncodeOptions;
-        use crate::egt_writer::{encode_frame, publish_buffers};
-        self.location.ensure_writable()?;
+        self.location.ensure_format()?;
         let mut compressed = Vec::new();
         let mut encoder = EncodeOptions::new()
             .compression_level(DEFAULT_COMPRESSION_LEVEL)
@@ -591,16 +472,19 @@ impl EgtFile {
             if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
                 encode_frame(&mut encoder, uncompressed)?;
             } else {
-                return Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"));
+                return Err(EgtError::Internal(
+                    "expected Uncompressed frame state after ensure_uncompressed",
+                ));
             }
-
         }
 
         encoder.flush()?;
         let table = encoder.into_seek_table();
         table.into_serializer().read_to_end(&mut compressed)?;
         let (bytes, _) = publish_buffers(
-            &self.location, &self.key, std::iter::once(compressed.into()),
+            &self.location,
+            &self.key,
+            std::iter::once(compressed.into()),
         )?;
         self.load_seek_table()?;
         self.frames.fill(FrameState::CompressedOnFile);
@@ -614,42 +498,60 @@ impl EgtFile {
         if let FrameState::Uncompressed { uncompressed, .. } = &mut self.frames[frame_idx] {
             Ok(uncompressed)
         } else {
-            Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"))
+            Err(EgtError::Internal(
+                "expected Uncompressed frame state after ensure_uncompressed",
+            ))
         }
     }
 
-    /// Returns the in-memory outcomes for the global indexes `[start, end)`,
+    /// Returns the in-memory outcomes for the table-local indexes `[start, end)`,
     /// allocating or decompressing the frame if needed. The range must lie
     /// within a single frame. This gives table scans direct slice access,
     /// avoiding the per-element overhead of `read_from_index`.
     pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[MaybeDtcOutcome]> {
         if start > end || end > self.index_range {
-            return Err(EgtError::IndexOutOfRange { index: end, range: self.index_range });
+            return Err(EgtError::IndexOutOfRange {
+                index: end,
+                range: self.index_range,
+            });
         }
         if start == end {
             return Ok(&[]);
         }
         let (frame_idx, offset) = self.locate_frame(start);
         if end - start > self.frame_layout[frame_idx].len - offset {
-            return Err(EgtError::Internal("frame_chunk range crosses a frame boundary"));
+            return Err(EgtError::Internal(
+                "frame_chunk range crosses a frame boundary",
+            ));
         }
         let data = self.get_frame_data(frame_idx)?;
         Ok(&data[offset..offset + (end - start)])
     }
 
-    fn frame_chunk_cached(&self, start: usize, end: usize) -> EgtResult<Option<&[MaybeDtcOutcome]>> {
+    fn frame_chunk_cached(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> EgtResult<Option<&[MaybeDtcOutcome]>> {
         if start > end || end > self.index_range {
-            return Err(EgtError::IndexOutOfRange { index: end, range: self.index_range });
+            return Err(EgtError::IndexOutOfRange {
+                index: end,
+                range: self.index_range,
+            });
         }
         if start == end {
             return Ok(Some(&[]));
         }
         let (frame_idx, offset) = self.locate_frame(start);
         if end - start > self.frame_layout[frame_idx].len - offset {
-            return Err(EgtError::Internal("frame_chunk range crosses a frame boundary"));
+            return Err(EgtError::Internal(
+                "frame_chunk range crosses a frame boundary",
+            ));
         }
         match &self.frames[frame_idx] {
-            FrameState::Uncompressed { uncompressed, .. } => Ok(Some(&uncompressed[offset..offset + end - start])),
+            FrameState::Uncompressed { uncompressed, .. } => {
+                Ok(Some(&uncompressed[offset..offset + end - start]))
+            }
             _ => Ok(None),
         }
     }
@@ -657,50 +559,59 @@ impl EgtFile {
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
-        let (key, reflected) = PawnKey::from_position(position).canonicalized();
-        let &egt_idx = self.egt_map.get(&key).ok_or(EgtError::PositionNotInTable { table: self.endgame.clone() })?;
-        let local_index = if reflected {
-            self.egts[egt_idx].reflected_position_to_index(position)
-        } else {
-            self.egts[egt_idx].position_to_index(position)
-        };
-
-        let global_index = self.get_global_index(egt_idx, local_index);
-        if global_index >= self.index_range {
-            return Err(EgtError::IndexOutOfRange { index: global_index, range: self.index_range });
+        let (id, reflected) = TableId::from_position(position)?;
+        if id != self.id {
+            return Err(EgtError::PositionNotInTable {
+                table: self.tablename.clone(),
+            });
         }
-
-        Ok(global_index)
+        self.map_routed_position_to_index(position, reflected)
     }
 
-    /// Computes the global index in the file given an Egt index and local index.
-    #[inline]
-    pub fn get_global_index(&self, egt_idx: usize, local_index: usize) -> usize {
-        self.egt_offsets[egt_idx] + local_index
+    /// Indexes a position already routed to this table. The caller must have
+    /// selected this identity and its reflection flag via TableId::from_position.
+    pub(crate) fn map_routed_position_to_index(
+        &self,
+        position: &Chess,
+        reflected: bool,
+    ) -> EgtResult<usize> {
+        let index = if reflected {
+            self.egt.reflected_position_to_index(position)
+        } else {
+            self.egt.position_to_index(position)
+        };
+        if index >= self.index_range {
+            return Err(EgtError::IndexOutOfRange {
+                index,
+                range: self.index_range,
+            });
+        }
+        Ok(index)
     }
 
-    /// Converts a global index to a position.
+    /// Converts a table-local index to a position.
     pub fn index_to_position(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         if index >= self.index_range {
             return None;
         }
-
-        // `egt_offsets` is sorted, so the owning sub-table is the last one that
-        // starts at or before `index`.
-        let egt_idx = self.egt_offsets.partition_point(|&offset| offset <= index) - 1;
-        let remaining_idx = index - self.egt_offsets[egt_idx];
-        self.egts[egt_idx].position_from_index(remaining_idx, side_to_move)
+        self.egt.position_from_index(index, side_to_move)
     }
 
     fn locate_frame(&self, index: usize) -> (usize, usize) {
-        let frame_idx = self.frame_layout.partition_point(|frame| frame.start <= index) - 1;
+        let frame_idx = self
+            .frame_layout
+            .partition_point(|frame| frame.start <= index)
+            - 1;
         (frame_idx, index - self.frame_layout[frame_idx].start)
     }
 
-    /// Reads an outcome directly by its global index.
+    /// Reads an outcome directly by its table-local index.
     pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
         if index >= self.index_range {
-            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
+            return Err(EgtError::IndexOutOfRange {
+                index,
+                range: self.index_range,
+            });
         }
 
         let (frame_idx, offset) = self.locate_frame(index);
@@ -709,22 +620,32 @@ impl EgtFile {
         Ok(data[offset])
     }
 
-    /// Writes an outcome directly by its global index.
+    /// Writes an outcome directly by its table-local index.
     pub fn write_to_index(&mut self, index: usize, outcome: MaybeDtcOutcome) -> EgtResult<()> {
         if index >= self.index_range {
-            return Err(EgtError::IndexOutOfRange { index, range: self.index_range });
+            return Err(EgtError::IndexOutOfRange {
+                index,
+                range: self.index_range,
+            });
         }
 
         let (frame_idx, offset) = self.locate_frame(index);
 
         self.ensure_uncompressed(frame_idx)?;
 
-        if let FrameState::Uncompressed { uncompressed, dirty, .. } = &mut self.frames[frame_idx] {
+        if let FrameState::Uncompressed {
+            uncompressed,
+            dirty,
+            ..
+        } = &mut self.frames[frame_idx]
+        {
             uncompressed[offset] = outcome;
             *dirty = true;
             Ok(())
         } else {
-            Err(EgtError::Internal("expected Uncompressed frame state after ensure_uncompressed"))
+            Err(EgtError::Internal(
+                "expected Uncompressed frame state after ensure_uncompressed",
+            ))
         }
     }
 
@@ -743,9 +664,11 @@ impl EgtFile {
                     dirty: true,
                 };
                 Ok(())
-            },
+            }
             FrameState::CompressedOnFile => {
-                let table = self.seek_table.as_ref()
+                let table = self
+                    .seek_table
+                    .as_ref()
                     .ok_or(EgtError::Internal("missing tablebase seek table"))?;
                 let range = table.frame_start_comp(frame_idx as u32)?
                     ..table.frame_end_comp(frame_idx as u32)?;
@@ -762,7 +685,7 @@ impl EgtFile {
                     dirty: false,
                 };
                 Ok(())
-            },
+            }
             FrameState::Compressed(compressed_bytes) => {
                 let uncompressed = decode_frame(compressed_bytes, frame.len)?;
                 self.frames[frame_idx] = FrameState::Uncompressed {
@@ -771,7 +694,7 @@ impl EgtFile {
                     dirty: false,
                 };
                 Ok(())
-            },
+            }
             FrameState::Uncompressed { .. } => {
                 // Already uncompressed
                 // TODO: update LRU status
@@ -793,8 +716,12 @@ impl EgtFile {
             FrameState::Compressed(_) => {
                 // Already compressed
                 Ok(())
-            },
-            FrameState::Uncompressed { uncompressed, dirty, .. } => {
+            }
+            FrameState::Uncompressed {
+                uncompressed,
+                dirty,
+                ..
+            } => {
                 if !dirty {
                     let mut temp = FrameState::Empty;
                     std::mem::swap(&mut self.frames[frame_idx], &mut temp);
@@ -827,7 +754,7 @@ impl EgtFile {
                     self.frames[frame_idx] = FrameState::Compressed(compressed_bytes);
                 }
                 Ok(())
-            },
+            }
         }
     }
 }
@@ -837,12 +764,20 @@ fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<MaybeDtcOutcome>
     // One-shot decoding is bounded by both slices and rejects truncated input.
     // zeekstd's streaming decoder can otherwise loop at premature EOF.
     let decoded = zstd_safe::decompress(&mut transposed[..], compressed).map_err(|code| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData,
-            format!("invalid compressed tablebase frame: {}", zstd_safe::get_error_name(code)))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "invalid compressed tablebase frame: {}",
+                zstd_safe::get_error_name(code)
+            ),
+        )
     })?;
     if decoded != transposed.len() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-            "decompressed tablebase frame has wrong length").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed tablebase frame has wrong length",
+        )
+        .into());
     }
     Ok(detranspose_frame(&transposed, len))
 }
@@ -890,138 +825,6 @@ pub fn detranspose_frame(transposed: &[u8], n: usize) -> Vec<MaybeDtcOutcome> {
     output
 }
 
-/// Pawnful layouts use a distinct indexing namespace; legacy files must never
-/// be interpreted using the color-order indexer. Pawnless files are unchanged.
-fn tablebase_filename(endgame: &str) -> String {
-    if endgame.contains('P') {
-        format!("{}.v2.ggegt", endgame)
-    } else {
-        format!("{}.ggegt", endgame)
-    }
-}
-
-/// Enumerates all rank color orders for a fixed pair of pawn-file multisets.
-fn pawn_order_combinations(stm: &[File], sntm: &[File]) -> Vec<Vec<EgtElement>> {
-    let mut counts = [[0usize; 2]; 8];
-    for &file in stm { counts[file.to_usize()][0] += 1; }
-    for &file in sntm { counts[file.to_usize()][1] += 1; }
-    if counts.iter().any(|c| c[0] + c[1] > 6) {
-        return Vec::new();
-    }
-    let mut layouts = vec![Vec::new()];
-    for (file, [n_stm, n_sntm]) in counts.into_iter().enumerate() {
-        let len = n_stm + n_sntm;
-        if len == 0 { continue; }
-        let mut next = Vec::new();
-        for mask in 0u8..(1 << len) {
-            if mask.count_ones() as usize != n_sntm { continue; }
-            let order = (0..len).map(|i| {
-                if mask & (1 << i) == 0 { EgtSide::SideToMove } else { EgtSide::SideNotToMove }
-            }).collect();
-            let group = EgtElement::PawnGroup { file: File::new(file as u32), order };
-            for layout in &layouts {
-                let mut layout = layout.clone();
-                layout.push(group.clone());
-                next.push(layout);
-            }
-        }
-        layouts = next;
-    }
-    layouts
-}
-
-/// Parses the endgame name (e.g., "KRP_KP") to extract:
-/// - Number of pawns for SideToMove
-/// - Number of pawns for SideNotToMove
-/// - List of non-pawn pieces
-fn parse_endgame_name(endgame: &str) -> EgtResult<(usize, usize, Vec<EgtElement>)> {
-    let (stm, sntm) = endgame.split_once('_').ok_or(EgtError::InvalidEndgameName {
-        name: endgame.to_string(),
-        reason: "missing '_' separator",
-    })?;
-    let mut stm_pawns = 0;
-    let mut sntm_pawns = 0;
-    let mut other_pieces = Vec::new();
-
-    for (s, side, pawns) in [
-        (stm, EgtSide::SideToMove, &mut stm_pawns),
-        (sntm, EgtSide::SideNotToMove, &mut sntm_pawns),
-    ] {
-        let mut count = ByRole::<usize>::default();
-        for c in s.chars() {
-            let role = Role::from_char(c).filter(|_| c.is_ascii_uppercase())
-                .ok_or_else(|| EgtError::InvalidEndgameName {
-                    name: endgame.to_string(),
-                    reason: "invalid piece character",
-                })?;
-            count[role] += 1;
-        }
-        *pawns = count[Role::Pawn];
-        if count[Role::King] != 1 {
-            return Err(EgtError::InvalidEndgameName {
-                name: endgame.to_string(),
-                reason: "each side must have exactly one king",
-            });
-        }
-        for role in Role::ALL.into_iter().rev() {
-            let multiplicity = count[role];
-            if role != Role::Pawn && multiplicity > 0 {
-                other_pieces.push(EgtElement::PieceGroup { role, side, multiplicity });
-            }
-        }
-    }
-    Ok((stm_pawns, sntm_pawns, other_pieces))
-}
-
-/// Generates all combinations with repetition of size `k` from the 8 files.
-fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
-    let mut results = Vec::new();
-    let mut current = Vec::new();
-    fn recurse(k: usize, start_file_idx: usize, current: &mut Vec<File>, results: &mut Vec<Vec<File>>) {
-        if current.len() == k {
-            results.push(current.clone());
-            return;
-        }
-        for idx in start_file_idx..8 {
-            let file = File::new(idx as u32);
-            current.push(file);
-            recurse(k, idx, current, results);
-            current.pop();
-        }
-    }
-    recurse(k, 0, &mut current, &mut results);
-    results
-}
-
-
-/// Compares an ascending list of files with its own horizontal reflection.
-///
-/// The reflection of an ascending list is the reversed list with every file
-/// mapped to `7 - f`, so the comparison needs no intermediate allocation.
-fn cmp_with_reflection(files: &[File]) -> std::cmp::Ordering {
-    debug_assert!(files.windows(2).all(|w| w[0].to_usize() <= w[1].to_usize()));
-    files
-        .iter()
-        .map(|f| f.to_usize())
-        .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
-}
-
-/// Checks if a pawn configuration is canonical (lexicographically lower than or equal to its horizontal reflection).
-///
-/// Both slices must be sorted ascending.
-pub fn is_canonical(stm_files: &[File], sntm_files: &[File]) -> bool {
-    use std::cmp::Ordering;
-
-    // Equivalent to `(stm, sntm) <= (reflect(stm), reflect(sntm))`, evaluated
-    // lazily so that the second component is only inspected on a tie.
-    match cmp_with_reflection(stm_files) {
-        Ordering::Less => true,
-        Ordering::Greater => false,
-        Ordering::Equal => cmp_with_reflection(sntm_files) != Ordering::Greater,
-    }
-}
-
-
 /// Mirrors a chess position horizontally for independent indexing checks.
 #[cfg(test)]
 pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
@@ -1036,76 +839,88 @@ pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shakmaty::fen::Fen;
     use shakmaty::Color;
+    use shakmaty::fen::Fen;
+
+    fn table_path(base: &Path, name: &str) -> std::path::PathBuf {
+        let path = base.join(TableId::parse(name).unwrap().relative_path("ggegt"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
 
     #[test]
     fn pawn_orders_route_to_distinct_tables_and_their_twins() {
         let dir = crate::TestDir::new("pawn_order_routing");
-        for (material, twin_material) in [("KP_KP", "KP_KP"), ("KPP_KP", "KP_KPP")] {
-            let file = EgtFile::new(&dir.0, material).unwrap();
-            let twin_file = EgtFile::new(&dir.0, twin_material).unwrap();
-            let mut names = std::collections::HashSet::new();
-            for (egt_idx, table) in file.egts.iter().enumerate() {
-                assert!(names.insert(table.tablename()));
-                let key = PawnKey::from_elements(&table.elements);
-                assert_eq!(key.reflected().reflected(), key);
-                assert_eq!(key.twin().twin(), key);
-                let (twin_key, reflected) = key.twin().canonicalized();
-                let twin = &twin_file.egts[twin_file.egt_map[&twin_key]];
-                assert_eq!(twin_key.twin().canonicalized().0, key);
-                let stride = (table.index_range() / 16).max(1);
-                for turn in [Color::White, Color::Black] {
-                    for index in (0..table.index_range()).step_by(stride) {
-                        let Some(position) = table.position_from_index(index, turn) else { continue; };
-                        assert_eq!(file.map_position_to_index(&position).unwrap(), file.egt_offsets[egt_idx] + index);
-                        let mirrored = mirror_horizontally(&position).unwrap();
-                        // File-count ties retain both orientations, so only compare
-                        // the descriptor selected by the documented symmetry policy.
-                        let (mirror_key, _) = PawnKey::from_position(&mirrored).canonicalized();
-                        let mirror_idx = file.map_position_to_index(&mirrored).unwrap();
-                        let mirror_table = file.egt_map[&mirror_key];
-                        assert!(mirror_idx >= file.egt_offsets[mirror_table]);
-                        for mv in position.legal_moves() {
-                            if mv.is_capture() || mv.is_promotion() { continue; }
-                            let successor = position.clone().play(mv).unwrap();
-                            assert_eq!(PawnKey::from_position(&successor).canonicalized().0, twin_key);
-                            let local = if reflected { twin.reflected_position_to_index(&successor) } else { twin.position_to_index(&successor) };
-                            assert_eq!(twin.position_from_index(local, successor.turn()).unwrap(),
-                                if reflected { mirror_horizontally(&successor).unwrap() } else { successor });
+        for name in ["KPa_KPa", "KPao_KPao", "KPaPa_KPb", "KPa_KPbPb"] {
+            let file = EgtFileReader::new(&dir.0, name).unwrap();
+            let (twin, _) = file.id.twin().unwrap();
+            let twin_file = EgtFileReader::new(&dir.0, twin.tablename()).unwrap();
+            let stride = (file.index_range / 64).max(1);
+            for turn in [Color::White, Color::Black] {
+                for index in (0..file.index_range).step_by(stride) {
+                    let Some(position) = file.index_to_position(index, turn) else {
+                        continue;
+                    };
+                    assert_eq!(file.map_position_to_index(&position).unwrap(), index);
+                    for mv in position.legal_moves() {
+                        if mv.is_capture() || mv.is_promotion() {
+                            continue;
                         }
+                        let successor = position.clone().play(mv).unwrap();
+                        let local = twin_file.map_position_to_index(&successor).unwrap();
+                        let (_, reflected) = TableId::from_position(&successor).unwrap();
+                        assert_eq!(
+                            twin_file
+                                .index_to_position(local, successor.turn())
+                                .unwrap(),
+                            if reflected {
+                                mirror_horizontally(&successor).unwrap()
+                            } else {
+                                successor
+                            }
+                        );
                     }
                 }
             }
         }
-        let file = EgtFile::new(&dir.0, "KP_KP").unwrap();
-        assert!(file.egts.iter().any(|t| t.tablename() == "KPa_KPa"));
-        assert!(file.egts.iter().any(|t| t.tablename() == "KPao_KPao"));
     }
 
     #[test]
-    fn pawnful_namespace_does_not_read_or_overwrite_legacy_files() {
-        let dir = crate::TestDir::new("pawn_order_namespace");
+    fn requires_format_and_uses_exact_hierarchical_namespace() {
+        let dir = crate::TestDir::new("exact_namespace");
         let legacy = dir.0.join("KP_K.ggegt");
         std::fs::write(&legacy, b"legacy indexing").unwrap();
-        assert!(matches!(EgtFile::new_from_file(&dir.0, "KP_K"), Err(EgtError::FileNotFound(_))));
-        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_err());
+        assert!(!dir.0.join("format.json").exists());
+        let mut file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
         file.save_to_file().unwrap();
-        assert!(dir.0.join("KP_K.v2.ggegt").exists());
+        assert!(dir.0.join(file.id.relative_path("ggegt")).exists());
         assert_eq!(std::fs::read(legacy).unwrap(), b"legacy indexing");
-        assert!(EgtFile::new_from_file(&dir.0, "KP_K").is_ok());
+        assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_ok());
+        assert!(EgtFileReader::new(&dir.0, "KP_K").is_err());
     }
 
     #[test]
     fn cached_probe_does_not_warm_frames() {
         let dir = crate::TestDir::new("cached_probe_does_not_warm_frames");
-        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
-        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
-            .into_position(CastlingMode::Standard).unwrap();
+        let mut file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
         assert_eq!(file.probe_cached(&position).unwrap(), None);
-        assert!(file.frames.iter().all(|frame| matches!(frame, FrameState::Empty)));
+        assert!(
+            file.frames
+                .iter()
+                .all(|frame| matches!(frame, FrameState::Empty))
+        );
         let index = file.map_position_to_index(&position).unwrap();
-        for outcome in [MaybeDtcOutcome::INVALID, MaybeDtcOutcome::new_unknown(3), MaybeDtcOutcome::DRAW] {
+        for outcome in [
+            MaybeDtcOutcome::INVALID,
+            MaybeDtcOutcome::new_unknown(3),
+            MaybeDtcOutcome::DRAW,
+        ] {
             file.write_to_index(index, outcome).unwrap();
             assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
         }
@@ -1120,22 +935,32 @@ mod tests {
     fn shared_dependency_cold_and_warm_probes() {
         let base = crate::TestDir::new("shared_dependency_base");
         let input = crate::TestDir::new("shared_dependency_input");
-        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
-            .into_position(CastlingMode::Standard).unwrap();
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
         let outcome = MaybeDtcOutcome::new_win(ConversionType::Promotion, 7);
         // Distinct values verify that lazy loading honors input-path precedence.
         for (path, value) in [(&base.0, MaybeDtcOutcome::DRAW), (&input.0, outcome)] {
-            let mut file = EgtFile::new(path, "KP_K").unwrap();
-            file.write_to_index(file.map_position_to_index(&position).unwrap(), value).unwrap();
+            let mut file = EgtFileReader::new(path, "KPa_K").unwrap();
+            file.write_to_index(file.map_position_to_index(&position).unwrap(), value)
+                .unwrap();
             file.save_to_file().unwrap();
         }
         for preloaded in [false, true] {
             let mut files = HashMap::new();
             if preloaded {
-                files.insert("KP_K".to_string(), EgtFile::new_from_file(&input.0, "KP_K").unwrap());
+                files.insert(
+                    "KPa_K".to_string(),
+                    EgtFileReader::new_from_file(&input.0, "KPa_K").unwrap(),
+                );
             }
-            let reader = SharedDependencyReader::new(files,
-                &Location::parse(&base.0).unwrap(), Some(&Location::parse(&input.0).unwrap()));
+            let reader = SharedDependencyReader::new(
+                files,
+                &Location::parse(&base.0).unwrap(),
+                Some(&Location::parse(&input.0).unwrap()),
+            );
             let barrier = std::sync::Barrier::new(8);
             std::thread::scope(|scope| {
                 for _ in 0..8 {
@@ -1152,7 +977,7 @@ mod tests {
             });
             // A warm probe needs only shared guards for both registry and file.
             let registry_guard = reader.files.read().unwrap();
-            let file = Arc::clone(registry_guard.get("KP_K").unwrap());
+            let file = Arc::clone(registry_guard.get("KPa_K").unwrap());
             let guard = file.read().unwrap();
             assert_eq!(reader.probe(&position).unwrap(), outcome);
             drop(guard);
@@ -1160,84 +985,133 @@ mod tests {
             drop(registry_guard);
             let cache = reader.into_cache().unwrap();
             assert_eq!(cache.len(), 1);
-            let file = &cache["KP_K"];
+            let file = &cache["KPa_K"];
             assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
-            assert_eq!(file.frames.iter().filter(|frame| matches!(frame, FrameState::Uncompressed { .. })).count(), 1);
+            assert_eq!(
+                file.frames
+                    .iter()
+                    .filter(|frame| matches!(frame, FrameState::Uncompressed { .. }))
+                    .count(),
+                1
+            );
         }
+    }
+
+    #[test]
+    fn shared_dependency_insert_remove_and_clear_preserve_cache_precedence() {
+        let base = crate::TestDir::new("shared_dependency_lifecycle_base");
+        let input = crate::TestDir::new("shared_dependency_lifecycle_input");
+        let pawn: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        let queen: Chess = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        let dependency_value = MaybeDtcOutcome::new_win(ConversionType::Promotion, 7);
+        let output_value = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 3);
+        for (path, name, position, value) in [
+            (&input.0, "KPa_K", &pawn, dependency_value),
+            (&input.0, "KQ_K", &queen, MaybeDtcOutcome::DRAW),
+            (&base.0, "KQ_K", &queen, output_value),
+        ] {
+            let mut file = EgtFileReader::new(path, name).unwrap();
+            file.write_to_index(file.map_position_to_index(position).unwrap(), value)
+                .unwrap();
+            file.save_to_file().unwrap();
+        }
+        let reader = SharedDependencyReader::new(
+            HashMap::new(),
+            &Location::parse(&base.0).unwrap(),
+            Some(&Location::parse(&input.0).unwrap()),
+        );
+        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
+        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
+        let dependency = Arc::downgrade(&reader.files.read().unwrap()["KPa_K"]);
+        let old_output = Arc::downgrade(&reader.files.read().unwrap()["KQ_K"]);
+
+        reader
+            .insert(EgtFileReader::new_from_file(&base.0, "KQ_K").unwrap())
+            .unwrap();
+        assert!(old_output.upgrade().is_none());
+        assert_eq!(reader.probe(&queen).unwrap(), output_value);
+        let pinned_output = Arc::downgrade(&reader.files.read().unwrap()["KQ_K"]);
+        reader.remove(&["KQ_K".to_owned()]).unwrap();
+        assert!(pinned_output.upgrade().is_none());
+        assert!(dependency.upgrade().is_some());
+        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
+        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
+        assert_eq!(reader.probe_outcome(&queen).unwrap(), DtcOutcome::Draw);
+
+        reader.clear().unwrap();
+        assert!(dependency.upgrade().is_none());
+        assert!(reader.files.read().unwrap().is_empty());
+        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
+        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
     }
 
     #[test]
     fn shared_dependency_missing_returns_error_without_generating() {
         let dir = crate::TestDir::new("shared_dependency_missing");
-        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse::<Fen>().unwrap()
-            .into_position(CastlingMode::Standard).unwrap();
-        let reader = SharedDependencyReader::new(HashMap::new(), &Location::parse(&dir.0).unwrap(), None);
-        assert!(matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
+        let position: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        let reader =
+            SharedDependencyReader::new(HashMap::new(), &Location::parse(&dir.0).unwrap(), None);
+        assert!(
+            matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
             dependency, source,
-        }) if dependency == "KP_K" && matches!(*source, EgtError::FileNotFound(_))));
-        assert!(!dir.0.join("KP_K.v2.ggegt").exists());
+        }) if dependency == "KPa_K" && matches!(*source, EgtError::FileNotFound(_)))
+        );
+        assert!(
+            !dir.0
+                .join(TableId::parse("KPa_K").unwrap().relative_path("ggegt"))
+                .exists()
+        );
         assert!(reader.into_cache().unwrap().is_empty());
     }
 
     #[test]
-    fn test_parse_endgame_name() {
-        let (stm_pawns, sntm_pawns, other_pieces) = parse_endgame_name("KRP_KP").unwrap();
-        assert_eq!(stm_pawns, 1);
-        assert_eq!(sntm_pawns, 1);
-        assert_eq!(other_pieces.len(), 3);
-        assert_eq!(other_pieces, vec![
-            EgtElement::PieceGroup { role: Role::King, side: EgtSide::SideToMove, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::Rook, side: EgtSide::SideToMove, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::King, side: EgtSide::SideNotToMove, multiplicity: 1 },
-        ]);
-
-        let (_, _, pieces) = parse_endgame_name("NBRQK_K").unwrap();
-        assert_eq!(pieces.iter().map(|piece| match piece {
-            EgtElement::PieceGroup { role, .. } => *role,
-            _ => unreachable!(),
-        }).collect::<Vec<_>>(), vec![Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight, Role::King]);
-
-        for name in ["Kk", "k_K", "K_qK", "K_XK", "K_K_K", "_K", "K_", "KK_K", "K_KK"] {
-            assert!(matches!(parse_endgame_name(name), Err(EgtError::InvalidEndgameName { .. })), "{name}");
-        }
-    }
-
-    #[test]
-    fn test_get_file_combinations() {
-        let combos_1 = get_file_combinations(1);
-        assert_eq!(combos_1.len(), 8);
-
-        let combos_2 = get_file_combinations(2);
-        assert_eq!(combos_2.len(), 36);
-    }
-
-    #[test]
-    fn test_is_canonical() {
-        // [a] vs [c] is canonical
-        assert!(is_canonical(&[File::A], &[File::C]));
-        // [h] vs [f] is not canonical (reflection is [a] vs [c])
-        assert!(!is_canonical(&[File::H], &[File::F]));
-    }
-
-    #[test]
     fn test_egt_file_creation() {
-        let path = PathBuf::from("test_kp_k.egt");
-        let egt_file = EgtFile::new(&path, "KP_K").unwrap();
-
-        // KP_K has 1 pawn for STM, 0 for SNTM.
-        // Files for STM pawn: a, b, c, d are canonical. e, f, g, h are reflected.
-        // So we expect exactly 4 Egts: KPa_K, KPb_K, KPc_K, KPd_K
-        assert_eq!(egt_file.egts.len(), 4);
-        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPa_K").unwrap().elements)));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPb_K").unwrap().elements)));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPc_K").unwrap().elements)));
-        assert!(egt_file.egt_map.contains_key(&PawnKey::from_elements(&Egt::from_tablename("KPd_K").unwrap().elements)));
+        let dir = crate::TestDir::new("single_table_creation");
+        let file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
+        assert_eq!(file.tablename, "KPa_K");
+        assert_eq!(file.id.tablename(), file.egt.tablename());
+        assert_eq!(file.index_range, file.egt.index_range());
+        let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        assert!(matches!(
+            file.map_position_to_index(&other),
+            Err(EgtError::PositionNotInTable { .. })
+        ));
+        let other_material: Chess = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        assert!(matches!(
+            file.map_position_to_index(&other_material),
+            Err(EgtError::PositionNotInTable { .. })
+        ));
+        assert!(
+            file.index_to_position(file.index_range, Color::White)
+                .is_none()
+        );
     }
 
     #[test]
     fn egt_file_probing_canonical() {
-        let path = PathBuf::from("test_kp_k.egt");
-        let mut egt_file = EgtFile::new(&path, "KP_K").unwrap();
+        let dir = crate::TestDir::new("single_table_probe");
+        let path = dir.0.clone();
+        let mut egt_file = EgtFileReader::new(&path, "KPa_K").unwrap();
 
         // A canonical position: White pawn on a2, White king on a1, Black king on h8
         // FEN: 8/8/8/8/8/8/P7/K6k w - - 0 1
@@ -1260,8 +1134,9 @@ mod tests {
 
     #[test]
     fn egt_file_probing_mirrored() {
-        let path = PathBuf::from("test_kp_k.egt");
-        let mut egt_file = EgtFile::new(&path, "KP_K").unwrap();
+        let dir = crate::TestDir::new("single_table_probe");
+        let path = dir.0.clone();
+        let mut egt_file = EgtFileReader::new(&path, "KPa_K").unwrap();
 
         // A mirrored (non-canonical) position: White pawn on h2, White king on h1, Black king on a1
         // This is the horizontal reflection of the canonical position above.
@@ -1274,56 +1149,45 @@ mod tests {
         // Write to the canonical position
         let expected_outcome = MaybeDtcOutcome::new_win(crate::ConversionType::Checkmate, 12);
         let idx_canonical = egt_file.map_position_to_index(&position_canonical).unwrap();
-        egt_file.write_to_index(idx_canonical, expected_outcome).unwrap();
+        egt_file
+            .write_to_index(idx_canonical, expected_outcome)
+            .unwrap();
 
         // Probing the mirrored position should return the same outcome because it gets canonicalized/mirrored
         let outcome = egt_file.probe(&position_mirrored).unwrap();
         assert_eq!(outcome, expected_outcome);
     }
 
-    fn run_round_trip_test(endgame: &str, stride: usize) {
-        let path = PathBuf::from(".");
-        let egt_file = EgtFile::new(&path, endgame).unwrap();
-
-        let mut offset = 0;
-        let num_egts = egt_file.egts.len();
-        for egt_idx in 0..num_egts {
-            let range = egt_file.egts[egt_idx].index_range();
-            let mut local_index = 0;
-            while local_index < range {
-                let global_index = offset + local_index;
-                if let Some(position) = egt_file.egts[egt_idx].position_from_index(local_index, Color::White) {
-                    let mapped_global_index = egt_file.map_position_to_index(&position).unwrap();
-                    assert_eq!(global_index, mapped_global_index);
+    fn run_round_trip_test(tablename: &str, stride: usize) {
+        let dir = crate::TestDir::new("single_table_roundtrip");
+        let file = EgtFileReader::new(&dir.0, tablename).unwrap();
+        for turn in [Color::White, Color::Black] {
+            for index in (0..file.index_range).step_by(stride) {
+                if let Some(position) = file.index_to_position(index, turn) {
+                    assert_eq!(file.map_position_to_index(&position).unwrap(), index);
                 }
-                local_index += stride;
             }
-            offset += range;
         }
     }
 
     #[test]
     fn egt_file_decode_encode_kpp_kpp() {
-        // KPP_KPP has 2.35 billion positions across 656 sub-tables.
-        run_round_trip_test("KPP_KPP", 100_000);
+        run_round_trip_test("KPaPb_KPcPd", 100_000);
     }
 
     #[test]
     fn egt_file_decode_encode_kq_kr() {
-        // KQ_KR has 1.7 million positions across 1 sub-table.
         run_round_trip_test("KQ_KR", 100);
     }
 
     #[test]
     fn egt_file_decode_encode_kppp_k() {
-        // KPPP_K has ~5 million positions across 56 sub-tables.
-        run_round_trip_test("KPPP_K", 100);
+        run_round_trip_test("KPaPbPc_K", 100);
     }
 
     #[test]
     fn egt_file_decode_encode_kpp_kp() {
-        // KPP_KP has ~15 million positions across 156 sub-tables.
-        run_round_trip_test("KPP_KP", 500);
+        run_round_trip_test("KPaPb_KPc", 500);
     }
 
     #[test]
@@ -1342,7 +1206,12 @@ mod tests {
         let transposed = transpose_frame(&inputs);
         let recovered = detranspose_frame(&transposed, n);
         for i in 0..n {
-            assert_eq!(inputs[i].to_u16(), recovered[i].to_u16(), "mismatch at i={}", i);
+            assert_eq!(
+                inputs[i].to_u16(),
+                recovered[i].to_u16(),
+                "mismatch at i={}",
+                i
+            );
         }
     }
 
@@ -1350,7 +1219,7 @@ mod tests {
     fn egt_file_compression_decompression() {
         let test_dir = crate::TestDir::new("egt_file_compression_decompression");
         let base_path = test_dir.0.clone();
-        let mut egt_file = EgtFile::new(&base_path, "KP_K").unwrap();
+        let mut egt_file = EgtFileReader::new(&base_path, "KPa_K").unwrap();
 
         // Sample a position
         let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
@@ -1364,7 +1233,7 @@ mod tests {
         egt_file.save_to_file().unwrap();
         for f in 0..egt_file.frames.len() {
             match egt_file.frames[f] {
-                FrameState::CompressedOnFile => {},
+                FrameState::CompressedOnFile => {}
                 _ => panic!("frame {} should be compressed on file", f),
             }
         }
@@ -1373,7 +1242,7 @@ mod tests {
         assert_eq!(egt_file.probe(&position).unwrap(), outcome);
 
         // Probe again (triggers on-demand decompression from file)
-        let mut another_egt_file = EgtFile::new_from_file(&base_path, "KP_K").unwrap();
+        let mut another_egt_file = EgtFileReader::new_from_file(&base_path, "KPa_K").unwrap();
         let loaded_outcome = another_egt_file.probe(&position).unwrap();
         assert_eq!(loaded_outcome, outcome);
     }
@@ -1381,7 +1250,7 @@ mod tests {
     #[test]
     fn resaving_disk_backed_file() {
         let dir = crate::TestDir::new("resaving_disk_backed_file");
-        let mut file = EgtFile::new(&dir.0, "KP_K").unwrap();
+        let mut file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
         let mut values = vec![MaybeDtcOutcome::INVALID; file.index_range];
         for (idx, value) in values.iter_mut().enumerate() {
             *value = if idx % 3 == 0 {
@@ -1394,101 +1263,138 @@ mod tests {
             file.write_to_index(idx, value).unwrap();
         }
         file.save_to_file().unwrap();
-        let mut reader = EgtFile::new_from_file(&dir.0, "KP_K").unwrap();
-        assert_eq!(reader.num_frames(), file.egts.len());
+        let mut reader = EgtFileReader::new_from_file(&dir.0, "KPa_K").unwrap();
+        assert_eq!(
+            reader.num_frames(),
+            file.index_range.div_ceil(file.frame_size)
+        );
         for idx in 0..reader.index_range {
             assert_eq!(reader.read_from_index(idx).unwrap(), values[idx]);
         }
         // Saving must not truncate disk-backed source data, including uncached frames.
         reader.frames.fill(FrameState::CompressedOnFile);
         reader.save_to_file().unwrap();
-        let mut reloaded = EgtFile::new_from_file(&dir.0, "KP_K").unwrap();
+        let mut reloaded = EgtFileReader::new_from_file(&dir.0, "KPa_K").unwrap();
         for idx in 0..reloaded.index_range {
             assert_eq!(reloaded.read_from_index(idx).unwrap(), values[idx]);
         }
-        assert_eq!(reloaded.frame_chunk(reloaded.index_range, reloaded.index_range).unwrap(), &[]);
-
+        assert_eq!(
+            reloaded
+                .frame_chunk(reloaded.index_range, reloaded.index_range)
+                .unwrap(),
+            &[]
+        );
     }
 
     #[test]
     fn full_frames_short_tail_and_table_boundaries() {
         let dir = crate::TestDir::new("frame_boundaries");
-        let mut file = EgtFile::new(&dir.0, "KQ_KR").unwrap();
+        let mut file = EgtFileReader::new(&dir.0, "KQ_KR").unwrap();
         assert!(file.num_frames() > 1);
         assert_eq!(file.frame_layout.last().unwrap().len, 174420);
-        let indexes = [0, DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE,
-            DEFAULT_FRAME_SIZE + 1, file.index_range - 1];
+        let indexes = [
+            0,
+            DEFAULT_FRAME_SIZE - 1,
+            DEFAULT_FRAME_SIZE,
+            DEFAULT_FRAME_SIZE + 1,
+            file.index_range - 1,
+        ];
         for (n, &idx) in indexes.iter().enumerate() {
-            file.write_to_index(idx, MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1)).unwrap();
+            file.write_to_index(
+                idx,
+                MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1),
+            )
+            .unwrap();
         }
-        assert!(file.frame_chunk(DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE + 1).is_err());
+        assert!(
+            file.frame_chunk(DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE + 1)
+                .is_err()
+        );
         file.save_to_file().unwrap();
-        let mut reader = EgtFile::new_from_file(&dir.0, "KQ_KR").unwrap();
+        let mut reader = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
         for (n, &idx) in indexes.iter().enumerate() {
-            assert_eq!(reader.read_from_index(idx).unwrap(),
-                MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1));
+            assert_eq!(
+                reader.read_from_index(idx).unwrap(),
+                MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
+            );
         }
-        let pawnful = EgtFile::new(&dir.0, "KP_K").unwrap();
-        assert_eq!(pawnful.num_frames(), pawnful.egts.len());
-        for (idx, frame) in pawnful.frame_layout.iter().enumerate() {
-            assert_eq!(frame.start, pawnful.get_global_index(idx, 0));
-            assert_eq!(frame.len, pawnful.egts[idx].index_range());
-        }
+        let pawnful = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
+        assert_eq!(pawnful.num_frames(), 1);
+        assert_eq!(pawnful.frame_layout[0].start, 0);
+        assert_eq!(pawnful.frame_layout[0].len, pawnful.index_range);
+        assert!(file.read_from_index(file.index_range).is_err());
+        assert!(
+            file.write_to_index(file.index_range, MaybeDtcOutcome::DRAW)
+                .is_err()
+        );
+        assert!(file.frame_chunk(1, 0).is_err());
+        assert!(file.frame_chunk(0, file.index_range + 1).is_err());
     }
 
     #[test]
     fn rejects_invalid_frame_layout() {
         let dir = crate::TestDir::new("invalid_frame_layout");
-        let file = EgtFile::new(&dir.0, "K_K").unwrap();
-        for bytes in [0, 3, 922, 926, DEFAULT_FRAME_SIZE * 2, DEFAULT_FRAME_SIZE * 2 + 2] {
-            let output = std::fs::File::create(dir.0.join("K_K.ggegt")).unwrap();
+        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
+        for bytes in [
+            0,
+            3,
+            922,
+            926,
+            DEFAULT_FRAME_SIZE * 2,
+            DEFAULT_FRAME_SIZE * 2 + 2,
+        ] {
+            let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
             encoder.compress(&vec![0; bytes]).unwrap();
             encoder.finish().unwrap();
-            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
         }
         // A correct payload with an extra empty frame has the wrong frame count.
-        let output = std::fs::File::create(dir.0.join("K_K.ggegt")).unwrap();
+        let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
         let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
         encoder.compress(&vec![0; file.index_range * 2]).unwrap();
         encoder.end_frame().unwrap();
         encoder.finish().unwrap();
-        assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+        assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
     }
 
     #[test]
     fn rejects_malformed_seek_table_suffixes() {
         let dir = crate::TestDir::new("malformed_seek_table_suffixes");
-        let path = dir.0.join("K_K.ggegt");
-        let mut file = EgtFile::new(&dir.0, "K_K").unwrap();
+        let path = table_path(&dir.0, "K_K");
+        let mut file = EgtFileReader::new(&dir.0, "K_K").unwrap();
         file.save_to_file().unwrap();
         let valid = std::fs::read(&path).unwrap();
         let table_start = valid.len() - 25;
 
         for length in [0, 8, 9, 24] {
             std::fs::write(&path, &valid[valid.len() - length..]).unwrap();
-            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
         }
         // Reject the declared count before zeekstd can allocate from it.
         let mut inflated = valid.clone();
         let count_start = inflated.len() - 9;
         inflated[count_start..count_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&path, inflated).unwrap();
-        assert!(matches!(EgtFile::new_from_file(&dir.0, "K_K"),
-            Err(EgtError::Internal("invalid tablebase frame count"))));
+        assert!(matches!(
+            EgtFileReader::new_from_file(&dir.0, "K_K"),
+            Err(EgtError::Internal("invalid tablebase frame count"))
+        ));
 
         // zeekstd, rather than our loader, validates magic and reserved bits.
         for offset in [valid.len() - 1, valid.len() - 5, table_start] {
             let mut corrupt = valid.clone();
             corrupt[offset] ^= 0x04;
             std::fs::write(&path, corrupt).unwrap();
-            assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
         }
         let mut prefixed = vec![0];
         prefixed.extend_from_slice(&valid);
         std::fs::write(&path, prefixed).unwrap();
-        assert!(matches!(EgtFile::new_from_file(&dir.0, "K_K"),
-            Err(EgtError::Internal("invalid tablebase compressed length"))));
+        assert!(matches!(
+            EgtFileReader::new_from_file(&dir.0, "K_K"),
+            Err(EgtError::Internal("invalid tablebase compressed length"))
+        ));
 
         // The reader deliberately accepts only our checksum-free seek-table format.
         let mut checksummed = valid.clone();
@@ -1497,31 +1403,42 @@ mod tests {
         let descriptor = checksummed.len() - 5;
         checksummed[descriptor] |= 0x80;
         std::fs::write(&path, checksummed).unwrap();
-        assert!(EgtFile::new_from_file(&dir.0, "K_K").is_err());
+        assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
 
         std::fs::write(&path, valid).unwrap();
-        EgtFile::new_from_file(&dir.0, "K_K").unwrap();
+        EgtFileReader::new_from_file(&dir.0, "K_K").unwrap();
     }
 
     #[test]
     fn rejects_short_frame_range() {
         let dir = crate::TestDir::new("short_frame_range");
-        let path = dir.0.join("K_K.ggegt");
-        let mut file = EgtFile::new(&dir.0, "K_K").unwrap();
+        let path = table_path(&dir.0, "K_K");
+        let mut file = EgtFileReader::new(&dir.0, "K_K").unwrap();
         file.save_to_file().unwrap();
-        let mut reader = EgtFile::new_from_file(&dir.0, "K_K").unwrap();
-        let frame_end = reader.seek_table.as_ref().unwrap().frame_end_comp(0).unwrap();
-        std::fs::OpenOptions::new().write(true).open(path).unwrap()
-            .set_len(frame_end - 1).unwrap();
-        assert!(matches!(reader.read_from_index(0),
-            Err(EgtError::Internal("truncated tablebase range"))));
+        let mut reader = EgtFileReader::new_from_file(&dir.0, "K_K").unwrap();
+        let frame_end = reader
+            .seek_table
+            .as_ref()
+            .unwrap()
+            .frame_end_comp(0)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(frame_end - 1)
+            .unwrap();
+        assert!(matches!(
+            reader.read_from_index(0),
+            Err(EgtError::Internal("truncated tablebase range"))
+        ));
     }
 
     #[test]
     fn egt_memory_compression_decompression() {
         let test_dir = crate::TestDir::new("egt_memory_compression_decompression");
         let path = test_dir.0.clone();
-        let mut egt_file = EgtFile::new(&path, "KP_K").unwrap();
+        let mut egt_file = EgtFileReader::new(&path, "KPa_K").unwrap();
 
         // Sample a position
         let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
@@ -1534,7 +1451,7 @@ mod tests {
         for f in 0..egt_file.frames.len() {
             egt_file.ensure_compressed(f).unwrap();
             match egt_file.frames[f] {
-                FrameState::Compressed(_) => {},
+                FrameState::Compressed(_) => {}
                 _ => panic!(),
             }
         }

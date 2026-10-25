@@ -62,6 +62,11 @@ impl Egt {
     /// Within a file, STM tokens follow ascending normalized rank and SNTM
     /// tokens descending rank. Noncanonical piece order is rejected.
     pub fn from_tablename(tablename: &str) -> EgtResult<Self> {
+        Self::from_elements(Self::parse_elements(tablename)?)
+    }
+
+    /// Parses and validates a descriptor without constructing an indexing plan.
+    pub(crate) fn parse_elements(tablename: &str) -> EgtResult<Vec<EgtElement>> {
         let invalid = |reason| EgtError::InvalidEndgameName {
             name: tablename.to_owned(),
             reason,
@@ -149,16 +154,17 @@ impl Egt {
                 order,
             });
         }
-        let egt = Self::from_elements(elements).map_err(|error| match error {
+        elements.sort();
+        crate::piece_set::validate_elements(&elements).map_err(|error| match error {
             EgtError::InvalidPieceConfig(reason) => invalid(reason),
             other => other,
         })?;
-        if egt.tablename != tablename {
+        if compute_tablename(&elements) != tablename {
             return Err(invalid(
                 "noncanonical piece order; expected KQRBN then pawns by file",
             ));
         }
-        Ok(egt)
+        Ok(elements)
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
@@ -216,7 +222,7 @@ fn pawn_flags(order: &[EgtSide], side: EgtSide) -> Vec<bool> {
     flags
 }
 
-fn compute_tablename(elements: &[EgtElement]) -> String {
+pub(crate) fn compute_tablename(elements: &[EgtElement]) -> String {
     let mut sides = Vec::new();
     for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
         let mut name = String::from("K");

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Sequential Linux generation benchmarks, using only the Python standard library.
 
-Use a fresh output directory. Dependencies are read from --reference; recursive
-creation and internal verification are disabled. Hashing happens after timing.
-Pawnful references must use the current .v2.ggegt/.v2.json indexing namespace.
+Use a fresh output directory and existing dependencies in --input-path.
+Each selector is benchmarked separately, including its quiet-move twins, with
+internal verification disabled. Hashing hierarchical artifacts happens after
+timing; no comparison against a reference generation is performed.
 """
 
 import argparse
@@ -18,14 +19,8 @@ import time
 
 
 PHASES = re.compile(
-    r"phase timings: init ([\d.]+)s, propagation ([\d.]+)s, finalize ([\d.]+)s"
+    r"phase timings: init ([\d.]+)s, propagation ([\d.]+)s, finalize/publish ([\d.]+)s"
 )
-ASSEMBLY = re.compile(r"output assembly ([\d.]+)s")
-
-
-def artifact_name(material, extension):
-    version = ".v2" if "P" in material else ""
-    return f"{material}{version}.{extension}"
 
 
 def sha256(path):
@@ -56,10 +51,11 @@ def measure(command, log_path, timeout):
         raise RuntimeError(f"Generation exited {child.returncode}; see {log_path}")
     text = log_path.read_text()
     phases = PHASES.findall(text)
-    assembly = ASSEMBLY.findall(text)
-    if len(phases) != 1 or len(assembly) != 1:
-        raise RuntimeError(f"Expected one complete endgame timing record in {log_path}")
-    init, propagation, finalize = map(float, phases[0])
+    if not phases:
+        raise RuntimeError(f"Expected pair timing records in {log_path}")
+    init, propagation, finalize = (
+        sum(float(phase[column]) for phase in phases) for column in range(3)
+    )
     return {
         "wall_s": elapsed,
         "user_s": usage.ru_utime,
@@ -67,17 +63,18 @@ def measure(command, log_path, timeout):
         "peak_rss_mib": usage.ru_maxrss / 1024,
         "init_s": init,
         "propagation_s": propagation,
-        "finalize_s": finalize,
-        "assembly_s": float(assembly[0]),
+        "finalize_publish_s": finalize,
+        "pairs": len(phases),
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--input-path", type=Path, required=True,
+                        help="Existing local dependencies in the current root format")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--endgames", nargs="+", required=True)
+    parser.add_argument("--selectors", nargs="+", required=True)
     parser.add_argument("--threads", nargs="+", type=int, default=[1])
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=600, help="Seconds per generation")
@@ -87,19 +84,14 @@ def main():
     if args.repeats < 1 or min(args.threads) < 1 or args.timeout <= 0:
         parser.error("Repeats, threads, and timeout must be positive")
     binary = args.binary.resolve(strict=True)
-    reference = args.reference.resolve(strict=True)
+    input_path = args.input_path.resolve(strict=True)
     output = args.output.resolve()
-    if not reference.is_dir():
-        parser.error("--reference must be a directory")
-    expected = {}
-    for endgame in args.endgames:
-        parts = endgame.split("_")
-        if len(parts) != 2 or not all(re.fullmatch(r"K[QRBNP]*", p) for p in parts):
-            parser.error(f"Invalid endgame: {endgame}")
-        for name in {endgame, "_".join(reversed(parts))}:
-            for extension in ("ggegt", "json"):
-                path = reference / artifact_name(name, extension)
-                expected[path.name] = sha256(path)
+    if not input_path.is_dir() or not (input_path / "format.json").is_file():
+        parser.error("--input-path must be a current tablebase root with format.json")
+    # Delegate selector validation to the pure theoretical listing action.
+    for selector in args.selectors:
+        subprocess.run([str(binary), "--list", selector], check=True,
+                       stdout=subprocess.DEVNULL, timeout=args.timeout)
     output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parent.parent
     manifest = {
@@ -117,52 +109,46 @@ def main():
             "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
             "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS", "RAYON_NUM_THREADS",
         ) if k in os.environ},
-        "reference": str(reference),
-        "reference_sha256": expected,
+        "input_path": str(input_path),
+        "input_format_sha256": sha256(input_path / "format.json"),
         "repeats": args.repeats,
         "threads": args.threads,
-        "endgames": args.endgames,
+        "selectors": args.selectors,
         "timeout_s": args.timeout,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     results = []
-    hashes_by_endgame = {}
-    for endgame in args.endgames:
+    hashes_by_selector = {}
+    for job, selector in enumerate(args.selectors, start=1):
         for repeat in range(1, args.repeats + 1):
             for threads in args.threads:
-                run = output / f"{endgame}-t{threads}-r{repeat}"
+                run = output / f"job{job}-t{threads}-r{repeat}"
                 run.mkdir()
                 tables = run / "tables"
                 command = [str(binary), "--path", str(tables), "--input-path",
-                           str(reference), "--generate", endgame,
+                           str(input_path), "--generate", selector,
                            "--threads", str(threads), "--noverify"]
-                print(f"Running {endgame}, {threads} thread(s), repeat {repeat}", flush=True)
+                print(f"Running {selector}, {threads} thread(s), repeat {repeat}", flush=True)
                 timing = measure(command, run / "generation.log", args.timeout)
-                hashes = {p.name: sha256(p) for p in sorted(tables.iterdir())}
-                names = {endgame, "_".join(reversed(endgame.split("_")))}
-                expected_names = {artifact_name(name, ext) for name in names for ext in ("ggegt", "json")}
-                if hashes.keys() != expected_names:
-                    raise RuntimeError(f"Unexpected output file set in {tables}")
-                stable = hashes == hashes_by_endgame.setdefault(endgame, hashes)
+                artifacts = sorted(p for p in tables.rglob("*") if p.is_file())
+                hashes = {p.relative_to(tables).as_posix(): sha256(p) for p in artifacts}
+                if "format.json" not in hashes or not any(p.suffix == ".ggegt" for p in artifacts):
+                    raise RuntimeError(f"Expected a format descriptor and table artifacts in {tables}")
+                stable = hashes == hashes_by_selector.setdefault(selector, hashes)
                 record = {
-                    "endgame": endgame, "threads": threads, "repeat": repeat,
+                    "selector": selector, "threads": threads, "repeat": repeat,
                     "command": command, **timing, "sha256": hashes,
-                    "matches_reference": {name: digest == expected[name]
-                                          for name, digest in hashes.items()},
                     "matches_first_run": stable,
                 }
                 (run / "result.json").write_text(json.dumps(record, indent=2) + "\n")
                 results.append(record)
                 (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
                 print(json.dumps({k: record[k] for k in (
-                    "endgame", "threads", "repeat", "init_s", "propagation_s",
-                    "finalize_s", "assembly_s", "wall_s", "peak_rss_mib",
-                    "matches_reference", "matches_first_run",
+                    "selector", "threads", "repeat", "pairs", "init_s", "propagation_s",
+                    "finalize_publish_s", "wall_s", "peak_rss_mib", "matches_first_run",
                 )}), flush=True)
                 if not stable:
-                    raise RuntimeError(f"Output differs between native runs for {endgame}")
-    if not all(all(r["matches_reference"].values()) for r in results):
-        raise SystemExit("Reference hashes differ; inspect file layout/statistics before comparing performance")
+                    raise RuntimeError(f"Output differs between native runs for {selector}")
 
 
 if __name__ == "__main__":

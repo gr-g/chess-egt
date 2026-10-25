@@ -1,4 +1,4 @@
-//! Frame-batched finalization in the solver's Rayon pool, with ordered publication.
+//! Single-table finalization in the caller's Rayon pool, with ordered frames.
 
 use std::io::Write;
 use std::sync::atomic::AtomicU16;
@@ -6,10 +6,11 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use crate::egt::Egt;
-use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFile, MaybeDtcOutcome};
+use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFileReader, MaybeDtcOutcome};
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
-use crate::finalization_stats::{EgtFileStatsBuilder, TableStats};
+use crate::finalization_stats::{EgtStatsBuilder, TableStats};
+use crate::stats::EgtStats;
 
 fn finalize_batch(
     values: &mut [AtomicU16],
@@ -57,122 +58,107 @@ fn finalize_batch(
     ))
 }
 
-pub(crate) struct Finalizer {
-    artifacts: Vec<(EgtFileWriter, EgtFileStatsBuilder)>,
-}
-
-impl Finalizer {
-    pub(crate) fn new(files: &[EgtFile]) -> EgtResult<Self> {
-        let artifacts = files
-            .iter()
-            .map(|file| Ok((EgtFileWriter::new(file)?, EgtFileStatsBuilder::default())))
-            .collect::<EgtResult<_>>()?;
-        Ok(Self { artifacts })
+/// Resolves unknowns to draws, computes statistics, and publishes one table and
+/// its JSON sidecar. Call only after all propagation workers have joined.
+/// Binary and sidecar publication are not an atomic multi-object transaction.
+pub(crate) fn finalize_table(
+    file: &EgtFileReader,
+    mut values: Vec<AtomicU16>,
+    maxima: [u16; 2],
+) -> EgtResult<EgtStats> {
+    if values.len() != file.egt.index_range() {
+        return Err(EgtError::Internal("completed table has wrong length"));
     }
-
-    pub(crate) fn accept_table(
-        &mut self,
-        file_idx: usize,
-        file: &EgtFile,
-        egt_idx: usize,
-        mut values: Vec<AtomicU16>,
-        maxima: [u16; 2],
-    ) -> EgtResult<()> {
-        let egt = &file.egts[egt_idx];
-        if values.len() != egt.index_range() {
-            return Err(EgtError::Internal("completed table has wrong length"));
-        }
-        let frames = values.len().div_ceil(file.frame_size);
-        let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * file.frame_size;
-        // Contiguous batches reuse one encoder each. Indexed collection preserves
-        // frame and example order, independently of worker completion order.
-        let batches: Vec<_> = values
-            .par_chunks_mut(batch_size)
-            .enumerate()
-            .map(|(idx, batch)| {
-                finalize_batch(batch, idx * batch_size, egt, file.frame_size, maxima)
-            })
-            .collect();
-        drop(values);
-        let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
-        let (segments, stats): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
-        let (writer, builder) = &mut self.artifacts[file_idx];
-        writer.write_segments(egt_idx, segments)?;
-        builder.merge_table(egt_idx, maxima[0], maxima[1], stats);
-        Ok(())
-    }
-
-    pub(crate) fn finish_and_publish(mut self, files: &mut [EgtFile]) -> EgtResult<()> {
-        // Validate both orientations before publishing either. As before, the
-        // tablebases and JSON sidecars are not an atomic multi-file transaction.
-        for (writer, _) in &mut self.artifacts {
-            writer.finish()?;
-        }
-        let published = self
-            .artifacts
-            .iter_mut()
-            .map(|(writer, _)| writer.publish())
-            .collect::<EgtResult<Vec<_>>>()?;
-        for (((_, builder), file), (bytes, sha256)) in
-            self.artifacts.into_iter().zip(files).zip(published)
-        {
-            let stats = builder.build(file, bytes, sha256);
-            file.save_stats(&stats)?;
-            let mut reader = EgtFile::open_in(&file.location, &file.endgame)?;
-            reader.stats = Some(stats);
-            *file = reader;
-        }
-        Ok(())
-    }
+    let mut writer = EgtFileWriter::new(file)?;
+    let frames = values.len().div_ceil(file.frame_size);
+    let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * file.frame_size;
+    // Contiguous batches reuse one encoder each. Indexed collection preserves
+    // frame and example order, independently of worker completion order.
+    let batches: Vec<_> = values
+        .par_chunks_mut(batch_size)
+        .enumerate()
+        .map(|(idx, batch)| {
+            finalize_batch(batch, idx * batch_size, &file.egt, file.frame_size, maxima)
+        })
+        .collect();
+    drop(values);
+    let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
+    let (segments, stats): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
+    let mut builder = EgtStatsBuilder::new(maxima);
+    builder.merge(stats);
+    writer.write_segments(segments)?;
+    writer.finish()?;
+    let (bytes, sha256) = writer.publish()?;
+    let stats = builder.build(file, bytes, sha256);
+    file.save_stats(&stats)?;
+    Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ConversionType;
+    use crate::stats::{INDEXING_VERSION, SCHEMA_VERSION};
 
     #[test]
     fn parallel_batches_match_serial_bytes_and_stats() {
         let mut results = Vec::new();
         for threads in [1, 4, 8] {
             let dir = crate::TestDir::new(&format!("finalization_t{threads}"));
-            let file = EgtFile::new(&dir.0, "KQ_KR").unwrap();
+            let file = EgtFileReader::new(&dir.0, "KQ_KR").unwrap();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
             pool.install(|| {
-                let mut finalizer = Finalizer::new(std::slice::from_ref(&file)).unwrap();
-                for idx in 0..file.egts.len() {
-                    let values = (0..file.egts[idx].index_range())
-                        .map(|i| {
-                            let outcome = match i % 4 {
-                                0 => MaybeDtcOutcome::INVALID,
-                                1 => MaybeDtcOutcome::new_unknown(17),
-                                2 => MaybeDtcOutcome::new_win(ConversionType::Capture, 3),
-                                _ => MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
-                            };
-                            AtomicU16::new(outcome.to_u16())
-                        })
-                        .collect();
-                    // Maxima above the synthetic distances avoid large EPD lists.
-                    finalizer
-                        .accept_table(0, &file, idx, values, [7, 9])
-                        .unwrap();
-                }
-                let mut files = [file];
-                finalizer.finish_and_publish(&mut files).unwrap();
+                let values = (0..file.egt.index_range())
+                    .map(|i| {
+                        let outcome = match i % 4 {
+                            0 => MaybeDtcOutcome::INVALID,
+                            1 => MaybeDtcOutcome::new_unknown(17),
+                            2 => MaybeDtcOutcome::new_win(ConversionType::Capture, 3),
+                            _ => MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
+                        };
+                        AtomicU16::new(outcome.to_u16())
+                    })
+                    .collect();
+                // Maxima above the synthetic distances avoid large EPD lists.
+                let stats = finalize_table(&file, values, [7, 9]).unwrap();
+                assert_eq!(stats.schema_version, SCHEMA_VERSION);
+                assert_eq!(stats.indexing_version, INDEXING_VERSION);
+                assert_eq!(stats.tablename, "KQ_KR");
                 assert_eq!(
-                    files[0].read_from_index(0).unwrap(),
+                    stats.unique_positions + stats.invalid_or_redundant,
+                    file.index_range
+                );
+                let mut published = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
+                assert_eq!(
+                    published.read_from_index(0).unwrap(),
                     MaybeDtcOutcome::INVALID
                 );
-                assert_eq!(files[0].read_from_index(1).unwrap(), MaybeDtcOutcome::DRAW);
+                assert_eq!(published.read_from_index(1).unwrap(), MaybeDtcOutcome::DRAW);
+                assert_eq!(
+                    crate::stats::read_stats(&file.location, &file.id).unwrap(),
+                    stats
+                );
                 results.push((
-                    std::fs::read(dir.0.join("KQ_KR.ggegt")).unwrap(),
-                    std::fs::read(dir.0.join("KQ_KR.json")).unwrap(),
+                    std::fs::read(dir.0.join(file.id.relative_path("ggegt"))).unwrap(),
+                    std::fs::read(dir.0.join(file.id.relative_path("json"))).unwrap(),
                 ));
             });
         }
         assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn wrong_length_does_not_publish() {
+        let dir = crate::TestDir::new("finalization_wrong_length");
+        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
+        assert!(matches!(
+            finalize_table(&file, Vec::new(), [0, 0]),
+            Err(EgtError::Internal("completed table has wrong length"))
+        ));
+        assert!(!dir.0.join(file.id.relative_path("ggegt")).exists());
+        assert!(!dir.0.join(file.id.relative_path("json")).exists());
     }
 }
