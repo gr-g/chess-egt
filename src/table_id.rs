@@ -16,6 +16,8 @@ use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 
 /// Identity of one oriented table, without an indexer, frames, or storage access.
+/// Ordered by piece count, pawn count, then name in KQRBNP order ignoring `o`
+/// markers. Canonical elements break ties between opposition variants.
 #[derive(Clone, Debug)]
 pub struct TableId {
     name: String,
@@ -35,7 +37,24 @@ impl PartialOrd for TableId {
 }
 impl Ord for TableId {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.name.cmp(&other.name)
+        fn name_key(name: &str) -> impl Iterator<Item = u8> + '_ {
+            name.bytes()
+                .filter(|&byte| byte != b'o')
+                .map(|byte| match byte {
+                    b'K' => 0,
+                    b'Q' => 1,
+                    b'R' => 2,
+                    b'B' => 3,
+                    b'N' => 4,
+                    b'P' => 5,
+                    _ => byte,
+                })
+        }
+
+        (self.n_pieces(), self.n_pawns())
+            .cmp(&(other.n_pieces(), other.n_pawns()))
+            .then_with(|| name_key(&self.name).cmp(name_key(&other.name)))
+            .then_with(|| self.elements.cmp(&other.elements))
     }
 }
 impl Hash for TableId {
@@ -452,6 +471,40 @@ mod tests {
         }
         let noncanonical = Egt::parse_elements("KPh_K").unwrap();
         assert!(TableId::from_elements(noncanonical).is_err());
+    }
+
+    #[test]
+    fn table_order_is_not_indexing_element_order() {
+        for (first, second) in [("KR_K", "K_KQ"), ("KQQ_K", "KQR_K")] {
+            let first = TableId::parse(first).unwrap();
+            let second = TableId::parse(second).unwrap();
+            assert!(first < second);
+            assert!(first.elements > second.elements);
+        }
+        let opposed = TableId::parse("KPao_KPao").unwrap();
+        let unopposed = TableId::parse("KPa_KPa").unwrap();
+        assert_eq!(
+            opposed.cmp(&unopposed),
+            opposed.elements.cmp(&unopposed.elements)
+        );
+        assert!(opposed < unopposed);
+    }
+
+    #[test]
+    fn ordering_is_consistent_with_identity() {
+        let tables = crate::resolve_selectors(&["2/", "3/", "4/", "KPP_KP"]).unwrap();
+        for a in &tables {
+            for b in &tables {
+                assert_eq!(a.cmp(b).is_eq(), a == b);
+                assert_eq!(a.cmp(b), b.cmp(a).reverse());
+                assert_eq!(a.partial_cmp(b), Some(a.cmp(b)));
+                assert_eq!(a.elements == b.elements, a == b);
+            }
+            assert_eq!(
+                a.cmp(&TableId::parse(a.tablename()).unwrap()),
+                Ordering::Equal
+            );
+        }
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //!
 //! Generation adds a selected table's quiet-move twin, but does not recursively
 //! add capture/promotion dependencies. Those prerequisites must already exist
-//! or be explicitly selected. Plans sort by piece count, then pawn count, so
-//! explicitly selected capture/promotion prerequisites precede their consumers.
+//! or be explicitly selected. Selections and plans sort by piece count, then
+//! pawn count, then name in KQRBNP order, so explicitly selected capture/promotion
+//! prerequisites precede their consumers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -236,7 +237,8 @@ impl TableSelector {
         })
     }
 
-    /// Returns identities in ascending table-name order, independently of I/O.
+    /// Returns identities in dependency order (pieces, then pawns), with
+    /// table names ordered by KQRBNP, independently of I/O.
     pub fn resolve(&self) -> EgtResult<Vec<TableId>> {
         let tables = match &self.target {
             Target::Exact(table) => vec![table.clone()],
@@ -267,7 +269,8 @@ impl TableSelector {
     }
 }
 
-/// Union of selectors, deduplicated and sorted by exact table name.
+/// Union of selectors, deduplicated and sorted by pieces, then pawns,
+/// then table name using KQRBNP piece order, grouping opposition variants.
 pub fn resolve_selectors(selectors: &[&str]) -> EgtResult<Vec<TableId>> {
     let mut tables = BTreeSet::new();
     for selector in selectors {
@@ -280,7 +283,8 @@ pub fn resolve_selectors(selectors: &[&str]) -> EgtResult<Vec<TableId>> {
 #[derive(Clone, Debug)]
 pub struct GenerationPlan {
     /// Lexically smaller name first; self-twins have no second table.
-    /// Pairs sort by total pieces, then pawns, then representative name.
+    /// Pairs use selection order: total pieces, then pawns, then representative
+    /// name in KQRBNP order.
     pub pairs: Vec<(TableId, Option<TableId>)>,
 }
 
@@ -298,15 +302,9 @@ impl GenerationPlan {
             };
             pairs.insert(first, second);
         }
-        let mut pairs: Vec<_> = pairs.into_iter().collect();
-        pairs.sort_by(|(a, _), (b, _)| {
-            (a.n_pieces(), a.n_pawns(), a.tablename()).cmp(&(
-                b.n_pieces(),
-                b.n_pawns(),
-                b.tablename(),
-            ))
-        });
-        Ok(Self { pairs })
+        Ok(Self {
+            pairs: pairs.into_iter().collect(),
+        })
     }
 }
 
@@ -454,6 +452,7 @@ mod tests {
             let tables = resolve(&n.to_string());
             assert_eq!(tables.len(), expected, "{n} pieces");
             assert!(tables.windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(tables.iter().collect::<BTreeSet<_>>().len(), expected);
             assert!(tables.iter().all(|table| table.n_pieces() == n));
             let from_materials = resolve_selectors(
                 &material_names(n)
@@ -494,6 +493,54 @@ mod tests {
     }
 
     #[test]
+    fn selections_follow_dependency_and_piece_order() {
+        let tables = resolve_selectors(&["3/", "2/", "KQ_K"]).unwrap();
+        assert_eq!(
+            names(&tables),
+            [
+                "K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "K_KQ", "K_KR", "K_KB", "K_KN", "KPa_K",
+                "KPb_K", "KPc_K", "KPd_K", "K_KPa", "K_KPb", "K_KPc", "K_KPd",
+            ]
+        );
+        assert_eq!(&tables[1..], resolve("3/"));
+        assert_eq!(tables, resolve_selectors(&["2/", "3/"]).unwrap());
+
+        // Fewer pieces take priority over fewer pawns; promotions precede pawns
+        // even when their names would sort later in the piece alphabet.
+        let tables = resolve_selectors(&["KQPa_K", "KPa_K", "K_KN", "KQQ_K"]).unwrap();
+        assert_eq!(names(&tables), ["K_KN", "KPa_K", "KQQ_K", "KQPa_K"]);
+        assert_eq!(names(&resolve("KQPa_K")), ["KQPa_K"]);
+    }
+
+    #[test]
+    fn opposition_variants_are_adjacent() {
+        let tables = resolve("KP_KP");
+        let plan = GenerationPlan::new(tables.clone()).unwrap();
+        let representatives: Vec<_> = plan.pairs.into_iter().map(|(table, _)| table).collect();
+        for tables in [&tables, &representatives] {
+            for file in ['a', 'b', 'c', 'd'] {
+                let unopposed = format!("KP{file}_KP{file}");
+                let opposed = format!("KP{file}o_KP{file}o");
+                assert!(tables.windows(2).any(|pair| {
+                    pair[0].tablename() == opposed && pair[1].tablename() == unopposed
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn plan_uses_selection_order_for_pair_representatives() {
+        let plan = GenerationPlan::new(resolve_selectors(&["3/", "2/"]).unwrap()).unwrap();
+        let representatives: Vec<_> = plan.pairs.iter().map(|(table, _)| table.clone()).collect();
+        assert_eq!(
+            names(&representatives),
+            [
+                "K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KPa_K", "KPb_K", "KPc_K", "KPd_K"
+            ]
+        );
+    }
+
+    #[test]
     fn plan_adds_twins_deduplicates_and_orders_prerequisites() {
         let selected = resolve_selectors(&[
             "KPa_K", "K_KPa", "KQ_K", "K_K", "KPd_KPe", "KQR_K", "KQPa_K",
@@ -501,12 +548,7 @@ mod tests {
         .unwrap();
         let plan = GenerationPlan::new(selected.clone()).unwrap();
         assert_eq!(plan.pairs.len(), 6);
-        let keys: Vec<_> = plan
-            .pairs
-            .iter()
-            .map(|(a, _)| (a.n_pieces(), a.n_pawns(), a.tablename()))
-            .collect();
-        assert!(keys.windows(2).all(|w| w[0] < w[1]));
+        assert!(plan.pairs.windows(2).all(|w| w[0].0 < w[1].0));
         for (first, second) in &plan.pairs {
             match second {
                 Some(second) => {

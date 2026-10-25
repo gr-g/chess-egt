@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     stats: Vec<String>,
 
-    /// List canonical table names.
+    /// List canonical table names by piece count, pawn count, then Q/R/B/N/P order.
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     list: Vec<String>,
 
