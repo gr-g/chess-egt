@@ -15,9 +15,8 @@ Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 Generated 176 tables: 125544710 unique positions, 13.31 MiB in 00h02m27s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 == All 5 pieces ==
-Generated all 5-pieces endgames, corresponding to 26040612459 unique positions.
-Time: 09h55m28s.
-Size on disk: 3592.53MiB (1.16 bits/pos on average, lowest compression for KBB_KQ: 4.23 bits/pos).
+Generated 1496 tables: 26040612459 unique positions, 3592.45 MiB in 10h32m58s.
+Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
