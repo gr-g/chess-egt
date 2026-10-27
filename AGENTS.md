@@ -12,10 +12,10 @@ Current generation results (with --threads=2, --noverify):
 Generated 17 tables: 368330 unique positions, 0.04 MiB in 00h00m01s.
 Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 == All 4 pieces ==
-Generated 176 tables: 125544710 unique positions, 13.31 MiB in 00h02m27s.
+Generated 176 tables: 125544710 unique positions, 13.31 MiB in 00h02m18s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 == All 5 pieces ==
-Generated 1496 tables: 26040612459 unique positions, 3592.45 MiB in 10h32m58s.
+Generated 1496 tables: 26040612459 unique positions, 3592.45 MiB in 09h38m05s.
 Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO

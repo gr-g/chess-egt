@@ -176,6 +176,9 @@ pub struct Indexer {
     // The total number of positions indexed in this endgame table.
     pub index_range: usize,
 
+    // Coordinate slots in normalized colors: White denotes the side to move.
+    pieces: ArrayVec<Piece, MAX_PIECES>,
+
     // The following field provides information on the en passant status.
     ep_options: Vec<EnpassantOption>,
 
@@ -209,6 +212,17 @@ impl Indexer {
 
         // Compute n_squares, combinations, span.
         Self::compute_piece_squares(&mut piece_set);
+        let mut pieces = ArrayVec::new();
+        for p in &piece_set {
+            let (role, sides): (_, ArrayVec<_, MAX_PIECES>) = match &p.element {
+                EgtElement::PawnGroup { order, .. } => (Role::Pawn, order.iter().rev().copied().collect()),
+                EgtElement::PieceGroup { role, side, multiplicity } => (*role, std::iter::repeat_n(*side, *multiplicity).collect()),
+            };
+            pieces.extend(sides.into_iter().map(|side| Piece {
+                role,
+                color: if side == EgtSide::SideToMove { Color::White } else { Color::Black },
+            }));
+        }
 
         let combinations_without_ep = piece_set.iter().map(|p| p.combinations).product();
 
@@ -234,6 +248,7 @@ impl Indexer {
             n_pawns,
             n_pawn_groups,
             index_range,
+            pieces,
             ep_options,
             nonking_combinations,
         })
@@ -525,24 +540,17 @@ impl Indexer {
         for p in self.piece_set(ep_idx) {
             match &p.element {
                 EgtElement::PawnGroup { file, order } => {
-                    // Gather both colors before sorting in normalized rank order.
+                    // Descending normalized ranks: White descends squares, Black ascends.
                     // Piece groups describe target files, not reflected source files.
                     let source_file = if REFLECTED { File::new(7 - file.to_u32()) } else { *file };
-                    let bb = position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file);
+                    let mut bb = position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file);
                     assert_eq!(bb.count(), order.len(), "pawn file does not match the piece set");
-                    let mut pawns: ArrayVec<_, 6> = bb.into_iter().map(|square| {
+                    for (i, expected_side) in (p.span.0..p.span.1).zip(order.iter().rev()) {
+                        let square = if position.turn() == Color::Black { bb.pop_front() } else { bb.pop_back() }.unwrap();
+                        debug_assert_eq!(position.board().by_color(position.turn()).contains(square),
+                            *expected_side == EgtSide::SideToMove, "pawn color order does not match the piece set");
                         let rank = square.rank().to_usize();
                         let rank = if position.turn() == Color::Black { 7 - rank } else { rank };
-                        let side = if position.board().by_color(position.turn()).contains(square) {
-                            EgtSide::SideToMove
-                        } else {
-                            EgtSide::SideNotToMove
-                        };
-                        (rank, side)
-                    }).collect();
-                    pawns.sort_unstable_by_key(|&(rank, _)| Reverse(rank));
-                    for ((i, &(rank, side)), expected_side) in (p.span.0..p.span.1).zip(pawns.iter()).zip(order.iter().rev()) {
-                        debug_assert_eq!(side, *expected_side, "pawn color order does not match the piece set");
                         buffer_coord[i] = (rank, file.to_usize());
                     }
                 }
@@ -563,34 +571,15 @@ impl Indexer {
 
     // Builds a position using the coordinates stored in `buffer_coord`.
     fn coord_to_position(&self, ep_idx: usize, buffer_coord: &CoordBuf, side_to_move: Color) -> Option<Chess> {
-        // We need a mutable copy of the coordinates because we may flip the ranks
-        // for the side-to-move perspective. The flip is undone before returning,
-        // but to avoid mutating the caller's buffer we operate on a local copy.
-        let mut coord: CoordBuf = buffer_coord.clone();
-
-        if self.n_pawns > 0 && side_to_move == Color::Black {
-            // The ranks are encoded from the point of view of the side to move. Switch them up.
-            for i in 0..self.n_pieces {
-                coord[i].0 = 7 - coord[i].0;
-            }
-        }
-
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
-        for p in self.piece_set(ep_idx) {
-            for i in p.span.0..p.span.1 {
-                let (role, side) = match &p.element {
-                    EgtElement::PawnGroup { order, .. } => (Role::Pawn, order[p.span.1 - 1 - i]),
-                    EgtElement::PieceGroup { role, side, .. } => (*role, *side),
-                };
-                let color = match side {
-                    EgtSide::SideToMove => side_to_move,
-                    EgtSide::SideNotToMove => !side_to_move,
-                };
-                let (r, f) = coord[i];
-                let square = Square::from_coords(File::new(f as u32), Rank::new(r as u32));
-                setup.board.set_piece_at(square, Piece { color, role });
+        for (&(mut r, f), mut piece) in buffer_coord.iter().zip(self.pieces.iter().copied()) {
+            if side_to_move == Color::Black {
+                piece.color = !piece.color;
+                if self.n_pawns > 0 { r = 7 - r; }
             }
+            let square = Square::from_coords(File::new(f as u32), Rank::new(r as u32));
+            setup.board.set_piece_at(square, piece);
         }
 
         let ep_square = if let Some(file) = self.ep_option(ep_idx).file {
@@ -635,9 +624,9 @@ impl Indexer {
         }
     }
 
-    // Sort coordinates for repeated pieces from highest to lowest.
+    // Sort repeated non-pawns from highest to lowest; pawns are already ordered.
     fn sort_coord_repeated_pieces(&self, ep_idx: usize, buffer_coord: &mut CoordBuf) {
-        for p in self.piece_set(ep_idx) {
+        for p in &self.piece_set(ep_idx)[self.n_pawn_groups..] {
             if p.span.1 - p.span.0 > 1 {
                 buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
             }
@@ -828,6 +817,8 @@ mod tests {
                             indexer.position_to_coord::<false>(0, &mut gathered, &position);
                             assert_eq!(gathered, coord);
                             let index = indexer.position_to_index(&position);
+                            let reflected = crate::egt_file::mirror_horizontally(&position).unwrap();
+                            assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                             assert_eq!(indexer.position_from_index(index, turn), Some(position));
                             legal_positions += 1;
                         }

@@ -105,7 +105,7 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
    - The indexer checks whether a legal en-passant capture is available. A raw EP square without a legal capture is equivalent to no EP.
    - If so, it selects the corresponding sub-table and adjusts the `index_offset`. The SNTM victim is the highest pawn on its file in STM-normalized ranks, fixed on rank 5. The remaining $k-1$ pawns on that file occupy ranks 2–4, contributing $\binom{3}{k-1}$ combinations. The sequence must end in SNTM and contain at most four pawns. Decoding still checks that an en-passant capture is legal.
    - The board position is converted into coordinates `(rank, file)` for each piece.
-   - Coordinates are sorted descending within each group: identical non-pawn pieces share a group, while all pawns on one file share a group regardless of color. Pawn colors are assigned to sorted rank slots by the stored sequence.
+   - Coordinates are ordered descending within each group. Pawns are gathered directly in rank order on their file; only repeated non-pawn pieces need sorting. Decoding uses precomputed piece/color slots for each pawn sequence and non-pawn group.
    - If there are no pawns, the first king's position is restricted to 10 canonical squares (representing one octant of the board) using horizontal, vertical, and diagonal reflections. All other pieces are reflected accordingly to preserve relative positions.
    - Each coordinate is converted to a raw square index in `0..64` (rank x 8 + file).
    - Since no two pieces can occupy the same square, the raw square indices are compacted to remove "holes" caused by already occupied squares. For each piece, its index is adjusted by subtracting the number of preceding pieces that occupy a lower square index. This maps the indices sequentially to ranges `[0..64, 0..63, 0..62, 0..61, ...]`.
@@ -121,8 +121,10 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
      $$\text{local\_index} = \text{index\_offset} + \text{aggregated\_combinations}$$
 
 ### 3.2 Table identity and storage
-`TableId` identifies one canonical table without storage or a full indexing plan.
-`Egt` supplies its logical indexing; `EgtFileReader` holds one `Egt`, its identity,
+`TableId` is a validated canonical name (`String`); logical elements are parsed
+only for construction and planning. Probes build names in a stack buffer and
+borrow them for cache lookup, allocating an owned name only on a cache miss.
+`Egt` supplies the logical indexing; `EgtFileReader` holds one `Egt`, its identity,
 and its storage/frame cache.
 
 ## 4. File Format & Compression

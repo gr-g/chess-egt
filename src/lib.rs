@@ -174,7 +174,7 @@ impl EgtGenerator {
                         .stats
                         .take()
                         .ok_or(EgtError::Internal("stats missing after generation"))?;
-                    names.push(file.tablename.clone());
+                    names.push(file.id.tablename().to_owned());
                     pair_stats.push(stats);
                     // Generation and verification share dependency frames. Pin
                     // both outputs so input artifacts cannot shadow either one.
@@ -259,15 +259,15 @@ impl EgtProber {
     }
 
     pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
-        let (id, reflected) = TableId::from_position(position)?;
-        let endgame = id.tablename().to_owned();
-        if !self.cache.contains_key(&endgame) {
-            let file = self.load_existing(&endgame)?;
-            self.cache.insert(endgame.clone(), file);
+        let (name, reflected) = table_id::position_table_name(position)?;
+        let endgame = name.as_str();
+        if !self.cache.contains_key(endgame) {
+            let file = self.load_existing(endgame)?;
+            self.cache.insert(endgame.to_owned(), file);
         }
         let file = self
             .cache
-            .get_mut(&endgame)
+            .get_mut(endgame)
             .ok_or(EgtError::Internal("cache entry missing after insert"))?;
         let idx = file.map_routed_position_to_index(position, reflected)?;
         let outcome = file.read_from_index(idx)?;

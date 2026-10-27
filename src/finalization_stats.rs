@@ -109,7 +109,7 @@ impl EgtStatsBuilder {
         EgtStats {
             schema_version: SCHEMA_VERSION,
             indexing_version: INDEXING_VERSION,
-            tablename: file.tablename.clone(),
+            tablename: file.id.tablename().to_owned(),
             bytes,
             sha256,
             index_range: file.index_range,
@@ -135,7 +135,7 @@ mod tests {
     use crate::table_id::TableId;
 
     fn table(name: &str) -> Egt {
-        Egt::from_elements(TableId::parse(name).unwrap().elements().to_vec()).unwrap()
+        Egt::from_elements(TableId::parse(name).unwrap().parse_elements()).unwrap()
     }
 
     #[test]

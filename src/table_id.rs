@@ -1,35 +1,21 @@
-//! Cheap, storage-independent identities for individual canonical tables.
+//! Validated canonical table names and allocation-free position routing.
 //!
-//! Names and element constructors reject noncanonical horizontal orientations.
-//! Position routing and twins canonicalize and report whether files were reflected.
-//! Canonicalization compares the two sides' sorted pawn-file multisets, **not**
-//! color words. When both multisets tie with their reflections, both color-word
-//! orientations remain distinct tables, exactly as in the existing indexing scheme.
+//! Horizontal canonicalization compares pawn-file multisets, not color words.
+//! Reflection ties deliberately retain both color-word orientations.
 
+use arrayvec::ArrayString;
+use shakmaty::{ByRole, Chess, Color, File, Position, Role};
 use std::cmp::Ordering;
-use std::hash::{Hash, Hasher};
 
-use shakmaty::{Chess, Color, File, Position, Role};
-
-use crate::egt::{Egt, compute_tablename};
 use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 
-/// Identity of one oriented table, without an indexer, frames, or storage access.
-/// Ordered by piece count, pawn count, then name in KQRBNP order ignoring `o`
-/// markers. Canonical elements break ties between opposition variants.
-#[derive(Clone, Debug)]
-pub struct TableId {
-    name: String,
-    elements: Vec<EgtElement>,
-}
+type TableName = ArrayString<{ 3 * MAX_PIECES + 1 }>;
 
-impl PartialEq for TableId {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-impl Eq for TableId {}
+/// A validated exact table name, without an indexing plan or storage access.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TableId(String);
+
 impl PartialOrd for TableId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -38,202 +24,112 @@ impl PartialOrd for TableId {
 impl Ord for TableId {
     fn cmp(&self, other: &Self) -> Ordering {
         fn name_key(name: &str) -> impl Iterator<Item = u8> + '_ {
-            name.bytes()
-                .filter(|&byte| byte != b'o')
-                .map(|byte| match byte {
-                    b'K' => 0,
-                    b'Q' => 1,
-                    b'R' => 2,
-                    b'B' => 3,
-                    b'N' => 4,
-                    b'P' => 5,
-                    _ => byte,
-                })
+            name.bytes().filter(|&b| b != b'o').map(|b| match b {
+                b'K' => 0,
+                b'Q' => 1,
+                b'R' => 2,
+                b'B' => 3,
+                b'N' => 4,
+                b'P' => 5,
+                _ => b,
+            })
         }
-
         (self.n_pieces(), self.n_pawns())
             .cmp(&(other.n_pieces(), other.n_pawns()))
-            .then_with(|| name_key(&self.name).cmp(name_key(&other.name)))
-            .then_with(|| self.elements.cmp(&other.elements))
-    }
-}
-impl Hash for TableId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+            .then_with(|| name_key(&self.0).cmp(name_key(&other.0)))
+            .then_with(|| {
+                if self == other {
+                    Ordering::Equal
+                } else {
+                    self.parse_elements().cmp(&other.parse_elements())
+                }
+            })
     }
 }
 
 impl TableId {
-    /// Parses an exact table name, rejecting noncanonical file orientations.
-    /// Uppercase pawn material such as `KP_K` is a selector, not a table name.
+    /// Rejects malformed names and noncanonical horizontal orientations.
     pub fn parse(name: &str) -> EgtResult<Self> {
-        let elements = Egt::parse_elements(name)?;
-        Self::from_elements(elements).map_err(|error| match error {
-            EgtError::InvalidPieceConfig(reason) => EgtError::InvalidEndgameName {
+        let elements = parse_elements(name)?;
+        if PawnKey::from_elements(&elements).canonicalized().1 {
+            return Err(EgtError::InvalidEndgameName {
                 name: name.to_owned(),
-                reason,
-            },
-            other => other,
-        })
+                reason: "noncanonical horizontal pawn-file orientation",
+            });
+        }
+        Ok(Self(name.to_owned()))
     }
 
-    /// Routes a position by material and pawn color order in normalized ranks.
-    /// The flag means the position must be horizontally reflected for indexing.
+    /// Routes a position, returning whether indexing requires file reflection.
     pub fn from_position(position: &Chess) -> EgtResult<(Self, bool)> {
-        if position.board().occupied().count() > MAX_PIECES {
-            return Err(EgtError::InvalidPieceConfig(
-                "at most eight physical pieces are supported",
-            ));
-        }
-        let key = PawnKey::from_position(position);
-        let (key, reflected) = key.canonicalized();
-        let mut elements = key.elements();
-        for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
-            let color = if side == EgtSide::SideToMove {
-                position.turn()
-            } else {
-                !position.turn()
-            };
-            for role in Role::ALL
-                .into_iter()
-                .rev()
-                .filter(|role| *role != Role::Pawn)
-            {
-                let multiplicity =
-                    (position.board().by_role(role) & position.board().by_color(color)).count();
-                if multiplicity != 0 {
-                    elements.push(EgtElement::PieceGroup {
-                        role,
-                        side,
-                        multiplicity,
-                    });
-                }
-            }
-        }
-        Ok((Self::from_elements(elements)?, reflected))
+        let (name, reflected) = position_table_name(position)?;
+        Ok((Self(name.to_string()), reflected))
     }
 
-    /// Sorts and validates elements, rejecting noncanonical horizontal input.
-    pub fn from_elements(mut elements: Vec<EgtElement>) -> EgtResult<Self> {
+    pub fn from_elements(elements: Vec<EgtElement>) -> EgtResult<Self> {
         validate_elements(&elements)?;
         if PawnKey::from_elements(&elements).canonicalized().1 {
             return Err(EgtError::InvalidPieceConfig(
                 "noncanonical horizontal pawn-file orientation",
             ));
         }
-        elements.sort();
-        Ok(Self {
-            name: compute_tablename(&elements),
-            elements,
-        })
+        Ok(Self(compute_tablename(&elements)))
     }
 
-    pub fn elements(&self) -> &[EgtElement] {
-        &self.elements
+    /// Parses logical elements on demand, without constructing an indexing plan.
+    pub fn parse_elements(&self) -> Vec<EgtElement> {
+        parse_elements(&self.0).expect("validated table name")
     }
     pub fn tablename(&self) -> &str {
-        &self.name
+        &self.0
     }
-
-    /// Oriented uppercase material, with STM first (never exchanges the sides).
+    /// Oriented material, retaining STM on the left.
     pub fn material(&self) -> String {
-        let mut names = Vec::new();
-        for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
-            let mut name = String::new();
-            for role in Role::ALL.into_iter().rev() {
-                let count: usize = self
-                    .elements
-                    .iter()
-                    .map(|element| match element {
-                        EgtElement::PieceGroup {
-                            role: r,
-                            side: s,
-                            multiplicity,
-                        } if *r == role && *s == side => *multiplicity,
-                        EgtElement::PawnGroup { order, .. } if role == Role::Pawn => {
-                            order.iter().filter(|s| **s == side).count()
-                        }
-                        _ => 0,
-                    })
-                    .sum();
-                name.extend(std::iter::repeat_n(role.upper_char(), count));
-            }
-            names.push(name);
-        }
-        names.join("_")
+        self.0.chars().filter(|c| !c.is_ascii_lowercase()).collect()
     }
 
-    /// The table reached by a quiet move: exchange sides and reverse normalized
-    /// ranks, then canonicalize files. The flag applies to the successor position.
     pub fn twin(&self) -> EgtResult<(Self, bool)> {
-        let (key, reflected) = PawnKey::from_elements(&self.elements)
-            .twin()
-            .canonicalized();
-        let mut elements = key.elements();
-        elements.extend(self.elements.iter().filter_map(|element| match element {
+        let elements = self.parse_elements();
+        let (key, reflected) = PawnKey::from_elements(&elements).twin().canonicalized();
+        let mut twin = key.elements();
+        twin.extend(elements.into_iter().filter_map(|element| match element {
             EgtElement::PieceGroup {
                 role,
                 side,
                 multiplicity,
             } => Some(EgtElement::PieceGroup {
-                role: *role,
+                role,
                 side: side.reverse(),
-                multiplicity: *multiplicity,
+                multiplicity,
             }),
             _ => None,
         }));
-        Ok((Self::from_elements(elements)?, reflected))
+        Ok((Self::from_elements(twin)?, reflected))
     }
-
     pub fn n_pieces(&self) -> usize {
-        self.elements.iter().map(EgtElement::multiplicity).sum()
+        self.0.bytes().filter(u8::is_ascii_uppercase).count()
     }
     pub fn n_pawns(&self) -> usize {
-        self.elements
-            .iter()
-            .map(|element| match element {
-                EgtElement::PawnGroup { order, .. } => order.len(),
-                _ => 0,
-            })
-            .sum()
+        self.0.bytes().filter(|&b| b == b'P').count()
     }
-
-    /// Mutually opposing pairs: an STM pawn immediately followed by an SNTM
-    /// pawn in ascending normalized rank. Each pair is counted once, not twice.
+    /// Each mutually opposing pair has exactly one opposed STM pawn.
     pub fn opposing_pairs(&self) -> usize {
-        self.elements
-            .iter()
-            .map(|element| match element {
-                EgtElement::PawnGroup { order, .. } => order
-                    .windows(2)
-                    .filter(|pair| pair == &[EgtSide::SideToMove, EgtSide::SideNotToMove])
-                    .count(),
-                _ => 0,
-            })
-            .sum()
+        self.0
+            .split_once('_')
+            .unwrap()
+            .0
+            .bytes()
+            .filter(|&b| b == b'o')
+            .count()
     }
-
     pub(crate) fn side_piece_counts(&self) -> (usize, usize) {
-        let stm = self
-            .elements
-            .iter()
-            .map(|element| match element {
-                EgtElement::PieceGroup {
-                    side: EgtSide::SideToMove,
-                    multiplicity,
-                    ..
-                } => *multiplicity,
-                EgtElement::PawnGroup { order, .. } => {
-                    order.iter().filter(|s| **s == EgtSide::SideToMove).count()
-                }
-                _ => 0,
-            })
-            .sum();
-        (stm, self.n_pieces() - stm)
+        let (a, b) = self.0.split_once('_').unwrap();
+        (
+            a.bytes().filter(u8::is_ascii_uppercase).count(),
+            b.bytes().filter(u8::is_ascii_uppercase).count(),
+        )
     }
-
-    /// Portable relative routing path. `extension` may include a leading dot.
-    /// This only formats a path; it performs no filesystem or object-store I/O.
+    /// Portable relative path; performs no storage I/O.
     pub fn relative_path(&self, extension: &str) -> String {
         let (a, b) = self.side_piece_counts();
         format!(
@@ -243,10 +139,202 @@ impl TableId {
             a.min(b),
             self.opposing_pairs(),
             self.n_pawns(),
-            self.name,
+            self.0,
             extension.trim_start_matches('.')
         )
     }
+}
+
+/// Warm probes borrow this stack name; only cache misses need an owned identity.
+pub(crate) fn position_table_name(position: &Chess) -> EgtResult<(TableName, bool)> {
+    if position.board().occupied().count() > MAX_PIECES {
+        return Err(EgtError::InvalidPieceConfig(
+            "at most eight physical pieces are supported",
+        ));
+    }
+    let (key, reflected) = PawnKey::from_position(position).canonicalized();
+    let name = format_name(key, |side, role| {
+        let color = if side == EgtSide::SideToMove {
+            position.turn()
+        } else {
+            !position.turn()
+        };
+        (position.board().by_role(role) & position.board().by_color(color)).count()
+    });
+    Ok((name, reflected))
+}
+
+pub(crate) fn compute_tablename(elements: &[EgtElement]) -> String {
+    format_name(PawnKey::from_elements(elements), |side, role| {
+        elements
+            .iter()
+            .filter_map(|element| match element {
+                EgtElement::PieceGroup {
+                    role: r,
+                    side: s,
+                    multiplicity,
+                } if *r == role && *s == side => Some(*multiplicity),
+                _ => None,
+            })
+            .sum()
+    })
+    .to_string()
+}
+
+fn format_name(key: PawnKey, count: impl Fn(EgtSide, Role) -> usize) -> TableName {
+    let mut name = TableName::new();
+    for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
+        let stm = side == EgtSide::SideToMove;
+        if !stm {
+            name.push('_');
+        }
+        for role in Role::ALL.into_iter().rev().filter(|r| *r != Role::Pawn) {
+            for _ in 0..count(side, role) {
+                name.push(role.upper_char());
+            }
+        }
+        for (file, word) in key.files.into_iter().enumerate() {
+            let len = word.ilog2() as usize;
+            for slot in 0..len {
+                let i = if stm { slot } else { len - 1 - slot };
+                if (word & (1 << i) == 0) != stm {
+                    continue;
+                }
+                name.push('P');
+                name.push((b'a' + file as u8) as char);
+                let opposed = if stm {
+                    i + 1 < len && word & (1 << (i + 1)) != 0
+                } else {
+                    i > 0 && word & (1 << (i - 1)) == 0
+                };
+                if opposed {
+                    name.push('o');
+                }
+            }
+        }
+    }
+    name
+}
+
+/// Parses and validates a descriptor without constructing an indexing plan.
+pub(crate) fn parse_elements(tablename: &str) -> EgtResult<Vec<EgtElement>> {
+    let invalid = |reason| EgtError::InvalidEndgameName {
+        name: tablename.to_owned(),
+        reason,
+    };
+    let (stm, sntm) = tablename
+        .split_once('_')
+        .ok_or_else(|| invalid("missing '_' separator"))?;
+    let mut elements = Vec::new();
+    let mut flags: [[Vec<bool>; 8]; 2] =
+        std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+
+    for (side_idx, (text, side)) in [(stm, EgtSide::SideToMove), (sntm, EgtSide::SideNotToMove)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut counts = ByRole::new_with(|_| 0usize);
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let role = match c {
+                'K' => Role::King,
+                'Q' => Role::Queen,
+                'R' => Role::Rook,
+                'B' => Role::Bishop,
+                'N' => Role::Knight,
+                'P' => {
+                    let file = match chars.next() {
+                        Some(c @ 'a'..='h') => File::new(c as u32 - 'a' as u32),
+                        _ => return Err(invalid("invalid pawn file specifier")),
+                    };
+                    let opposed = chars.next_if_eq(&'o').is_some();
+                    flags[side_idx][file.to_usize()].push(opposed);
+                    continue;
+                }
+                _ => return Err(invalid("invalid piece character")),
+            };
+            counts[role] += 1;
+        }
+        if counts.king != 1 {
+            return Err(invalid("each side must have exactly one king"));
+        }
+        for role in Role::ALL.into_iter().rev() {
+            if counts[role] != 0 {
+                elements.push(EgtElement::PieceGroup {
+                    role,
+                    side,
+                    multiplicity: counts[role],
+                });
+            }
+        }
+    }
+
+    for file_idx in 0..8 {
+        let stm_flags = &flags[0][file_idx];
+        let sntm_flags = &flags[1][file_idx];
+        let len = stm_flags.len() + sntm_flags.len();
+        if len == 0 {
+            continue;
+        }
+        if len > 6 {
+            return Err(invalid("at most six pawns may occupy a file"));
+        }
+        // There are at most 64 color words on a file. Both sides' ordered
+        // flags together identify the full word, including unopposed pawns.
+        let order = (0usize..1 << len)
+            .find_map(|word| {
+                if word.count_ones() as usize != sntm_flags.len() {
+                    return None;
+                }
+                let order: arrayvec::ArrayVec<EgtSide, 6> = (0..len)
+                    .map(|i| {
+                        if word & (1 << i) == 0 {
+                            EgtSide::SideToMove
+                        } else {
+                            EgtSide::SideNotToMove
+                        }
+                    })
+                    .collect();
+                (pawn_flags(&order, EgtSide::SideToMove) == *stm_flags
+                    && pawn_flags(&order, EgtSide::SideNotToMove) == *sntm_flags)
+                    .then_some(order)
+            })
+            .ok_or_else(|| invalid("inconsistent opposed-pawn flags"))?;
+        elements.push(EgtElement::PawnGroup {
+            file: File::new(file_idx as u32),
+            order,
+        });
+    }
+    elements.sort();
+    crate::piece_set::validate_elements(&elements).map_err(|error| match error {
+        EgtError::InvalidPieceConfig(reason) => invalid(reason),
+        other => other,
+    })?;
+    if compute_tablename(&elements) != tablename {
+        return Err(invalid(
+            "noncanonical piece order; expected KQRBN then pawns by file",
+        ));
+    }
+    Ok(elements)
+}
+
+/// Whether each pawn faces an enemy in the next occupied slot towards promotion.
+/// The result follows that side's traversal order, not board-square order.
+fn pawn_flags(order: &[EgtSide], side: EgtSide) -> Vec<bool> {
+    let mut flags = Vec::new();
+    for (i, &pawn_side) in order.iter().enumerate() {
+        if pawn_side == side {
+            let neighbor = match side {
+                EgtSide::SideToMove => order.get(i + 1),
+                EgtSide::SideNotToMove => i.checked_sub(1).and_then(|j| order.get(j)),
+            };
+            flags.push(neighbor.is_some_and(|&other| other != side));
+        }
+    }
+    if side == EgtSide::SideNotToMove {
+        flags.reverse();
+    }
+    flags
 }
 
 /// Allocation-free pawn color words, copied from the former storage-layer
@@ -277,14 +365,16 @@ impl PawnKey {
         let mut files = [1; 8];
         let enemy = position.board().by_color(!position.turn());
         for (file, word) in files.iter_mut().enumerate() {
-            let pawns =
+            let mut pawns =
                 position.board().pawns() & shakmaty::Bitboard::from_file(File::new(file as u32));
-            let mut squares: arrayvec::ArrayVec<_, 6> = pawns.into_iter().collect();
-            if position.turn() == Color::Black {
-                squares.reverse();
-            }
-            *word = 1 << squares.len();
-            for (i, square) in squares.into_iter().enumerate() {
+            *word = 1 << pawns.count();
+            for i in 0..pawns.count() {
+                let square = if position.turn() == Color::Black {
+                    pawns.pop_back()
+                } else {
+                    pawns.pop_front()
+                }
+                .unwrap();
                 if enemy.contains(square) {
                     *word |= 1 << i;
                 }
@@ -438,6 +528,7 @@ pub(crate) fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egt::Egt;
     use crate::selection::TableSelector;
     use shakmaty::{CastlingMode, fen::Fen};
 
@@ -454,7 +545,7 @@ mod tests {
             let table = TableId::parse(name).unwrap();
             assert_eq!(table.tablename(), name);
             assert_eq!(
-                TableId::from_elements(table.elements().to_vec()).unwrap(),
+                TableId::from_elements(table.parse_elements()).unwrap(),
                 table
             );
         }
@@ -469,7 +560,7 @@ mod tests {
         ] {
             assert!(TableId::parse(name).is_err(), "{name}");
         }
-        let noncanonical = Egt::parse_elements("KPh_K").unwrap();
+        let noncanonical = parse_elements("KPh_K").unwrap();
         assert!(TableId::from_elements(noncanonical).is_err());
     }
 
@@ -479,13 +570,13 @@ mod tests {
             let first = TableId::parse(first).unwrap();
             let second = TableId::parse(second).unwrap();
             assert!(first < second);
-            assert!(first.elements > second.elements);
+            assert!(first.parse_elements() > second.parse_elements());
         }
         let opposed = TableId::parse("KPao_KPao").unwrap();
         let unopposed = TableId::parse("KPa_KPa").unwrap();
         assert_eq!(
             opposed.cmp(&unopposed),
-            opposed.elements.cmp(&unopposed.elements)
+            opposed.parse_elements().cmp(&unopposed.parse_elements())
         );
         assert!(opposed < unopposed);
     }
@@ -498,7 +589,6 @@ mod tests {
                 assert_eq!(a.cmp(b).is_eq(), a == b);
                 assert_eq!(a.cmp(b), b.cmp(a).reverse());
                 assert_eq!(a.partial_cmp(b), Some(a.cmp(b)));
-                assert_eq!(a.elements == b.elements, a == b);
             }
             assert_eq!(
                 a.cmp(&TableId::parse(a.tablename()).unwrap()),
@@ -562,7 +652,7 @@ mod tests {
         let b = TableId::parse("KPaPho_KPaPho").unwrap();
         assert_ne!(a, b);
         for table in [&a, &b] {
-            let key = PawnKey::from_elements(table.elements());
+            let key = PawnKey::from_elements(&table.parse_elements());
             assert!(!key.canonicalized().1);
             assert!(!key.reflected().canonicalized().1);
             assert_ne!(key, key.reflected());
@@ -576,7 +666,7 @@ mod tests {
             for table in tables {
                 let (twin, reflected) = table.twin().unwrap();
                 assert_eq!(twin.twin().unwrap().0, table);
-                let key = PawnKey::from_elements(table.elements());
+                let key = PawnKey::from_elements(&table.parse_elements());
                 assert_eq!(key.reflected().reflected(), key);
                 assert_eq!(key.twin().twin(), key);
                 assert_eq!(key.twin().canonicalized().1, reflected);
@@ -586,7 +676,7 @@ mod tests {
                 if table.n_pieces() > 4 {
                     continue;
                 }
-                let egt = Egt::from_elements(table.elements().to_vec()).unwrap();
+                let egt = Egt::from_elements(table.parse_elements()).unwrap();
                 for turn in [Color::White, Color::Black] {
                     for index in (0..egt.index_range()).step_by((egt.index_range() / 16).max(1)) {
                         let Some(position) = egt.position_from_index(index, turn) else {

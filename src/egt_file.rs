@@ -4,7 +4,7 @@ use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
 use crate::stats::EgtStats;
 use crate::storage::{Location, block_on};
-use crate::table_id::TableId;
+use crate::table_id::{TableId, position_table_name};
 use crate::{ConversionType, DtcOutcome};
 use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
 #[cfg(test)]
@@ -140,7 +140,6 @@ struct FrameDescriptor {
 pub struct EgtFileReader {
     pub egt: Egt,
     pub id: TableId,
-    pub tablename: String,
     pub(crate) location: Location,
     pub(crate) key: ObjectPath,
     seek_table: Option<zeekstd::SeekTable>,
@@ -220,9 +219,9 @@ impl SharedDependencyReader {
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
-        let (id, reflected) = TableId::from_position(position)?;
+        let (name, reflected) = position_table_name(position)?;
         let result = (|| {
-            let file = self.file(id.tablename())?;
+            let file = self.file(name.as_str())?;
             let index = {
                 let reader = file
                     .read()
@@ -242,7 +241,7 @@ impl SharedDependencyReader {
         })();
         result.map_err(|source| match source {
             EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                dependency: id.tablename().to_owned(),
+                dependency: name.to_string(),
                 source: Box::new(source),
             },
             other => other,
@@ -277,7 +276,7 @@ impl SharedDependencyReader {
         self.files
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
-            .insert(file.tablename.clone(), Arc::new(RwLock::new(file)));
+            .insert(file.id.tablename().to_owned(), Arc::new(RwLock::new(file)));
         Ok(())
     }
 
@@ -336,7 +335,7 @@ impl EgtFileReader {
     // Construction itself performs no storage I/O, so opening never writes.
     fn construct(location: &Location, tablename: &str) -> EgtResult<Self> {
         let id = TableId::parse(tablename)?;
-        let egt = Egt::from_elements(id.elements().to_vec())?;
+        let egt = Egt::from_elements(id.parse_elements())?;
         let index_range = egt.index_range();
         let frame_size = DEFAULT_FRAME_SIZE;
         let frame_layout: Vec<_> = (0..index_range)
@@ -349,7 +348,6 @@ impl EgtFileReader {
         let frames = vec![FrameState::Empty; frame_layout.len()];
         Ok(Self {
             key: location.key(&id.relative_path("ggegt")),
-            tablename: id.tablename().to_owned(),
             id,
             egt,
             location: location.clone(),
@@ -559,17 +557,17 @@ impl EgtFileReader {
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
-        let (id, reflected) = TableId::from_position(position)?;
-        if id != self.id {
+        let (name, reflected) = position_table_name(position)?;
+        if name.as_str() != self.id.tablename() {
             return Err(EgtError::PositionNotInTable {
-                table: self.tablename.clone(),
+                table: self.id.tablename().to_owned(),
             });
         }
         self.map_routed_position_to_index(position, reflected)
     }
 
     /// Indexes a position already routed to this table. The caller must have
-    /// selected this identity and its reflection flag via TableId::from_position.
+    /// selected this identity and its reflection flag via position_table_name.
     pub(crate) fn map_routed_position_to_index(
         &self,
         position: &Chess,
@@ -1080,7 +1078,7 @@ mod tests {
     fn test_egt_file_creation() {
         let dir = crate::TestDir::new("single_table_creation");
         let file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
-        assert_eq!(file.tablename, "KPa_K");
+        assert_eq!(file.id.tablename(), "KPa_K");
         assert_eq!(file.id.tablename(), file.egt.tablename());
         assert_eq!(file.index_range, file.egt.index_range());
         let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"

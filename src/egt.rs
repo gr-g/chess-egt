@@ -1,7 +1,8 @@
-use shakmaty::{ByRole, Chess, Color, File, Role};
+use shakmaty::{Chess, Color};
+use crate::table_id::{compute_tablename, parse_elements};
 mod indexer;
-use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{EgtElement, EgtSide};
+use crate::error::EgtResult;
+use crate::piece_set::EgtElement;
 use indexer::Indexer;
 
 #[derive(Clone, Debug)]
@@ -62,109 +63,7 @@ impl Egt {
     /// Within a file, STM tokens follow ascending normalized rank and SNTM
     /// tokens descending rank. Noncanonical piece order is rejected.
     pub fn from_tablename(tablename: &str) -> EgtResult<Self> {
-        Self::from_elements(Self::parse_elements(tablename)?)
-    }
-
-    /// Parses and validates a descriptor without constructing an indexing plan.
-    pub(crate) fn parse_elements(tablename: &str) -> EgtResult<Vec<EgtElement>> {
-        let invalid = |reason| EgtError::InvalidEndgameName {
-            name: tablename.to_owned(),
-            reason,
-        };
-        let (stm, sntm) = tablename
-            .split_once('_')
-            .ok_or_else(|| invalid("missing '_' separator"))?;
-        let mut elements = Vec::new();
-        let mut flags: [[Vec<bool>; 8]; 2] =
-            std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
-
-        for (side_idx, (text, side)) in [(stm, EgtSide::SideToMove), (sntm, EgtSide::SideNotToMove)]
-            .into_iter()
-            .enumerate()
-        {
-            let mut counts = ByRole::new_with(|_| 0usize);
-            let mut chars = text.chars().peekable();
-            while let Some(c) = chars.next() {
-                let role = match c {
-                    'K' => Role::King,
-                    'Q' => Role::Queen,
-                    'R' => Role::Rook,
-                    'B' => Role::Bishop,
-                    'N' => Role::Knight,
-                    'P' => {
-                        let file = match chars.next() {
-                            Some(c @ 'a'..='h') => File::new(c as u32 - 'a' as u32),
-                            _ => return Err(invalid("invalid pawn file specifier")),
-                        };
-                        let opposed = chars.next_if_eq(&'o').is_some();
-                        flags[side_idx][file.to_usize()].push(opposed);
-                        continue;
-                    }
-                    _ => return Err(invalid("invalid piece character")),
-                };
-                counts[role] += 1;
-            }
-            if counts.king != 1 {
-                return Err(invalid("each side must have exactly one king"));
-            }
-            for role in Role::ALL.into_iter().rev() {
-                if counts[role] != 0 {
-                    elements.push(EgtElement::PieceGroup {
-                        role,
-                        side,
-                        multiplicity: counts[role],
-                    });
-                }
-            }
-        }
-
-        for file_idx in 0..8 {
-            let stm_flags = &flags[0][file_idx];
-            let sntm_flags = &flags[1][file_idx];
-            let len = stm_flags.len() + sntm_flags.len();
-            if len == 0 {
-                continue;
-            }
-            if len > 6 {
-                return Err(invalid("at most six pawns may occupy a file"));
-            }
-            // There are at most 64 color words on a file. Both sides' ordered
-            // flags together identify the full word, including unopposed pawns.
-            let order = (0usize..1 << len)
-                .find_map(|word| {
-                    if word.count_ones() as usize != sntm_flags.len() {
-                        return None;
-                    }
-                    let order: arrayvec::ArrayVec<EgtSide, 6> = (0..len)
-                        .map(|i| {
-                            if word & (1 << i) == 0 {
-                                EgtSide::SideToMove
-                            } else {
-                                EgtSide::SideNotToMove
-                            }
-                        })
-                        .collect();
-                    (pawn_flags(&order, EgtSide::SideToMove) == *stm_flags
-                        && pawn_flags(&order, EgtSide::SideNotToMove) == *sntm_flags)
-                        .then_some(order)
-                })
-                .ok_or_else(|| invalid("inconsistent opposed-pawn flags"))?;
-            elements.push(EgtElement::PawnGroup {
-                file: File::new(file_idx as u32),
-                order,
-            });
-        }
-        elements.sort();
-        crate::piece_set::validate_elements(&elements).map_err(|error| match error {
-            EgtError::InvalidPieceConfig(reason) => invalid(reason),
-            other => other,
-        })?;
-        if compute_tablename(&elements) != tablename {
-            return Err(invalid(
-                "noncanonical piece order; expected KQRBN then pawns by file",
-            ));
-        }
-        Ok(elements)
+        Self::from_elements(parse_elements(tablename)?)
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
@@ -203,56 +102,12 @@ impl Egt {
     }
 }
 
-/// Whether each pawn faces an enemy in the next occupied slot towards promotion.
-/// The result follows that side's traversal order, not board-square order.
-fn pawn_flags(order: &[EgtSide], side: EgtSide) -> Vec<bool> {
-    let mut flags = Vec::new();
-    for (i, &pawn_side) in order.iter().enumerate() {
-        if pawn_side == side {
-            let neighbor = match side {
-                EgtSide::SideToMove => order.get(i + 1),
-                EgtSide::SideNotToMove => i.checked_sub(1).and_then(|j| order.get(j)),
-            };
-            flags.push(neighbor.is_some_and(|&other| other != side));
-        }
-    }
-    if side == EgtSide::SideNotToMove {
-        flags.reverse();
-    }
-    flags
-}
-
-pub(crate) fn compute_tablename(elements: &[EgtElement]) -> String {
-    let mut sides = Vec::new();
-    for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
-        let mut name = String::from("K");
-        for element in elements {
-            if let EgtElement::PieceGroup { role, side: piece_side, multiplicity } = element
-                && *role != Role::King && *piece_side == side
-            {
-                name.extend(std::iter::repeat_n(role.upper_char(), *multiplicity));
-            }
-        }
-        for element in elements {
-            let EgtElement::PawnGroup { file, order } = element else {
-                continue;
-            };
-            for opposed in pawn_flags(order, side) {
-                name.push('P');
-                name.push((b'a' + file.to_usize() as u8) as char);
-                if opposed {
-                    name.push('o');
-                }
-            }
-        }
-        sides.push(name);
-    }
-    sides.join("_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shakmaty::{File, Role};
+    use crate::piece_set::EgtSide;
+    use crate::error::EgtError;
     use EgtSide::{SideNotToMove as Sntm, SideToMove as Stm};
 
     fn pawn_group(file: File, order: &[EgtSide]) -> EgtElement {

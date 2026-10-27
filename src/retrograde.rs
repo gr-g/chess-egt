@@ -727,11 +727,11 @@ pub(crate) fn generate_pair(
     base.ensure_writable()?;
     let (twin, _) = table.twin()?;
     let mut ids = vec![table.clone()];
-    let table_a = Egt::from_elements(table.elements().to_vec())?;
+    let table_a = Egt::from_elements(table.parse_elements())?;
     let table_b = if twin == *table {
         None
     } else {
-        let egt = Egt::from_elements(twin.elements().to_vec())?;
+        let egt = Egt::from_elements(twin.parse_elements())?;
         ids.push(twin);
         Some(egt)
     };
@@ -775,12 +775,12 @@ mod tests {
 
     fn tables(material: &str) -> Vec<Egt> {
         TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
-            .map(|id| Egt::from_elements(id.elements().to_vec()).unwrap())
+            .map(|id| Egt::from_elements(id.parse_elements()).unwrap())
             .collect()
     }
 
     fn table(name: &str) -> Egt {
-        Egt::from_elements(TableId::parse(name).unwrap().elements().to_vec()).unwrap()
+        Egt::from_elements(TableId::parse(name).unwrap().parse_elements()).unwrap()
     }
 
     #[test]
