@@ -1,9 +1,8 @@
 //! Location parsing and the async boundary for synchronous tablebase operations.
 //!
-//! Each root requires an immutable `format.json`: format `chess-egt`, format,
-//! indexing and layout versions 1, and 262144 outcomes per frame. Generation
-//! creates it conditionally; readers only validate it. Table data and optional
-//! statistics use `TableId::relative_path("ggegt")` and `relative_path("json")`.
+//! Each root requires an immutable `format.json` identifying format `ggegt-v1`.
+//! Generation creates it conditionally; readers only validate it. Table data and
+//! optional statistics use `TableId::relative_path("ggegt")` and `relative_path("json")`.
 //! Neither probing nor format validation requires statistics.
 
 use std::future::Future;
@@ -19,9 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-pub(crate) const FORMAT_VERSION: u32 = 1;
-pub(crate) const INDEXING_VERSION: u32 = 1;
-pub(crate) const LAYOUT_VERSION: u32 = 1;
+const TABLEBASE_FORMAT: &str = "ggegt-v1";
 pub(crate) const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 
 /// Root metadata is immutable and independent of optional per-table statistics.
@@ -29,20 +26,12 @@ pub(crate) const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 #[serde(deny_unknown_fields)]
 struct FormatDescriptor {
     format: String,
-    format_version: u32,
-    indexing_version: u32,
-    layout_version: u32,
-    frame_size: usize,
 }
 
 impl Default for FormatDescriptor {
     fn default() -> Self {
         Self {
-            format: "chess-egt".into(),
-            format_version: FORMAT_VERSION,
-            indexing_version: INDEXING_VERSION,
-            layout_version: LAYOUT_VERSION,
-            frame_size: DEFAULT_FRAME_SIZE,
+            format: TABLEBASE_FORMAT.into(),
         }
     }
 }
@@ -230,13 +219,7 @@ mod tests {
         let after = block_on(location.store.get(&key)).unwrap();
         assert_eq!(before, block_on(after.bytes()).unwrap());
         let actual: serde_json::Value = serde_json::from_slice(&before).unwrap();
-        assert_eq!(
-            actual,
-            serde_json::json!({
-                "format": "chess-egt", "format_version": 1, "indexing_version": 1,
-                "layout_version": 1, "frame_size": 262144
-            })
-        );
+        assert_eq!(actual, serde_json::json!({ "format": "ggegt-v1" }));
     }
 
     #[test]
@@ -281,40 +264,28 @@ mod tests {
         let location = Location::parse("memory:///tables").unwrap();
         location.ensure_format().unwrap();
         let key = location.prefix.clone().join("format.json");
-        for field in [
-            "format",
-            "format_version",
-            "indexing_version",
-            "layout_version",
-            "frame_size",
+        for bytes in [
+            serde_json::to_vec(&serde_json::json!({ "format": "other" })).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "format": TABLEBASE_FORMAT,
+                "format_version": 1,
+                "indexing_version": 1,
+                "layout_version": 1,
+                "frame_size": 262144
+            }))
+            .unwrap(),
+            b"not json".to_vec(),
         ] {
-            let mut descriptor = serde_json::to_value(FormatDescriptor::default()).unwrap();
-            descriptor[field] = if field == "format" {
-                serde_json::json!("other")
-            } else {
-                serde_json::json!(2)
-            };
-            let bytes = serde_json::to_vec(&descriptor).unwrap();
             block_on(location.store.put(&key, bytes.clone().into())).unwrap();
             let location = Location {
                 format_validated: Arc::new(OnceLock::new()),
                 ..location.clone()
             };
-            assert!(matches!(
-                location.validate_format(),
-                Err(EgtError::InvalidStorageLocation(_))
-            ));
+            assert!(location.validate_format().is_err());
             assert!(location.ensure_format().is_err());
             let result = block_on(location.store.get(&key)).unwrap();
             assert_eq!(block_on(result.bytes()).unwrap().as_ref(), bytes);
         }
-        block_on(location.store.put(&key, b"not json".to_vec().into())).unwrap();
-        let location = Location {
-            format_validated: Arc::new(OnceLock::new()),
-            ..location
-        };
-        assert!(location.validate_format().is_err());
-        assert!(location.ensure_format().is_err());
     }
 
     #[test]

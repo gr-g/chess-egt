@@ -57,7 +57,7 @@ is implemented locally for the tablebase solver.
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt`, `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files through `object_store`, seekable Zstd compression/decompression, and in-memory frame cache.
+3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files (via `object_store`), seekable Zstd compression/decompression (via `zeekstd`), and in-memory frame cache.
 4. **Retrograde Analysis** (`RetrogradeSolver`): The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
@@ -141,9 +141,7 @@ Here `n` counts all pieces including kings, `max`/`min` are the two side piece
 counts in descending order, `K` counts mutually opposing pawn pairs (once per
 pair), and `N` counts pawns.
 
-The immutable root `format.json` declares `format: "chess-egt"`,
-`format_version: 1`, `indexing_version: 1`, `layout_version: 1`, and
-`frame_size: 262144`.
+The immutable root `format.json` contains only `format: "ggegt-v1"`.
 
 - Frames contain at most `256 * 1024` positions, with a short, unpadded final frame.
 - Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the single table's index range and validates it against the seek table.

@@ -98,7 +98,6 @@ pub(crate) fn finalize_table(
 mod tests {
     use super::*;
     use crate::ConversionType;
-    use crate::stats::{INDEXING_VERSION, SCHEMA_VERSION};
 
     #[test]
     fn parallel_batches_match_serial_bytes_and_stats() {
@@ -124,8 +123,6 @@ mod tests {
                     .collect();
                 // Maxima above the synthetic distances avoid large EPD lists.
                 let stats = finalize_table(&file, values, [7, 9]).unwrap();
-                assert_eq!(stats.schema_version, SCHEMA_VERSION);
-                assert_eq!(stats.indexing_version, INDEXING_VERSION);
                 assert_eq!(stats.tablename, "KQ_KR");
                 assert_eq!(
                     stats.unique_positions + stats.invalid_or_redundant,

@@ -6,7 +6,7 @@ use shakmaty::{Color, EnPassantMode, fen::Epd};
 
 use crate::egt::Egt;
 use crate::egt_file::{EgtFileReader, MaybeDtcOutcome};
-use crate::stats::{EgtStats, INDEXING_VERSION, LongestDtcPosition, SCHEMA_VERSION};
+use crate::stats::{EgtStats, LongestDtcPosition};
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
 #[derive(Default)]
@@ -107,8 +107,6 @@ impl EgtStatsBuilder {
         };
         let [histogram_win, histogram_loss] = self.totals.histograms;
         EgtStats {
-            schema_version: SCHEMA_VERSION,
-            indexing_version: INDEXING_VERSION,
             tablename: file.id.tablename().to_owned(),
             bytes,
             sha256,

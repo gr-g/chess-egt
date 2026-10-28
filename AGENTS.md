@@ -21,7 +21,6 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
 - Internal module layout; visibility and public interface.
-- Add stats without en passant positions to EgtFileStats and implement a verify_with_syzygy() function.script to check our stats against the Syzygy stats available on the internet.
 - Experiment with approach using capture/promotion unmoves for initialization. Perhaps reconsider concurrency in `SharedFileCache` if only useful for validation.
 - Frontend, cloning https://syzygy-tables.info/
 
@@ -29,7 +28,7 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt`, `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files through `object_store`, seekable Zstd compression/decompression, and in-memory frame cache.
+3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files (via `object_store`), seekable Zstd compression/decompression (via `zeekstd`), and in-memory frame cache.
 4. **Retrograde Analysis** (`RetrogradeSolver`): The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 See the design specifications in `README.md` for more information.

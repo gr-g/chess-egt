@@ -26,8 +26,8 @@ Dependencies have no LRU eviction, so a warm multi-job cache can affect memory
 and timing.
 
 Artifacts are individual tables at `n/maxvmin/opK/Npawns/name.ggegt` with JSON
-sidecars. Root `format.json` declares format/indexing/layout versions 1 and
-frame size 262144. The script hashes relative hierarchical paths after timing,
+sidecars. Root `format.json` contains only `format: "ggegt-v1"`. The script
+hashes relative hierarchical paths after timing,
 checks repeat/thread-count determinism, and records build/machine metadata. It
 does not compare against an older reference generation. Historical measurements
 in the design documents may use earlier storage layouts and are labeled as such.

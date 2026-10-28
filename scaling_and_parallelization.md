@@ -589,9 +589,9 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 - Each exact canonical table has its own
   `n/maxvmin/opK/Npawns/name.ggegt` object and optional `.json` statistics
   sidecar, with both orientations sharing a directory split but not a filename.
-  Root `format.json` declares format `chess-egt`, format/indexing/layout versions
-  1, and frame size 262144. Generation conditionally creates or validates this
-  immutable descriptor; reads only validate it, without requiring statistics.
+  Root `format.json` contains only `format: "ggegt-v1"`. Generation conditionally
+  creates or validates this immutable descriptor; reads only validate it, without
+  requiring statistics.
 - Lookups prefer `--input-path`, falling back to `--path` only on `NotFound`;
   probing also honors the input location. After root format validation, readers
   load the checksum-free seek table with one suffix GET, validate its frame

@@ -10,9 +10,6 @@ use crate::storage::{DEFAULT_FRAME_SIZE, Location, block_on};
 use crate::table_id::TableId;
 use crate::{EgtError, EgtResult};
 
-pub const SCHEMA_VERSION: u32 = 1;
-pub const INDEXING_VERSION: u32 = crate::storage::INDEXING_VERSION;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LongestDtcPosition {
     pub epd: String,
@@ -21,8 +18,6 @@ pub struct LongestDtcPosition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgtStats {
-    pub schema_version: u32,
-    pub indexing_version: u32,
     pub tablename: String,
     pub bytes: u64,
     pub sha256: String,
@@ -121,9 +116,6 @@ impl EgtStats {
                 format!("invalid statistics for {}: {reason}", id.tablename()),
             ))
         };
-        if self.schema_version != SCHEMA_VERSION || self.indexing_version != INDEXING_VERSION {
-            return Err(invalid("unsupported schema or indexing version"));
-        }
         if self.tablename != id.tablename() {
             return Err(invalid("tablename does not match the requested table"));
         }
@@ -181,8 +173,6 @@ mod tests {
 
     fn stats() -> EgtStats {
         EgtStats {
-            schema_version: SCHEMA_VERSION,
-            indexing_version: INDEXING_VERSION,
             tablename: "KQ_K".into(),
             bytes: 100,
             sha256: "ab".repeat(32),
@@ -287,31 +277,6 @@ mod tests {
         ));
         put(&location, serde_json::to_vec(&stats()).unwrap());
         assert_eq!(read_stats(&location, &id).unwrap(), stats());
-    }
-
-    #[test]
-    fn rejects_missing_schema_corrupt_json_versions_and_wrong_identity() {
-        let location = location();
-        let id = TableId::parse("KQ_K").unwrap();
-        let mut json = serde_json::to_value(stats()).unwrap();
-        json.as_object_mut().unwrap().remove("schema_version");
-        put(&location, serde_json::to_vec(&json).unwrap());
-        assert!(matches!(read_stats(&location, &id), Err(EgtError::Json(_))));
-        put(&location, b"{broken json".to_vec());
-        assert!(matches!(read_stats(&location, &id), Err(EgtError::Json(_))));
-        for field in ["schema_version", "indexing_version", "tablename"] {
-            let mut json = serde_json::to_value(stats()).unwrap();
-            json[field] = if field == "tablename" {
-                serde_json::json!("KR_K")
-            } else {
-                serde_json::json!(2)
-            };
-            put(&location, serde_json::to_vec(&json).unwrap());
-            assert!(
-                read_stats(&location, &id).is_err(),
-                "accepted invalid {field}"
-            );
-        }
     }
 
     #[test]

@@ -925,8 +925,6 @@ mod tests {
             assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(&data)));
             let json = std::fs::read(table_path(&output.0, &stats.tablename, "json")).unwrap();
             assert_eq!(serde_json::from_slice::<EgtStats>(&json).unwrap(), *stats);
-            assert_eq!(stats.schema_version, stats::SCHEMA_VERSION);
-            assert_eq!(stats.indexing_version, stats::INDEXING_VERSION);
         }
         let mut shadowed = EgtProber::new(&output.0).unwrap();
         shadowed.with_input_path(&input.0).unwrap();

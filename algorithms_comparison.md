@@ -182,6 +182,6 @@ In `chess-egt`'s `TODO`, there is an item: *"Experiment with approach using capt
 - **Insight**: Both Syzygy and Prophet validate this approach. By iterating over the (much smaller) dependency tables and unmoving captures/promotions into the target table, you eliminate the overhead of forward legality checking and sub-table probe searching for the vast majority of non-capture positions during initialization.
 
 ### 5. Probing and Storage Footprint (STM Dropping)
-- **Current storage**: `Egt` is logical indexing; `EgtFileReader` and `EgtFileWriter` read/publish one exact oriented table. Each table has its own `n/maxvmin/opK/Npawns/name.ggegt` and JSON sidecar, with root `format.json` identifying format/indexing/layout version 1 and frame size 262144. Tables publish immediately, without accumulating a material selection's outputs.
+- **Current storage**: `Egt` is logical indexing; `EgtFileReader` and `EgtFileWriter` read/publish one exact oriented table. Each table has its own file `n/maxvmin/opK/Npawns/name.ggegt` and corresponding JSON file.
 - **Possible optimization**: omitting one quiet-move twin for asymmetric endgames and reconstructing it through 1-ply search could reduce final storage and prober memory. The actual saving depends on the two tables' compressed sizes; this is not implemented.
 - Note that during the retrograde generation process itself, both sides must remain active in memory to propagate alternating plies, so this optimization does not reduce generation-time memory pressure.
