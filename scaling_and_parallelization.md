@@ -90,10 +90,6 @@ Extrapolating with the same factors:
 | 6 | ~5 × 10¹² | ~10⁴ (about a week on one 64-core node) |
 | 7 | ~10¹⁵ | ~10⁶-10⁷ |
 
-The per-position cost at 7 pieces directly sets the cloud bill. The hotspots
-listed in `AGENTS.md` (`Chess::from_setup`, `Indexer::position_to_index`) are
-therefore strategic, not incidental (see Section 6.2).
-
 ---
 
 ## 3. Three levels of parallelism
@@ -357,20 +353,13 @@ else it adds complexity without reducing cost.
 
 ### 6.1 Separate working arrays from `EgtFileReader` (implemented in Step 3)
 
-`EgtFileReader`'s frame model (empty / compressed on storage / compressed in
-memory / uncompressed, with LRU eviction still unimplemented) suits **dependency tables and probing**, whose accesses are
-sparse and repeated. Retrograde unmoves instead hit the whole working set at
-scattered locations, making frame-cache lookup and eviction inappropriate for
-**the tables being solved**.
-
 The solver uses flat `Vec<AtomicU16>` arrays for the active pair, separate from
 `Egt`'s logical indexing and `EgtFileReader`'s storage cache. Finalization
 compresses and publishes each individual table before moving on. Working memory
 is the active pair plus the current table's compressed output, dependency cache,
 index metadata, local summaries, statistics, and compression/I/O buffers. Outputs
 do not accumulate across jobs. Dependency frames are shared with verification
-and retained within a material family, then released when the family changes;
-there is no LRU eviction or disk scratch staging.
+and retained within a material family, then released when the family changes.
 
 Atomic working values for shared-memory parallelism are implemented in Step 4.
 Memory-mapped arrays for out-of-core runs remain a future option.
@@ -632,18 +621,6 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 - **Implemented:** initialization reuses its legal-move list; reflected indexing
   avoids `Chess` reconstruction; local pawnless and pawnful quiet predecessors
   use reverse attacks and checked `Setup` construction without forward replay.
-  EP state is legal-normalized, not based on pawn adjacency. The reverse paths
-  exclude castling, captures, and promotions and use upstream Shakmaty 0.30.
-- Independent exhaustive local oracles use checked forward play to compare
-  predecessor multisets, including EP legality and multiplicity. An indexed
-  `KRP_KP` regression covers a double push with no legal EP capture. Affected
-  legacy tables and dependents require regeneration; their hashes are not a
-  correctness requirement for this semantic correction.
-- **Remaining:** measure checked construction during source decoding and
-  predecessor generation, index encoding, and finalization/compression on the
-  current configuration before choosing further optimizations. Earlier profiles
-  do not establish current upstream cost shares. See
-  [benchmarking](benchmarking.md) for reproducible benchmarks.
 
 ### Step 7: distributed backend (worker swarm)
 
@@ -654,16 +631,10 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 - If Steps 1-4 respect the invariant of Section 4.3, this step adds a backend
   and does not require rewriting the core loop.
 
-### Optional step: pawn-rank slicing
-
-- Solve slices of pawnful `Egt`s in dependency order. Inject successors in
-  already solved slices at the matching ply (Section 3, Level 1).
-- Consider further slicing of positions with one pair of opposing pawns (see [https://github.com/lichess-org/op1]).
-- **Acceptance:** byte-identical output. Peak memory reduced to about one slice
-  plus the successor slices it reads.
-
 ### Optional step: further optimizations
 
+- Pawn-rank slicing: solve slices of pawnful `Egt`s in dependency order. Inject
+  successors in already solved slices at the matching ply (Section 3, Level 1).
 - Avoid `from_setup` re-validation in source decoding.
 - Evaluate a generation-specific index layout (Section 6.2).
 

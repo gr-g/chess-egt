@@ -44,13 +44,13 @@ use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, R
 use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
 use crate::table_id::{PawnKey, TableId};
-use crate::error::EgtResult;
+use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
 
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
-use crate::egt_file::SharedDependencyReader;
+use crate::egt_file::SharedFileCache;
 use crate::storage::Location;
 
 type EgtHandle = usize;
@@ -77,6 +77,29 @@ struct WorkingPair {
 }
 
 impl WorkingPair {
+    fn new<'a>(tables: impl IntoIterator<Item = (&'a str, usize)>) -> EgtResult<Self> {
+        let mut values = Vec::new();
+        for (table, len) in tables {
+            let context = format!("table {table} working values");
+            let bytes = len.checked_mul(std::mem::size_of::<AtomicU16>()).ok_or_else(|| {
+                EgtError::WorkingMemoryAllocation {
+                    context: context.clone(),
+                    bytes: len as u128 * std::mem::size_of::<AtomicU16>() as u128,
+                    reason: "allocation size overflow".to_string(),
+                }
+            })?;
+            let mut table_values = Vec::new();
+            table_values.try_reserve_exact(len).map_err(|err| EgtError::WorkingMemoryAllocation {
+                context,
+                bytes: bytes as u128,
+                reason: err.to_string(),
+            })?;
+            table_values.resize_with(len, || AtomicU16::new(MaybeDtcOutcome::INVALID.to_u16()));
+            values.push(table_values);
+        }
+        Ok(Self { values })
+    }
+
     fn load(&self, slot: usize, idx: usize) -> MaybeDtcOutcome {
         MaybeDtcOutcome::from_u16(self.values[slot][idx].load(Ordering::Relaxed))
     }
@@ -484,7 +507,7 @@ struct InitCounts {
 fn initialize_table(
     egt: &Egt,
     values: &mut [AtomicU16],
-    reader: &SharedDependencyReader,
+    reader: &SharedFileCache,
 ) -> EgtResult<InitCounts> {
     let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
     debug_assert_eq!(values.len(), size);
@@ -578,7 +601,7 @@ fn solve_pair(
     solver: &RetrogradeSolver,
     table_a: EgtHandle,
     table_b: EgtHandle,
-    reader: &SharedDependencyReader,
+    reader: &SharedFileCache,
 ) -> EgtResult<PairResult> {
     let init_start = std::time::Instant::now();
     let egt = |table: EgtHandle| &solver.tables[table];
@@ -594,11 +617,9 @@ fn solve_pair(
         ]
     };
 
-    let mut working = WorkingPair {
-        values: tables.iter().map(|&(table, ..)| {
-            (0..egt(table).index_range()).map(|_| AtomicU16::new(MaybeDtcOutcome::INVALID.to_u16())).collect()
-        }).collect(),
-    };
+    let mut working = WorkingPair::new(tables.iter().map(|&(table, ..)| {
+        (table_name(solver, table), egt(table).index_range())
+    }))?;
 
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
     let mut previous = [Found::default(); 2];
@@ -722,7 +743,7 @@ fn solve_pair(
 pub(crate) fn generate_pair(
     base: &Location,
     table: &TableId,
-    reader: &SharedDependencyReader,
+    reader: &SharedFileCache,
 ) -> EgtResult<Vec<EgtFileReader>> {
     base.ensure_writable()?;
     let (twin, _) = table.twin()?;
@@ -1049,6 +1070,19 @@ mod tests {
     }
 
     #[test]
+    fn working_pair_reports_allocation_capacity_overflow() {
+        let len = usize::MAX;
+        let err = WorkingPair::new([("oversized", len)]).err().unwrap();
+        match err {
+            EgtError::WorkingMemoryAllocation { context, bytes, .. } => {
+                assert_eq!(context, "table oversized working values");
+                assert_eq!(bytes, len as u128 * std::mem::size_of::<AtomicU16>() as u128);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn pair_local_mark_win_preference_and_newly_resolved() {
         for order in [
             [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate],
@@ -1136,7 +1170,7 @@ mod tests {
         let solver = RetrogradeSolver::new(table("K_K"), None);
         let table = 0;
         let location = Location::parse(&dir.0).unwrap();
-        let reader = SharedDependencyReader::new(HashMap::new(), &location, None);
+        let reader = SharedFileCache::new(&location, None, None);
         let pair = solve_pair(&solver, table, table, &reader).unwrap();
         assert_eq!(pair.working.values.len(), 1);
         assert_eq!(pair.working.values[0].len(), solver.tables[0].index_range());

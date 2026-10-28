@@ -23,7 +23,7 @@ mod stats;
 mod storage;
 mod table_id;
 
-use crate::egt_file::SharedDependencyReader;
+use crate::egt_file::SharedFileCache;
 use crate::storage::Location;
 pub use egt::Egt;
 pub use egt_file::EgtFileReader;
@@ -33,7 +33,7 @@ pub use selection::{GenerationPlan, TableSelector, resolve_selectors};
 use shakmaty::{Chess, Color, Move, MoveList, Position, Role};
 pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -109,6 +109,8 @@ impl EgtGenerator {
         self.threads = threads;
     }
 
+    /// Sets the shared dependency-frame cache budget in bytes.
+    /// Generation working arrays are allocated separately.
     pub fn with_assigned_memory(&mut self, n: usize) {
         self.assigned_memory = Some(n);
     }
@@ -139,8 +141,9 @@ impl EgtGenerator {
 
     /// Deduplicates selectors into twin-pair jobs, ordered by pieces then pawns.
     /// Reuses one Rayon pool and shares dependency frames with verification.
-    /// The cache is released between material families (there is no LRU yet).
-    /// Completed pairs are published and optionally verified before the next job.
+    /// The cache is released between material families, with LRU eviction when
+    /// an assigned cache-memory limit is configured. Completed pairs are
+    /// published and optionally verified before the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let plan = GenerationPlan::new(resolve_selectors(selectors)?)?;
         self.base_path.ensure_format()?;
@@ -148,8 +151,11 @@ impl EgtGenerator {
             .num_threads(self.threads)
             .build()
             .map_err(|_| EgtError::Internal("failed to build generation thread pool"))?;
-        let reader =
-            SharedDependencyReader::new(HashMap::new(), &self.base_path, self.input_path.as_ref());
+        let reader = SharedFileCache::new(
+            &self.base_path,
+            self.input_path.as_ref(),
+            self.assigned_memory,
+        );
         let mut results = Vec::new();
         let mut previous_material = None;
         println!(
@@ -203,8 +209,7 @@ pub struct EgtProber {
     /// Additional path used to look up dependency files. If `None`, only
     /// `base_path` is consulted.
     input_path: Option<Location>,
-    assigned_memory: Option<usize>,
-    cache: HashMap<String, EgtFileReader>,
+    cache: SharedFileCache,
     threads: usize,
 }
 
@@ -219,11 +224,11 @@ impl EgtProber {
     }
 
     pub(crate) fn from_location(location: Location) -> Self {
+        let cache = SharedFileCache::new(&location, None, None);
         Self {
             base_path: location,
             input_path: None,
-            assigned_memory: None,
-            cache: HashMap::new(),
+            cache,
             threads: 0,
         }
     }
@@ -234,8 +239,9 @@ impl EgtProber {
         self.threads = threads;
     }
 
-    pub fn with_assigned_memory(&mut self, n: usize) {
-        self.assigned_memory = Some(n);
+    /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
+    pub fn with_assigned_memory(&mut self, n: usize) -> EgtResult<()> {
+        self.cache.set_assigned_memory(n)
     }
 
     /// Resolves an additional local directory or object-store URL for table lookup.
@@ -247,35 +253,25 @@ impl EgtProber {
     /// when called from an async application.
     pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         let input = Location::parse(path)?;
-        self.cache.clear();
+        self.cache.set_input_path(Some(input.clone()))?;
         self.input_path = Some(input);
         Ok(())
     }
 
     /// Attempts to load an existing file, looking it up first in `input_path`
     /// (if set) and then in `base_path`.
+    #[cfg(test)]
     fn load_existing(&self, endgame: &str) -> EgtResult<EgtFileReader> {
         load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)
     }
 
     pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
-        let (name, reflected) = table_id::position_table_name(position)?;
-        let endgame = name.as_str();
-        if !self.cache.contains_key(endgame) {
-            let file = self.load_existing(endgame)?;
-            self.cache.insert(endgame.to_owned(), file);
-        }
-        let file = self
-            .cache
-            .get_mut(endgame)
-            .ok_or(EgtError::Internal("cache entry missing after insert"))?;
-        let idx = file.map_routed_position_to_index(position, reflected)?;
-        let outcome = file.read_from_index(idx)?;
-        outcome.to_outcome_at(idx)
+        self.cache.probe_direct_outcome(position)
     }
 
     /// Verifies exactly the tables selected, without implicitly adding twins.
-    /// Successor dependencies must be available. Frames are shared without eviction.
+    /// Successor dependencies must be available. Frames are shared and subject
+    /// to the configured LRU cache budget.
     pub fn verify_internal_consistency(&mut self, selector: &str) -> EgtResult<()> {
         self.verify_selected(&[selector])
     }
@@ -293,27 +289,15 @@ impl EgtProber {
     }
 
     fn verify_tables_in_pool(&mut self, names: &[String]) -> EgtResult<()> {
-        // Load only the current selected table at a time. The shared reader
-        // lazily opens successors; taking/recovering the cache keeps frames shared.
         for name in names {
-            if !self.cache.contains_key(name) {
-                let file = self.load_existing(name)?;
-                self.cache.insert(name.clone(), file);
-            }
-            let file = self
-                .cache
-                .get(name)
-                .ok_or(EgtError::Internal("cache entry missing after insert"))?;
-            let egt = file.egt.clone();
-            let frame_size = file.frame_size;
-            let reader = SharedDependencyReader::new(
-                std::mem::take(&mut self.cache),
-                &self.base_path,
-                self.input_path.as_ref(),
-            );
-            let result = Self::verify_egt(&reader, name, &egt, frame_size);
-            self.cache = reader.into_cache()?;
-            result?;
+            let file = self.cache.file(name)?;
+            let (egt, frame_size) = {
+                let file = file
+                    .read()
+                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+                (file.egt.clone(), file.frame_size)
+            };
+            Self::verify_egt(&self.cache, name, &egt, frame_size)?;
             println!(
                 "Successfully verified internal consistency of table {}.",
                 name
@@ -324,10 +308,7 @@ impl EgtProber {
 
     /// Reads only versioned JSON sidecars. Missing data is an error.
     /// Overlapping selectors are deduplicated before retrieval and aggregation.
-    pub fn stats(
-        &self,
-        selectors: &[&str],
-    ) -> EgtResult<AggregateStats> {
+    pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
         let tables = resolve_selectors(selectors)?;
         let mut total = AggregateStats {
             selected_tables: tables.len(),
@@ -367,7 +348,7 @@ impl EgtProber {
 
     /// Verifies independent blocks of one table using table-local indices.
     fn verify_egt(
-        reader: &SharedDependencyReader,
+        reader: &SharedFileCache,
         endgame: &str,
         egt: &egt::Egt,
         frame_size: usize,
@@ -404,7 +385,7 @@ impl EgtProber {
     }
 
     fn verify_block(
-        reader: &SharedDependencyReader,
+        reader: &SharedFileCache,
         endgame: &str,
         egt: &egt::Egt,
         start: usize,
@@ -474,7 +455,7 @@ impl EgtProber {
     /// Computes the best outcome reachable from `position` by playing one of
     /// `legals`, probing each successor in the tablebases.
     fn best_outcome(
-        reader: &SharedDependencyReader,
+        reader: &SharedFileCache,
         position: &Chess,
         legals: &MoveList,
     ) -> EgtResult<DtcOutcome> {
@@ -504,7 +485,7 @@ impl EgtProber {
     /// Builds a human-readable diagnostic for a mismatch between the outcome
     /// stored in the file and the best outcome computed from the legal moves.
     fn describe_mismatch(
-        reader: &SharedDependencyReader,
+        reader: &SharedFileCache,
         position: &Chess,
         legals: &MoveList,
         outcome: DtcOutcome,
@@ -808,13 +789,15 @@ mod tests {
         let index = (0..file.index_range)
             .find(|&index| file.egt.position_from_index(index, Color::White).is_some())
             .unwrap();
-        prober.cache.insert("K_K".to_string(), file);
+        prober.cache.insert(file).unwrap();
 
         for threads in [0, 1, 4] {
             prober.with_threads(threads);
             prober
                 .cache
-                .get_mut("K_K")
+                .file("K_K")
+                .unwrap()
+                .write()
                 .unwrap()
                 .write_to_index(index, MaybeDtcOutcome::INVALID)
                 .unwrap();
@@ -824,7 +807,9 @@ mod tests {
 
             prober
                 .cache
-                .get_mut("K_K")
+                .file("K_K")
+                .unwrap()
+                .write()
                 .unwrap()
                 .write_to_index(index, MaybeDtcOutcome::from_u16(8))
                 .unwrap();
@@ -832,7 +817,9 @@ mod tests {
                 Err(EgtError::CorruptedOutcome { index: failed, value: 8 }) if failed == index));
             prober
                 .cache
-                .get_mut("K_K")
+                .file("K_K")
+                .unwrap()
+                .write()
                 .unwrap()
                 .write_to_index(index, MaybeDtcOutcome::DRAW)
                 .unwrap();
@@ -857,6 +844,59 @@ mod tests {
             assert_eq!(tables.len(), 1);
             prober.verify_internal_consistency("K_K").unwrap();
         }
+    }
+
+    #[test]
+    fn bounded_cache_memory_supports_generation_verification_and_probing() {
+        let dir = TestDir::new("bounded_cache_memory");
+        // Fit both queen-table frames, but force eviction when K_K is also probed.
+        let cache_bytes = 2 * Egt::from_tablename("KQ_K").unwrap().index_range() * 2;
+        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        generator.with_threads(2);
+        generator.with_assigned_memory(cache_bytes);
+        let tables = generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
+        assert_eq!(tables.len(), 3);
+
+        let mut prober = EgtProber::new(&dir.0).unwrap();
+        prober.with_threads(2);
+        prober.with_assigned_memory(cache_bytes).unwrap();
+        prober.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
+
+        let reference = TestDir::new("bounded_cache_memory_reference");
+        unverified_generator(&reference.0)
+            .generate_selected(&["K_K", "KQ_K"])
+            .unwrap();
+        for stats in &tables {
+            assert_eq!(
+                std::fs::read(table_path(&dir.0, &stats.tablename, "ggegt")).unwrap(),
+                std::fs::read(table_path(&reference.0, &stats.tablename, "ggegt")).unwrap()
+            );
+        }
+
+        let egt = Egt::from_tablename("KQ_K").unwrap();
+        let position = (0..egt.index_range())
+            .find_map(|index| egt.position_from_index(index, Color::White))
+            .unwrap();
+        prober.probe(&position).unwrap();
+    }
+
+    #[test]
+    fn zero_cache_memory_supports_generation_verification_and_probing() {
+        let dir = TestDir::new("zero_cache_memory");
+        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        generator.with_threads(2);
+        generator.with_assigned_memory(0);
+        generator.generate("K_K").unwrap();
+
+        let mut prober = EgtProber::new(&dir.0).unwrap();
+        prober.with_threads(2);
+        prober.with_assigned_memory(0).unwrap();
+        prober.verify_internal_consistency("K_K").unwrap();
+        let egt = Egt::from_tablename("K_K").unwrap();
+        let position = (0..egt.index_range())
+            .find_map(|index| egt.position_from_index(index, Color::White))
+            .unwrap();
+        assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
     }
 
     #[test]
@@ -895,12 +935,7 @@ mod tests {
             assert!(!matches!(error, EgtError::FileNotFound(_)));
         }
         let prober = EgtProber::new(&output.0).unwrap();
-        assert_eq!(
-            prober
-                .stats(&["KQ_K", "K_KQ"])
-                .unwrap(),
-            aggregate(&tables)
-        );
+        assert_eq!(prober.stats(&["KQ_K", "K_KQ"]).unwrap(), aggregate(&tables));
     }
 
     #[test]
@@ -928,12 +963,7 @@ mod tests {
             file.key.as_ref(),
             format!("nested/tables/{}", file.id.relative_path("ggegt"))
         );
-        assert_eq!(
-            prober
-                .stats(&["KQ_K", "K_KQ"])
-                .unwrap(),
-            aggregate(&tables)
-        );
+        assert_eq!(prober.stats(&["KQ_K", "K_KQ"]).unwrap(), aggregate(&tables));
     }
 
     #[test]

@@ -50,6 +50,14 @@ pub enum EgtError {
             source: object_store::Error,
         },
 
+    /// Memory for a generation working array could not be allocated.
+    #[error("failed to allocate {bytes} bytes for {context}: {reason}; generation working memory is separate from the cache budget")]
+    WorkingMemoryAllocation {
+        context: String,
+        bytes: u128,
+        reason: String,
+    },
+
     /// A consistency check failed during verification.
     #[error("consistency check failed for {endgame:?} at index {index}: {reason}")]
     ConsistencyCheckFailed {

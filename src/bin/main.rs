@@ -22,8 +22,9 @@ struct Cli {
     #[arg(long)]
     input_path: Option<PathBuf>,
 
-    #[arg(long)]
-    memory: Option<String>,
+    /// Retained frame-cache memory (bytes, B, KiB, MiB, or GiB).
+    #[arg(long, value_parser = parse_byte_size)]
+    memory: Option<usize>,
 
     /// Number of generation and verification workers (0 uses Rayon's default).
     #[arg(long, default_value_t = 0)]
@@ -205,9 +206,33 @@ fn generation_summary(
     summary
 }
 
+fn parse_byte_size(value: &str) -> Result<usize, String> {
+    let normalized = value.to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = normalized.strip_suffix("kib") {
+        (number, 1024)
+    } else if let Some(number) = normalized.strip_suffix("mib") {
+        (number, 1024 * 1024)
+    } else if let Some(number) = normalized.strip_suffix("gib") {
+        (number, 1024 * 1024 * 1024)
+    } else if let Some(number) = normalized.strip_suffix('b') {
+        (number, 1)
+    } else {
+        (normalized.as_str(), 1)
+    };
+    let bytes = number
+        .parse::<usize>()
+        .map_err(|_| format!("invalid byte size '{value}'"))?;
+    bytes
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size '{value}' is too large"))
+}
+
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
     let mut prober = EgtProber::new(&cli.path)?;
     prober.with_threads(usize::from(cli.threads));
+    if let Some(memory) = cli.memory {
+        prober.with_assigned_memory(memory)?;
+    }
     if let Some(ref input) = cli.input_path {
         prober.with_input_path(input)?;
     }
@@ -216,6 +241,9 @@ fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
 
 fn configure_generator(generator: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
     generator.with_threads(usize::from(cli.threads));
+    if let Some(memory) = cli.memory {
+        generator.with_assigned_memory(memory);
+    }
     if let Some(ref input) = cli.input_path {
         generator.with_input_path(input)?;
     }
@@ -266,6 +294,29 @@ mod tests {
     fn selector_actions_require_at_least_one_selector() {
         for action in ACTIONS {
             assert!(Cli::try_parse_from(["chess-egt", action]).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_accepts_byte_sizes() {
+        for (value, expected) in [
+            ("123", 123),
+            ("123B", 123),
+            ("2kib", 2 * 1024),
+            ("2MiB", 2 * 1024 * 1024),
+            ("1GiB", 1024 * 1024 * 1024),
+        ] {
+            let cli = Cli::try_parse_from(["chess-egt", "--memory", value]).unwrap();
+            assert_eq!(cli.memory, Some(expected));
+        }
+    }
+
+    #[test]
+    fn memory_rejects_malformed_or_overflowing_sizes() {
+        for value in ["", "MiB", "1.5GiB", "1KB", "-1", "18446744073709551615GiB"] {
+            let argument = format!("--memory={value}");
+            let error = Cli::try_parse_from(["chess-egt", &argument]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
     }
 

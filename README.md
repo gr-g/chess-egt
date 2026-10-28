@@ -56,8 +56,8 @@ is implemented locally for the tablebase solver.
 ## 1. High-Level Architecture
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
-2. **Logical Indexing Layer (`Egt` & `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
-3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`)**: Stores each canonical table separately through `object_store`, with seekable Zstd compression, buffered publication, and a shared dependency frame cache. Storage is separate from the logical `Egt`.
+2. **Logical Indexing Layer (`Egt`, `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
+3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files through `object_store`, seekable Zstd compression/decompression, and in-memory frame cache.
 4. **Retrograde Analysis** (`RetrogradeSolver`): The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
 ## 2. Outcome Representation (`DtcOutcome`)
@@ -161,16 +161,21 @@ in frame order without recompression and appends one seek table through the
 
 ## 5. Memory Management
 
-Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved. Finalization processes one table at a time in parallel frame batches. Batches use the same Rayon pool as generation, with at most one encoder per configured thread; level-19 encoder memory therefore grows with `--threads`.
+Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved.
+These arrays are allocated with `try_reserve_exact`, so allocation failure is
+reported as an error. Finalization processes one table at a time in parallel
+frame batches. Batches use the same Rayon pool as generation, with at most one
+encoder per configured thread; level-19 encoder memory therefore grows with
+`--threads`.
 
-Selected jobs run serially while reusing one Rayon pool and a shared dependency
-reader/cache across jobs within each material family.
+Selected jobs run serially while reusing one Rayon pool and a `SharedFileCache`
+across jobs within each material family. Probing and verification use the same
+cache implementation.
 
-### 5.1 Frame States
-Each frame in an `EgtFileReader` can be empty, compressed on storage, compressed
-in memory, or uncompressed in memory. Cold stored frames are fetched and decoded
-on demand. Empty frames default to invalid outcomes; generation's active working
-arrays are separate from this cache.
+### 5.1 Frame Caching
+A frame is either resident as uncompressed outcomes or absent. The shared cache
+tracks resident frames across all files and evicts the least recently used
+clean stored frame when over budget.
 
 ## 6. Retrograde Analysis
 Retrograde analysis generates endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.

@@ -13,7 +13,7 @@ use shakmaty::CastlingMode;
 use shakmaty::Position;
 use shakmaty::{Chess, Color};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::storage::DEFAULT_FRAME_SIZE;
 
@@ -103,31 +103,6 @@ impl MaybeDtcOutcome {
     }
 }
 
-/// Represents the state of a single frame in an EgtFileReader.
-///
-/// The `Compressed` variant (and `ensure_compressed`) are not reached yet: they
-/// exist for the planned LRU eviction of in-memory frames, which is what will
-/// compress a dirty frame without going through a full `save_to_file()`.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum FrameState {
-    /// The frame is empty.
-    Empty,
-    /// The frame is compressed on file.
-    CompressedOnFile,
-    /// The frame is compressed in memory.
-    Compressed(Vec<u8>),
-    /// The frame is fully uncompressed in memory.
-    Uncompressed {
-        /// Cached compressed bytes to avoid re-compression if not dirty.
-        compressed: Vec<u8>,
-        /// Uncompressed values.
-        uncompressed: Vec<MaybeDtcOutcome>,
-        /// True if the compressed bytes are not updated.
-        dirty: bool,
-    },
-}
-
 /// Logical extent of an unpadded, table-local transposed Zstd frame.
 #[derive(Debug, Clone, Copy)]
 struct FrameDescriptor {
@@ -143,7 +118,8 @@ pub struct EgtFileReader {
     pub(crate) location: Location,
     pub(crate) key: ObjectPath,
     seek_table: Option<zeekstd::SeekTable>,
-    frames: Vec<FrameState>,
+    /// `None` is cold when a seek table exists, or unallocated in a new file.
+    frames: Vec<Option<Vec<MaybeDtcOutcome>>>,
     frame_layout: Vec<FrameDescriptor>,
     /// Maximum number of indexed locations per frame; the tail may be shorter.
     pub frame_size: usize,
@@ -151,36 +127,71 @@ pub struct EgtFileReader {
     pub stats: Option<EgtStats>,
 }
 
-/// Shared files for parallel initialization and verification.
-///
-/// Existing dependencies are loaded lazily; missing tables are reported as errors.
-/// Frames are shared, not copied per worker; no eviction is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameKey {
+    file: usize,
+    frame: usize,
+}
+
 #[derive(Debug)]
-pub(crate) struct SharedDependencyReader {
+struct CachedFrame {
+    file: Weak<RwLock<EgtFileReader>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct CacheMemory {
+    assigned: Option<usize>,
+    resident: usize,
+    clock: u64,
+    frames: HashMap<FrameKey, CachedFrame>,
+}
+
+/// Shared files and their uncompressed frames for probing and verification.
+///
+/// The assigned memory bounds retained frames between operations. Concurrent
+/// cold loads, copied chunks, metadata, and decompression buffers are excluded.
+#[derive(Debug)]
+pub(crate) struct SharedFileCache {
     files: RwLock<HashMap<String, Arc<RwLock<EgtFileReader>>>>,
     base_path: Location,
     input_path: Option<Location>,
+    memory: Mutex<CacheMemory>,
 }
 
-impl SharedDependencyReader {
+impl SharedFileCache {
     pub(crate) fn new(
-        files: HashMap<String, EgtFileReader>,
         base_path: &Location,
         input_path: Option<&Location>,
+        assigned_memory: Option<usize>,
     ) -> Self {
         Self {
-            files: RwLock::new(
-                files
-                    .into_iter()
-                    .map(|(name, file)| (name, Arc::new(RwLock::new(file))))
-                    .collect(),
-            ),
+            files: RwLock::new(HashMap::new()),
             base_path: base_path.clone(),
             input_path: input_path.cloned(),
+            memory: Mutex::new(CacheMemory {
+                assigned: assigned_memory,
+                ..CacheMemory::default()
+            }),
         }
     }
 
-    fn file(&self, endgame: &str) -> EgtResult<Arc<RwLock<EgtFileReader>>> {
+    pub(crate) fn set_assigned_memory(&self, assigned: usize) -> EgtResult<()> {
+        self.memory
+            .lock()
+            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?
+            .assigned = Some(assigned);
+        self.enforce_limit()
+    }
+
+    pub(crate) fn set_input_path(&mut self, input: Option<Location>) -> EgtResult<()> {
+        self.clear()?;
+        self.input_path = input;
+        Ok(())
+    }
+
+    pub(crate) fn file(&self, endgame: &str) -> EgtResult<Arc<RwLock<EgtFileReader>>> {
         let cached_file = {
             let files = self
                 .files
@@ -218,34 +229,56 @@ impl SharedDependencyReader {
         outcome.to_outcome_at(index)
     }
 
+    /// Probes a primary table without wrapping a missing file as a dependency error.
+    pub(crate) fn probe_direct_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
+        let (name, reflected) = position_table_name(position)?;
+        let (index, outcome) = self.probe_routed(position, name.as_str(), reflected)?;
+        outcome.to_outcome_at(index)
+    }
+
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
         let (name, reflected) = position_table_name(position)?;
-        let result = (|| {
-            let file = self.file(name.as_str())?;
-            let index = {
-                let reader = file
-                    .read()
-                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-                let index = reader.map_routed_position_to_index(position, reflected)?;
-                if let Some(outcome) = reader.read_from_index_cached(index)? {
-                    return Ok((index, outcome));
-                }
-                index
-            };
+        self.probe_routed(position, name.as_str(), reflected)
+            .map_err(|source| match source {
+                EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
+                    dependency: name.to_string(),
+                    source: Box::new(source),
+                },
+                other => other,
+            })
+    }
+
+    fn probe_routed(
+        &self,
+        position: &Chess,
+        endgame: &str,
+        reflected: bool,
+    ) -> EgtResult<(usize, MaybeDtcOutcome)> {
+        let file = self.file(endgame)?;
+        let reader = file
+            .read()
+            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+        let index = reader.map_routed_position_to_index(position, reflected)?;
+        let frame = reader.locate_frame(index).0;
+        let bytes = reader.frame_bytes(frame);
+        let (outcome, over_limit) = if let Some(outcome) = reader.read_from_index_cached(index)? {
+            let over_limit = self.record_access(&file, frame, bytes)?;
+            drop(reader);
+            (outcome, over_limit)
+        } else {
+            drop(reader);
             // Metadata is immutable: retain the index while upgrading to a write
             // guard. read_from_index rechecks whether another worker warmed it.
             let mut writer = file
                 .write()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            Ok((index, writer.read_from_index(index)?))
-        })();
-        result.map_err(|source| match source {
-            EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                dependency: name.to_string(),
-                source: Box::new(source),
-            },
-            other => other,
-        })
+            let outcome = writer.read_from_index(index)?;
+            (outcome, self.record_access(&file, frame, bytes)?)
+        };
+        if over_limit {
+            self.enforce_limit()?;
+        }
+        Ok((index, outcome))
     }
 
     /// Copies a scan block so no file lock is held while probing successors.
@@ -257,26 +290,167 @@ impl SharedDependencyReader {
         end: usize,
     ) -> EgtResult<Vec<MaybeDtcOutcome>> {
         let file = self.file(endgame)?;
-        {
-            let reader = file
-                .read()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            if let Some(chunk) = reader.frame_chunk_cached(start, end)? {
-                return Ok(chunk.to_vec());
-            }
-        }
-        let mut writer = file
-            .write()
+        let reader = file
+            .read()
             .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        Ok(writer.frame_chunk(start, end)?.to_vec())
+        if start > end || end > reader.index_range {
+            return Err(EgtError::IndexOutOfRange {
+                index: end,
+                range: reader.index_range,
+            });
+        }
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let frame = reader.locate_frame(start).0;
+        let bytes = reader.frame_bytes(frame);
+        let (chunk, over_limit) = if let Some(chunk) = reader.frame_chunk_cached(start, end)? {
+            let chunk = chunk.to_vec();
+            let over_limit = self.record_access(&file, frame, bytes)?;
+            drop(reader);
+            (chunk, over_limit)
+        } else {
+            drop(reader);
+            let mut writer = file
+                .write()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            let chunk = writer.frame_chunk(start, end)?.to_vec();
+            (chunk, self.record_access(&file, frame, bytes)?)
+        };
+        if over_limit {
+            self.enforce_limit()?;
+        }
+        Ok(chunk)
     }
 
-    /// Pins freshly published output ahead of configured input lookup.
+    fn record_access(
+        &self,
+        file: &Arc<RwLock<EgtFileReader>>,
+        frame: usize,
+        bytes: usize,
+    ) -> EgtResult<bool> {
+        // Arc addresses are stable while registered. insert/remove/clear purge
+        // their entries, so no table-name allocation is needed on a warm probe.
+        let key = FrameKey {
+            file: Arc::as_ptr(file) as usize,
+            frame,
+        };
+        let mut memory = self
+            .memory
+            .lock()
+            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+        memory.clock = memory.clock.wrapping_add(1);
+        let last_used = memory.clock;
+        let new_resident = memory
+            .resident
+            .checked_add(bytes)
+            .ok_or(EgtError::Internal("cache memory accounting overflow"))?;
+        if let Some(frame) = memory.frames.get_mut(&key) {
+            frame.last_used = last_used;
+        } else {
+            memory.resident = new_resident;
+            memory.frames.insert(
+                key,
+                CachedFrame {
+                    file: Arc::downgrade(file),
+                    bytes,
+                    last_used,
+                },
+            );
+        }
+        Ok(memory.assigned.is_some_and(|limit| memory.resident > limit))
+    }
+
+    fn enforce_limit(&self) -> EgtResult<()> {
+        loop {
+            let victim = {
+                let memory = self
+                    .memory
+                    .lock()
+                    .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+                if memory.assigned.is_none_or(|limit| memory.resident <= limit) {
+                    return Ok(());
+                }
+                memory
+                    .frames
+                    .iter()
+                    .min_by_key(|(_, frame)| frame.last_used)
+                    .map(|(key, frame)| (*key, frame.last_used, frame.file.clone()))
+            };
+            let Some((key, last_used, weak_file)) = victim else {
+                return Err(EgtError::Internal(
+                    "cache accounting has no evictable frame",
+                ));
+            };
+            let Some(file) = weak_file.upgrade() else {
+                let mut memory = self
+                    .memory
+                    .lock()
+                    .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+                if memory.frames.get(&key).map(|frame| frame.last_used) == Some(last_used) {
+                    let frame = memory.frames.remove(&key).ok_or(EgtError::Internal(
+                        "cache frame missing during stale-entry removal",
+                    ))?;
+                    memory.resident -= frame.bytes;
+                }
+                continue;
+            };
+
+            // Never wait for a file while holding the memory lock. Once the
+            // write guard is held, revalidate that no newer access touched it.
+            let mut file = file
+                .write()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            let mut memory = self
+                .memory
+                .lock()
+                .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+            if memory.frames.get(&key).map(|frame| frame.last_used) != Some(last_used) {
+                continue;
+            }
+            if file.seek_table.is_none() || file.frames[key.frame].is_none() {
+                return Err(EgtError::Internal(
+                    "cached frame is not disk-backed and resident",
+                ));
+            }
+            file.frames[key.frame] = None;
+            let frame = memory
+                .frames
+                .remove(&key)
+                .ok_or(EgtError::Internal("cache frame missing during eviction"))?;
+            memory.resident -= frame.bytes;
+        }
+    }
+
+    fn forget_file(&self, file: &Arc<RwLock<EgtFileReader>>) -> EgtResult<()> {
+        let file_id = Arc::as_ptr(file) as usize;
+        let mut memory = self
+            .memory
+            .lock()
+            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+        let mut released = 0;
+        memory.frames.retain(|key, frame| {
+            if key.file == file_id {
+                released += frame.bytes;
+                false
+            } else {
+                true
+            }
+        });
+        memory.resident -= released;
+        Ok(())
+    }
+
+    /// Pins freshly published, cold output ahead of configured input lookup.
     pub(crate) fn insert(&self, file: EgtFileReader) -> EgtResult<()> {
-        self.files
+        let old = self
+            .files
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
             .insert(file.id.tablename().to_owned(), Arc::new(RwLock::new(file)));
+        if let Some(old) = old {
+            self.forget_file(&old)?;
+        }
         Ok(())
     }
 
@@ -287,7 +461,9 @@ impl SharedDependencyReader {
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
         for name in names {
-            files.remove(name);
+            if let Some(file) = files.remove(name) {
+                self.forget_file(&file)?;
+            }
         }
         Ok(())
     }
@@ -298,25 +474,23 @@ impl SharedDependencyReader {
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
             .clear();
+        let mut memory = self
+            .memory
+            .lock()
+            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
+        memory.frames.clear();
+        memory.resident = 0;
         Ok(())
     }
 
-    /// Recovers owned files, including frames warmed by workers, after they join.
-    pub(crate) fn into_cache(self) -> EgtResult<HashMap<String, EgtFileReader>> {
-        let files = self
-            .files
-            .into_inner()
-            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-        files
-            .into_iter()
-            .map(|(name, file)| {
-                let file = Arc::try_unwrap(file)
-                    .map_err(|_| EgtError::Internal("dependency file still shared"))?
-                    .into_inner()
-                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-                Ok((name, file))
-            })
-            .collect()
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, name: &str) -> bool {
+        self.files.read().unwrap().contains_key(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.read().unwrap().is_empty()
     }
 }
 
@@ -345,7 +519,7 @@ impl EgtFileReader {
                 len: frame_size.min(index_range - start),
             })
             .collect();
-        let frames = vec![FrameState::Empty; frame_layout.len()];
+        let frames = vec![None; frame_layout.len()];
         Ok(Self {
             key: location.key(&id.relative_path("ggegt")),
             id,
@@ -371,7 +545,7 @@ impl EgtFileReader {
         let mut file = Self::construct(location, tablename)?;
         location.validate_format()?;
         file.load_seek_table()?;
-        file.frames.fill(FrameState::CompressedOnFile);
+        file.frames.fill(None);
         Ok(file)
     }
 
@@ -442,10 +616,9 @@ impl EgtFileReader {
             });
         }
         let (frame_idx, offset) = self.locate_frame(index);
-        match &self.frames[frame_idx] {
-            FrameState::Uncompressed { uncompressed, .. } => Ok(Some(uncompressed[offset])),
-            _ => Ok(None),
-        }
+        Ok(self.frames[frame_idx]
+            .as_ref()
+            .map(|uncompressed| uncompressed[offset]))
     }
 
     /// Save the entire table using seekable Zstd compression.
@@ -467,13 +640,10 @@ impl EgtFileReader {
             self.ensure_uncompressed(frame_idx)?;
 
             // Transpose the frame
-            if let FrameState::Uncompressed { uncompressed, .. } = &self.frames[frame_idx] {
-                encode_frame(&mut encoder, uncompressed)?;
-            } else {
-                return Err(EgtError::Internal(
-                    "expected Uncompressed frame state after ensure_uncompressed",
-                ));
-            }
+            let uncompressed = self.frames[frame_idx].as_deref().ok_or(EgtError::Internal(
+                "expected resident frame after ensure_uncompressed",
+            ))?;
+            encode_frame(&mut encoder, uncompressed)?;
         }
 
         encoder.flush()?;
@@ -485,7 +655,7 @@ impl EgtFileReader {
             std::iter::once(compressed.into()),
         )?;
         self.load_seek_table()?;
-        self.frames.fill(FrameState::CompressedOnFile);
+        self.frames.fill(None);
         Ok(bytes)
     }
 
@@ -493,13 +663,11 @@ impl EgtFileReader {
     fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&mut [MaybeDtcOutcome]> {
         self.ensure_uncompressed(frame_idx)?;
 
-        if let FrameState::Uncompressed { uncompressed, .. } = &mut self.frames[frame_idx] {
-            Ok(uncompressed)
-        } else {
-            Err(EgtError::Internal(
-                "expected Uncompressed frame state after ensure_uncompressed",
+        self.frames[frame_idx]
+            .as_deref_mut()
+            .ok_or(EgtError::Internal(
+                "expected resident frame after ensure_uncompressed",
             ))
-        }
     }
 
     /// Returns the in-memory outcomes for the table-local indexes `[start, end)`,
@@ -546,12 +714,9 @@ impl EgtFileReader {
                 "frame_chunk range crosses a frame boundary",
             ));
         }
-        match &self.frames[frame_idx] {
-            FrameState::Uncompressed { uncompressed, .. } => {
-                Ok(Some(&uncompressed[offset..offset + end - start]))
-            }
-            _ => Ok(None),
-        }
+        Ok(self.frames[frame_idx]
+            .as_ref()
+            .map(|uncompressed| &uncompressed[offset..offset + end - start]))
     }
 
     /// Maps a position to the corresponding index. This is used when probing
@@ -603,6 +768,10 @@ impl EgtFileReader {
         (frame_idx, index - self.frame_layout[frame_idx].start)
     }
 
+    fn frame_bytes(&self, frame_idx: usize) -> usize {
+        self.frame_layout[frame_idx].len * std::mem::size_of::<MaybeDtcOutcome>()
+    }
+
     /// Reads an outcome directly by its table-local index.
     pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
         if index >= self.index_range {
@@ -629,131 +798,32 @@ impl EgtFileReader {
 
         let (frame_idx, offset) = self.locate_frame(index);
 
-        self.ensure_uncompressed(frame_idx)?;
-
-        if let FrameState::Uncompressed {
-            uncompressed,
-            dirty,
-            ..
-        } = &mut self.frames[frame_idx]
-        {
-            uncompressed[offset] = outcome;
-            *dirty = true;
-            Ok(())
-        } else {
-            Err(EgtError::Internal(
-                "expected Uncompressed frame state after ensure_uncompressed",
-            ))
-        }
+        let uncompressed = self.get_frame_data(frame_idx)?;
+        uncompressed[offset] = outcome;
+        Ok(())
     }
 
-    /// Ensures that the frame at `frame_idx` is in the `Uncompressed` state.
-    /// Allocates memory and decompresses if necessary.
+    /// Ensures that the frame at `frame_idx` is resident and uncompressed.
     fn ensure_uncompressed(&mut self, frame_idx: usize) -> EgtResult<()> {
+        if self.frames[frame_idx].is_some() {
+            return Ok(());
+        }
         let frame = self.frame_layout[frame_idx];
-        match &self.frames[frame_idx] {
-            FrameState::Empty => {
-                // TODO: Allocate memory from arena
-                let uncompressed = vec![MaybeDtcOutcome::INVALID; frame.len];
-
-                self.frames[frame_idx] = FrameState::Uncompressed {
-                    compressed: vec![],
-                    uncompressed,
-                    dirty: true,
-                };
-                Ok(())
+        let uncompressed = if let Some(table) = &self.seek_table {
+            let range = table.frame_start_comp(frame_idx as u32)?
+                ..table.frame_end_comp(frame_idx as u32)?;
+            let length = range.end - range.start;
+            let compressed = block_on(self.location.store.get_range(&self.key, range))
+                .map_err(|error| self.location.error(&self.key, error))?;
+            if compressed.len() as u64 != length {
+                return Err(EgtError::Internal("truncated tablebase range"));
             }
-            FrameState::CompressedOnFile => {
-                let table = self
-                    .seek_table
-                    .as_ref()
-                    .ok_or(EgtError::Internal("missing tablebase seek table"))?;
-                let range = table.frame_start_comp(frame_idx as u32)?
-                    ..table.frame_end_comp(frame_idx as u32)?;
-                let length = range.end - range.start;
-                let compressed = block_on(self.location.store.get_range(&self.key, range))
-                    .map_err(|error| self.location.error(&self.key, error))?;
-                if compressed.len() as u64 != length {
-                    return Err(EgtError::Internal("truncated tablebase range"));
-                }
-                let uncompressed = decode_frame(&compressed, frame.len)?;
-                self.frames[frame_idx] = FrameState::Uncompressed {
-                    compressed: vec![],
-                    uncompressed,
-                    dirty: false,
-                };
-                Ok(())
-            }
-            FrameState::Compressed(compressed_bytes) => {
-                let uncompressed = decode_frame(compressed_bytes, frame.len)?;
-                self.frames[frame_idx] = FrameState::Uncompressed {
-                    compressed: compressed_bytes.clone(),
-                    uncompressed,
-                    dirty: false,
-                };
-                Ok(())
-            }
-            FrameState::Uncompressed { .. } => {
-                // Already uncompressed
-                // TODO: update LRU status
-                Ok(())
-            }
-        }
-    }
-
-    /// Ensures that the frame at `frame_idx` is in the `Compressed` state.
-    ///
-    /// Currently only exercised by tests; see the note on `FrameState`.
-    #[allow(dead_code)]
-    fn ensure_compressed(&mut self, frame_idx: usize) -> EgtResult<()> {
-        match &self.frames[frame_idx] {
-            FrameState::Empty | FrameState::CompressedOnFile => {
-                self.ensure_uncompressed(frame_idx)?;
-                self.ensure_compressed(frame_idx)
-            }
-            FrameState::Compressed(_) => {
-                // Already compressed
-                Ok(())
-            }
-            FrameState::Uncompressed {
-                uncompressed,
-                dirty,
-                ..
-            } => {
-                if !dirty {
-                    let mut temp = FrameState::Empty;
-                    std::mem::swap(&mut self.frames[frame_idx], &mut temp);
-                    if let FrameState::Uncompressed { compressed, .. } = temp {
-                        self.frames[frame_idx] = if compressed.is_empty() {
-                            FrameState::CompressedOnFile
-                        } else {
-                            FrameState::Compressed(compressed)
-                        };
-                    }
-                } else {
-                    // Regenerate the compressed bytes
-                    // TODO: Use the exact compressed frame bytes that would be used for the
-                    // full compressed file.
-                    use zeekstd::EncodeOptions;
-
-                    let mut compressed_bytes = vec![];
-                    let mut encoder = EncodeOptions::new()
-                        .compression_level(DEFAULT_COMPRESSION_LEVEL)
-                        .into_encoder(&mut compressed_bytes)?;
-
-                    // Transpose (bit-slice) the frame
-                    let transposed = transpose_frame(uncompressed);
-
-                    // Compress the transposed frame
-                    encoder.compress(&transposed)?;
-                    encoder.end_frame()?;
-                    encoder.finish()?;
-
-                    self.frames[frame_idx] = FrameState::Compressed(compressed_bytes);
-                }
-                Ok(())
-            }
-        }
+            decode_frame(&compressed, frame.len)?
+        } else {
+            vec![MaybeDtcOutcome::INVALID; frame.len]
+        };
+        self.frames[frame_idx] = Some(uncompressed);
+        Ok(())
     }
 }
 
@@ -908,11 +978,7 @@ mod tests {
             .into_position(CastlingMode::Standard)
             .unwrap();
         assert_eq!(file.probe_cached(&position).unwrap(), None);
-        assert!(
-            file.frames
-                .iter()
-                .all(|frame| matches!(frame, FrameState::Empty))
-        );
+        assert!(file.frames.iter().all(Option::is_none));
         let index = file.map_position_to_index(&position).unwrap();
         for outcome in [
             MaybeDtcOutcome::INVALID,
@@ -922,9 +988,6 @@ mod tests {
             file.write_to_index(index, outcome).unwrap();
             assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
         }
-        file.ensure_compressed(file.locate_frame(index).0).unwrap();
-        assert_eq!(file.probe_cached(&position).unwrap(), None);
-        assert_eq!(file.probe(&position).unwrap(), MaybeDtcOutcome::DRAW);
         file.save_to_file().unwrap();
         assert_eq!(file.probe_cached(&position).unwrap(), None);
     }
@@ -946,53 +1009,117 @@ mod tests {
                 .unwrap();
             file.save_to_file().unwrap();
         }
-        for preloaded in [false, true] {
-            let mut files = HashMap::new();
-            if preloaded {
-                files.insert(
-                    "KPa_K".to_string(),
-                    EgtFileReader::new_from_file(&input.0, "KPa_K").unwrap(),
-                );
+        let reader = SharedFileCache::new(
+            &Location::parse(&base.0).unwrap(),
+            Some(&Location::parse(&input.0).unwrap()),
+            None,
+        );
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = &reader;
+                let position = &position;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 {
+                        assert_eq!(reader.probe(position).unwrap(), outcome);
+                    }
+                });
             }
-            let reader = SharedDependencyReader::new(
-                files,
-                &Location::parse(&base.0).unwrap(),
-                Some(&Location::parse(&input.0).unwrap()),
-            );
-            let barrier = std::sync::Barrier::new(8);
-            std::thread::scope(|scope| {
-                for _ in 0..8 {
-                    let reader = &reader;
-                    let position = &position;
-                    let barrier = &barrier;
-                    scope.spawn(move || {
-                        barrier.wait();
-                        for _ in 0..20 {
-                            assert_eq!(reader.probe(position).unwrap(), outcome);
-                        }
-                    });
-                }
-            });
-            // A warm probe needs only shared guards for both registry and file.
-            let registry_guard = reader.files.read().unwrap();
-            let file = Arc::clone(registry_guard.get("KPa_K").unwrap());
-            let guard = file.read().unwrap();
-            assert_eq!(reader.probe(&position).unwrap(), outcome);
-            drop(guard);
-            drop(file);
-            drop(registry_guard);
-            let cache = reader.into_cache().unwrap();
-            assert_eq!(cache.len(), 1);
-            let file = &cache["KPa_K"];
-            assert_eq!(file.probe_cached(&position).unwrap(), Some(outcome));
-            assert_eq!(
-                file.frames
-                    .iter()
-                    .filter(|frame| matches!(frame, FrameState::Uncompressed { .. }))
-                    .count(),
-                1
-            );
+        });
+        // A warm probe needs only shared guards for both registry and file.
+        let registry_guard = reader.files.read().unwrap();
+        let file = Arc::clone(registry_guard.get("KPa_K").unwrap());
+        let guard = file.read().unwrap();
+        assert_eq!(reader.probe(&position).unwrap(), outcome);
+        assert_eq!(guard.probe_cached(&position).unwrap(), Some(outcome));
+        assert_eq!(
+            guard.frames.iter().filter(|frame| frame.is_some()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_cache_evicts_lru_frames_and_accounts_for_short_frames() {
+        let dir = crate::TestDir::new("shared_cache_lru");
+        let positions = [
+            ("KQ_K", "8/8/8/8/8/8/3Q4/K6k w - - 0 1"),
+            ("KR_K", "8/8/8/8/8/8/3R4/K6k w - - 0 1"),
+            ("KB_K", "8/8/8/8/8/8/3B4/K6k w - - 0 1"),
+        ];
+        let mut frame_bytes = None;
+        for (name, fen) in positions {
+            let position = fen
+                .parse::<Fen>()
+                .unwrap()
+                .into_position(CastlingMode::Standard)
+                .unwrap();
+            let mut file = EgtFileReader::new(&dir.0, name).unwrap();
+            let index = file.map_position_to_index(&position).unwrap();
+            file.write_to_index(index, MaybeDtcOutcome::DRAW).unwrap();
+            assert_eq!(file.num_frames(), 1);
+            let bytes = file.frame_bytes(0);
+            assert_eq!(bytes, file.index_range * 2);
+            assert_eq!(frame_bytes.get_or_insert(bytes), &bytes);
+            file.save_to_file().unwrap();
         }
+        let frame_bytes = frame_bytes.unwrap();
+        let cache = SharedFileCache::new(
+            &Location::parse(&dir.0).unwrap(),
+            None,
+            Some(2 * frame_bytes),
+        );
+        let positions = positions.map(|(name, fen)| {
+            (
+                name,
+                fen.parse::<Fen>()
+                    .unwrap()
+                    .into_position(CastlingMode::Standard)
+                    .unwrap(),
+            )
+        });
+        let resident = |name| {
+            let file = cache.file(name).unwrap();
+            let file = file.read().unwrap();
+            file.frames[0].is_some()
+        };
+
+        cache.probe(&positions[0].1).unwrap();
+        cache.probe(&positions[1].1).unwrap();
+        cache.probe(&positions[0].1).unwrap(); // Warm hit makes KR_K oldest.
+        cache.probe(&positions[2].1).unwrap();
+        assert!(resident("KQ_K"));
+        assert!(!resident("KR_K"));
+        assert!(resident("KB_K"));
+        assert_eq!(cache.memory.lock().unwrap().resident, 2 * frame_bytes);
+
+        cache.probe(&positions[1].1).unwrap();
+        assert!(!resident("KQ_K"));
+        assert!(resident("KR_K"));
+        assert!(resident("KB_K"));
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let cache = &cache;
+                let positions = &positions;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        for (_, position) in positions {
+                            assert_eq!(cache.probe(position).unwrap(), MaybeDtcOutcome::DRAW);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(cache.memory.lock().unwrap().resident <= 2 * frame_bytes);
+
+        cache.set_assigned_memory(0).unwrap();
+        assert_eq!(cache.memory.lock().unwrap().resident, 0);
+        assert!(positions.iter().all(|(name, _)| !resident(name)));
+        assert_eq!(cache.probe(&positions[0].1).unwrap(), MaybeDtcOutcome::DRAW);
+        assert!(!resident("KQ_K"));
+        assert_eq!(cache.memory.lock().unwrap().resident, 0);
     }
 
     #[test]
@@ -1021,10 +1148,10 @@ mod tests {
                 .unwrap();
             file.save_to_file().unwrap();
         }
-        let reader = SharedDependencyReader::new(
-            HashMap::new(),
+        let reader = SharedFileCache::new(
             &Location::parse(&base.0).unwrap(),
             Some(&Location::parse(&input.0).unwrap()),
+            None,
         );
         assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
         assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
@@ -1059,8 +1186,7 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let reader =
-            SharedDependencyReader::new(HashMap::new(), &Location::parse(&dir.0).unwrap(), None);
+        let reader = SharedFileCache::new(&Location::parse(&dir.0).unwrap(), None, None);
         assert!(
             matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
             dependency, source,
@@ -1071,7 +1197,7 @@ mod tests {
                 .join(TableId::parse("KPa_K").unwrap().relative_path("ggegt"))
                 .exists()
         );
-        assert!(reader.into_cache().unwrap().is_empty());
+        assert!(reader.is_empty());
     }
 
     #[test]
@@ -1230,10 +1356,7 @@ mod tests {
         // Save to file
         egt_file.save_to_file().unwrap();
         for f in 0..egt_file.frames.len() {
-            match egt_file.frames[f] {
-                FrameState::CompressedOnFile => {}
-                _ => panic!("frame {} should be compressed on file", f),
-            }
+            assert!(egt_file.frames[f].is_none(), "frame {f} should be cold");
         }
 
         // Probing the saved file re-reads the frame from disk.
@@ -1270,7 +1393,7 @@ mod tests {
             assert_eq!(reader.read_from_index(idx).unwrap(), values[idx]);
         }
         // Saving must not truncate disk-backed source data, including uncached frames.
-        reader.frames.fill(FrameState::CompressedOnFile);
+        reader.frames.fill(None);
         reader.save_to_file().unwrap();
         let mut reloaded = EgtFileReader::new_from_file(&dir.0, "KPa_K").unwrap();
         for idx in 0..reloaded.index_range {
@@ -1430,32 +1553,5 @@ mod tests {
             reader.read_from_index(0),
             Err(EgtError::Internal("truncated tablebase range"))
         ));
-    }
-
-    #[test]
-    fn egt_memory_compression_decompression() {
-        let test_dir = crate::TestDir::new("egt_memory_compression_decompression");
-        let path = test_dir.0.clone();
-        let mut egt_file = EgtFileReader::new(&path, "KPa_K").unwrap();
-
-        // Sample a position
-        let fen: Fen = "8/8/8/8/8/8/P7/K6k w - - 0 1".parse().unwrap();
-        let position = fen.into_position(CastlingMode::Standard).unwrap();
-        let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
-        let idx = egt_file.map_position_to_index(&position).unwrap();
-        egt_file.write_to_index(idx, outcome).unwrap();
-        assert_eq!(egt_file.probe(&position).unwrap(), outcome);
-
-        for f in 0..egt_file.frames.len() {
-            egt_file.ensure_compressed(f).unwrap();
-            match egt_file.frames[f] {
-                FrameState::Compressed(_) => {}
-                _ => panic!(),
-            }
-        }
-
-        // Probe again (triggers decompression from memory)
-        let loaded_outcome = egt_file.probe(&position).unwrap();
-        assert_eq!(loaded_outcome, outcome);
     }
 }
