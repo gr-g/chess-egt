@@ -24,7 +24,7 @@ struct Cli {
 
     /// Retained frame-cache memory (bytes, B, KiB, MiB, or GiB).
     #[arg(long, value_parser = parse_byte_size)]
-    memory: Option<usize>,
+    cache_size: Option<usize>,
 
     /// Number of generation and verification workers (0 uses Rayon's default).
     #[arg(long, default_value_t = 0)]
@@ -230,8 +230,8 @@ fn parse_byte_size(value: &str) -> Result<usize, String> {
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
     let mut prober = EgtProber::new(&cli.path)?;
     prober.with_threads(usize::from(cli.threads));
-    if let Some(memory) = cli.memory {
-        prober.with_assigned_memory(memory)?;
+    if let Some(cache_size) = cli.cache_size {
+        prober.with_cache_size(cache_size)?;
     }
     if let Some(ref input) = cli.input_path {
         prober.with_input_path(input)?;
@@ -241,8 +241,8 @@ fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
 
 fn configure_generator(generator: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
     generator.with_threads(usize::from(cli.threads));
-    if let Some(memory) = cli.memory {
-        generator.with_assigned_memory(memory);
+    if let Some(cache_size) = cli.cache_size {
+        generator.with_cache_size(cache_size);
     }
     if let Some(ref input) = cli.input_path {
         generator.with_input_path(input)?;
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_accepts_byte_sizes() {
+    fn cache_size_accepts_byte_sizes() {
         for (value, expected) in [
             ("123", 123),
             ("123B", 123),
@@ -306,15 +306,15 @@ mod tests {
             ("2MiB", 2 * 1024 * 1024),
             ("1GiB", 1024 * 1024 * 1024),
         ] {
-            let cli = Cli::try_parse_from(["chess-egt", "--memory", value]).unwrap();
-            assert_eq!(cli.memory, Some(expected));
+            let cli = Cli::try_parse_from(["chess-egt", "--cache-size", value]).unwrap();
+            assert_eq!(cli.cache_size, Some(expected));
         }
     }
 
     #[test]
-    fn memory_rejects_malformed_or_overflowing_sizes() {
+    fn cache_size_rejects_malformed_or_overflowing_sizes() {
         for value in ["", "MiB", "1.5GiB", "1KB", "-1", "18446744073709551615GiB"] {
-            let argument = format!("--memory={value}");
+            let argument = format!("--cache-size={value}");
             let error = Cli::try_parse_from(["chess-egt", &argument]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }

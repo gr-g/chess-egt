@@ -22,7 +22,7 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
 - Visibility and public interface.
 - Add stats without en passant positions to EgtFileStats and implement a verify_with_syzygy() function.script to check our stats against the Syzygy stats available on the internet.
-- Experiment with approach using capture/promotion unmoves for initialization.
+- Experiment with approach using capture/promotion unmoves for initialization. Perhaps allows to drop concurrency from `SharedFileCache`?
 - Frontend, cloning https://syzygy-tables.info/
 
 ## High-Level Architecture

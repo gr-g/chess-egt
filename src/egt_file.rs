@@ -157,28 +157,28 @@ pub(crate) struct SharedFileCache {
     files: RwLock<HashMap<String, Arc<RwLock<EgtFileReader>>>>,
     base_path: Location,
     input_path: Option<Location>,
-    memory: Mutex<CacheMemory>,
+    cache: Mutex<CacheMemory>,
 }
 
 impl SharedFileCache {
     pub(crate) fn new(
         base_path: &Location,
         input_path: Option<&Location>,
-        assigned_memory: Option<usize>,
+        cache_size: Option<usize>,
     ) -> Self {
         Self {
             files: RwLock::new(HashMap::new()),
             base_path: base_path.clone(),
             input_path: input_path.cloned(),
-            memory: Mutex::new(CacheMemory {
-                assigned: assigned_memory,
+            cache: Mutex::new(CacheMemory {
+                assigned: cache_size,
                 ..CacheMemory::default()
             }),
         }
     }
 
-    pub(crate) fn set_assigned_memory(&self, assigned: usize) -> EgtResult<()> {
-        self.memory
+    pub(crate) fn set_cache_size(&self, assigned: usize) -> EgtResult<()> {
+        self.cache
             .lock()
             .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?
             .assigned = Some(assigned);
@@ -335,21 +335,21 @@ impl SharedFileCache {
             file: Arc::as_ptr(file) as usize,
             frame,
         };
-        let mut memory = self
-            .memory
+        let mut cache = self
+            .cache
             .lock()
             .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-        memory.clock = memory.clock.wrapping_add(1);
-        let last_used = memory.clock;
-        let new_resident = memory
+        cache.clock = cache.clock.wrapping_add(1);
+        let last_used = cache.clock;
+        let new_resident = cache
             .resident
             .checked_add(bytes)
             .ok_or(EgtError::Internal("cache memory accounting overflow"))?;
-        if let Some(frame) = memory.frames.get_mut(&key) {
+        if let Some(frame) = cache.frames.get_mut(&key) {
             frame.last_used = last_used;
         } else {
-            memory.resident = new_resident;
-            memory.frames.insert(
+            cache.resident = new_resident;
+            cache.frames.insert(
                 key,
                 CachedFrame {
                     file: Arc::downgrade(file),
@@ -358,20 +358,20 @@ impl SharedFileCache {
                 },
             );
         }
-        Ok(memory.assigned.is_some_and(|limit| memory.resident > limit))
+        Ok(cache.assigned.is_some_and(|limit| cache.resident > limit))
     }
 
     fn enforce_limit(&self) -> EgtResult<()> {
         loop {
             let victim = {
-                let memory = self
-                    .memory
+                let cache = self
+                    .cache
                     .lock()
                     .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-                if memory.assigned.is_none_or(|limit| memory.resident <= limit) {
+                if cache.assigned.is_none_or(|limit| cache.resident <= limit) {
                     return Ok(());
                 }
-                memory
+                cache
                     .frames
                     .iter()
                     .min_by_key(|(_, frame)| frame.last_used)
@@ -383,15 +383,15 @@ impl SharedFileCache {
                 ));
             };
             let Some(file) = weak_file.upgrade() else {
-                let mut memory = self
-                    .memory
+                let mut cache = self
+                    .cache
                     .lock()
                     .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-                if memory.frames.get(&key).map(|frame| frame.last_used) == Some(last_used) {
-                    let frame = memory.frames.remove(&key).ok_or(EgtError::Internal(
+                if cache.frames.get(&key).map(|frame| frame.last_used) == Some(last_used) {
+                    let frame = cache.frames.remove(&key).ok_or(EgtError::Internal(
                         "cache frame missing during stale-entry removal",
                     ))?;
-                    memory.resident -= frame.bytes;
+                    cache.resident -= frame.bytes;
                 }
                 continue;
             };
@@ -401,11 +401,11 @@ impl SharedFileCache {
             let mut file = file
                 .write()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            let mut memory = self
-                .memory
+            let mut cache = self
+                .cache
                 .lock()
                 .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-            if memory.frames.get(&key).map(|frame| frame.last_used) != Some(last_used) {
+            if cache.frames.get(&key).map(|frame| frame.last_used) != Some(last_used) {
                 continue;
             }
             if file.seek_table.is_none() || file.frames[key.frame].is_none() {
@@ -414,22 +414,22 @@ impl SharedFileCache {
                 ));
             }
             file.frames[key.frame] = None;
-            let frame = memory
+            let frame = cache
                 .frames
                 .remove(&key)
                 .ok_or(EgtError::Internal("cache frame missing during eviction"))?;
-            memory.resident -= frame.bytes;
+            cache.resident -= frame.bytes;
         }
     }
 
     fn forget_file(&self, file: &Arc<RwLock<EgtFileReader>>) -> EgtResult<()> {
         let file_id = Arc::as_ptr(file) as usize;
-        let mut memory = self
-            .memory
+        let mut cache = self
+            .cache
             .lock()
             .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
         let mut released = 0;
-        memory.frames.retain(|key, frame| {
+        cache.frames.retain(|key, frame| {
             if key.file == file_id {
                 released += frame.bytes;
                 false
@@ -437,7 +437,7 @@ impl SharedFileCache {
                 true
             }
         });
-        memory.resident -= released;
+        cache.resident -= released;
         Ok(())
     }
 
@@ -474,12 +474,12 @@ impl SharedFileCache {
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
             .clear();
-        let mut memory = self
-            .memory
+        let mut cache = self
+            .cache
             .lock()
             .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-        memory.frames.clear();
-        memory.resident = 0;
+        cache.frames.clear();
+        cache.resident = 0;
         Ok(())
     }
 
@@ -1092,7 +1092,7 @@ mod tests {
         assert!(resident("KQ_K"));
         assert!(!resident("KR_K"));
         assert!(resident("KB_K"));
-        assert_eq!(cache.memory.lock().unwrap().resident, 2 * frame_bytes);
+        assert_eq!(cache.cache.lock().unwrap().resident, 2 * frame_bytes);
 
         cache.probe(&positions[1].1).unwrap();
         assert!(!resident("KQ_K"));
@@ -1112,14 +1112,14 @@ mod tests {
                 });
             }
         });
-        assert!(cache.memory.lock().unwrap().resident <= 2 * frame_bytes);
+        assert!(cache.cache.lock().unwrap().resident <= 2 * frame_bytes);
 
-        cache.set_assigned_memory(0).unwrap();
-        assert_eq!(cache.memory.lock().unwrap().resident, 0);
+        cache.set_cache_size(0).unwrap();
+        assert_eq!(cache.cache.lock().unwrap().resident, 0);
         assert!(positions.iter().all(|(name, _)| !resident(name)));
         assert_eq!(cache.probe(&positions[0].1).unwrap(), MaybeDtcOutcome::DRAW);
         assert!(!resident("KQ_K"));
-        assert_eq!(cache.memory.lock().unwrap().resident, 0);
+        assert_eq!(cache.cache.lock().unwrap().resident, 0);
     }
 
     #[test]

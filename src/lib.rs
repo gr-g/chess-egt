@@ -78,7 +78,7 @@ impl PartialOrd for DtcOutcome {
 
 pub struct EgtGenerator {
     base_path: Location,
-    assigned_memory: Option<usize>,
+    cache_size: Option<usize>,
     input_path: Option<Location>,
     verify: bool,
     threads: usize,
@@ -97,7 +97,7 @@ impl EgtGenerator {
     pub(crate) fn from_location(location: Location) -> Self {
         Self {
             base_path: location,
-            assigned_memory: None,
+            cache_size: None,
             input_path: None,
             verify: true,
             threads: 0,
@@ -111,8 +111,8 @@ impl EgtGenerator {
 
     /// Sets the shared dependency-frame cache budget in bytes.
     /// Generation working arrays are allocated separately.
-    pub fn with_assigned_memory(&mut self, n: usize) {
-        self.assigned_memory = Some(n);
+    pub fn with_cache_size(&mut self, n: usize) {
+        self.cache_size = Some(n);
     }
 
     /// Resolves an additional local directory or object-store URL for dependencies.
@@ -142,7 +142,7 @@ impl EgtGenerator {
     /// Deduplicates selectors into twin-pair jobs, ordered by pieces then pawns.
     /// Reuses one Rayon pool and shares dependency frames with verification.
     /// The cache is released between material families, with LRU eviction when
-    /// an assigned cache-memory limit is configured. Completed pairs are
+    /// an assigned cache-size limit is configured. Completed pairs are
     /// published and optionally verified before the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let plan = GenerationPlan::new(resolve_selectors(selectors)?)?;
@@ -154,7 +154,7 @@ impl EgtGenerator {
         let reader = SharedFileCache::new(
             &self.base_path,
             self.input_path.as_ref(),
-            self.assigned_memory,
+            self.cache_size,
         );
         let mut results = Vec::new();
         let mut previous_material = None;
@@ -240,8 +240,8 @@ impl EgtProber {
     }
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
-    pub fn with_assigned_memory(&mut self, n: usize) -> EgtResult<()> {
-        self.cache.set_assigned_memory(n)
+    pub fn with_cache_size(&mut self, n: usize) -> EgtResult<()> {
+        self.cache.set_cache_size(n)
     }
 
     /// Resolves an additional local directory or object-store URL for table lookup.
@@ -847,22 +847,22 @@ mod tests {
     }
 
     #[test]
-    fn bounded_cache_memory_supports_generation_verification_and_probing() {
-        let dir = TestDir::new("bounded_cache_memory");
+    fn bounded_cache_size_supports_generation_verification_and_probing() {
+        let dir = TestDir::new("bounded_cache_size");
         // Fit both queen-table frames, but force eviction when K_K is also probed.
         let cache_bytes = 2 * Egt::from_tablename("KQ_K").unwrap().index_range() * 2;
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
         generator.with_threads(2);
-        generator.with_assigned_memory(cache_bytes);
+        generator.with_cache_size(cache_bytes);
         let tables = generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
         assert_eq!(tables.len(), 3);
 
         let mut prober = EgtProber::new(&dir.0).unwrap();
         prober.with_threads(2);
-        prober.with_assigned_memory(cache_bytes).unwrap();
+        prober.with_cache_size(cache_bytes).unwrap();
         prober.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
 
-        let reference = TestDir::new("bounded_cache_memory_reference");
+        let reference = TestDir::new("bounded_cache_size_reference");
         unverified_generator(&reference.0)
             .generate_selected(&["K_K", "KQ_K"])
             .unwrap();
@@ -881,16 +881,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_cache_memory_supports_generation_verification_and_probing() {
-        let dir = TestDir::new("zero_cache_memory");
+    fn zero_cache_size_supports_generation_verification_and_probing() {
+        let dir = TestDir::new("zero_cache_size");
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
         generator.with_threads(2);
-        generator.with_assigned_memory(0);
+        generator.with_cache_size(0);
         generator.generate("K_K").unwrap();
 
         let mut prober = EgtProber::new(&dir.0).unwrap();
         prober.with_threads(2);
-        prober.with_assigned_memory(0).unwrap();
+        prober.with_cache_size(0).unwrap();
         prober.verify_internal_consistency("K_K").unwrap();
         let egt = Egt::from_tablename("K_K").unwrap();
         let position = (0..egt.index_range())
