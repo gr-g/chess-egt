@@ -12,8 +12,8 @@ loops in its Section 2.A.
 **Status:** Steps 1-4, selector-based serial job scheduling and object storage in
 Step 5, and the local per-position optimizations in Step 6 are implemented.
 Distributed job scheduling/completion manifests and the worker backend in Step 7
-remain proposals. Timing and reference results below are historical measurements,
-not validation of the current individual-table storage layout.
+remain proposals. Historical benchmark results are marked as such; Sections 2.2
+and 9 use generation runs with the current individual-table storage layout.
 
 ---
 
@@ -38,8 +38,8 @@ not validation of the current individual-table storage layout.
 - **At 7 pieces, the cost per position dominates everything.** A 5x faster core
   loop saves more than any parallelization design.
 - **Cloud cost (speculative, Section 9):** all 6-piece tables take about one day
-  on ~10 large AWS instances for $500-900 on-demand. All 7-piece tables take
-  3-5 weeks on ~50 instances for roughly $300k on-demand ($60k-150k on spot),
+  on two large AWS instances for $300-500 on-demand. All 7-piece tables take
+  2-4 weeks on ~50 instances for roughly $180k on-demand ($33k-83k on spot),
   plus ~$2k/month to keep them on S3 Standard.
 
 ---
@@ -77,18 +77,27 @@ indices.
 
 ### 2.2 Compute
 
-- 5-piece generation took 26 h for 2.6 × 10¹⁰ positions, i.e. ~3.6 µs per
-  position, single-threaded.
-- From 4 to 5 pieces, the number of positions grew ~200x and the time ~480x:
-  the cost per position also grows with the number of pieces (more moves, more
-  unmoves, longer decode/encode).
+Measured generation-only runs (`--noverify`) on the reference AMD Ryzen 7 5700G,
+using two threads:
 
-Extrapolating with the same factors:
+| Pieces | Individual tables | Index positions | Wall time | Core-hours | Core time / index position |
+|---|---:|---:|---:|---:|---:|
+| 4 | 176 | 156,642,876 | 2 m 18 s | 0.077 | 1.76 µs |
+| 5 | 1,496 | 35,603,758,980 | 9 h 38 m 05 s | 19.27 | 1.95 µs |
 
-| Pieces | Positions (all tables, order of magnitude) | Core-hours (order of magnitude) |
-|---|---|---|
-| 6 | ~5 × 10¹² | ~10⁴ (about a week on one 64-core node) |
-| 7 | ~10¹⁵ | ~10⁶-10⁷ |
+Core-hours are wall time times two. The 5-piece run covers 26.04 billion unique
+positions, so its cost is also 2.66 µs per unique position. From 4 to 5 pieces,
+index positions grew 227x and core time 251x; cost per index position therefore
+grew only 1.11x.
+
+Extrapolation to deeper tables remains uncertain. Using the conservative
+assumptions of Section 9.2 (1.5-2.4x cost growth per additional piece and 70%
+parallel efficiency):
+
+| Pieces | Index positions (all tables) | Core-hours |
+|---|---:|---:|
+| 6 | 5.69 × 10¹² | 7k-11k (central estimate 9k) |
+| 7 | 6.93 × 10¹⁴ | 1.2M-3.1M (central estimate 2.1M) |
 
 ---
 
@@ -673,38 +682,44 @@ AWS price list). Spot prices are a snapshot and fluctuate.
 
 ### 9.1 Problem size
 
-Computed from the indexing scheme; the model reproduces the measured
-`index_range` totals of the 4- and 5-piece tables within 0.1%.
+Computed directly by enumerating the current selectors and constructing each
+`Indexer`. Index positions sum the `index_range` of every individual table.
 
-| Pieces | Table files | Index positions | Largest pair (2 B/pos) | Work by largest-pair memory |
-|---|---:|---:|---|---|
-| 5 | 110 | 3.6 × 10¹⁰ | 0.4 GB | all small |
-| 6 | 365 | 5.7 × 10¹² | 25 GB | 100% ≤ 50 GB |
-| 7 | 1001 | 6.9 × 10¹⁴ | 1.43 TB | ≤ 300 GB: 35%, ≤ 700 GB: 31%, 0.7-1.43 TB: 34% |
+| Pieces | Table files | Twin-pair jobs | Index positions | Largest working pair | Work by working-pair memory |
+|---|---:|---:|---:|---:|---|
+| 5 | 1,496 | 748 | 3.56 × 10¹⁰ | 0.42 GB | all small |
+| 6 | 10,530 | 5,342 | 5.69 × 10¹² | 25 GB | 100% ≤ 50 GB |
+| 7 | 63,816 | 31,908 | 6.93 × 10¹⁴ | 1.43 TB | ≤ 300 GB: 35%, ≤ 700 GB: 31%, 0.7-1.43 TB: 34% |
 
-A "table file" counts an endgame and its color-swapped twin once, since they are
-generated together. Typical 7-piece tables: the median file has ~4 × 10¹¹
-positions (~200 GB pair); the position-weighted median is a one-pawn file such
-as `KP_KQBNN` with ~1.2 × 10¹² positions (pairs of ~1.17 TB).
+A table file is one exact canonical table, including pawn files and within-file
+color order. Quiet-move twins are generated together; a working pair holds both
+sides-to-move at 2 bytes per position. The median 7-piece file has only
+~2.7 × 10⁸ positions (~1.1 GB working pair), but the position-weighted median is
+`KRRPb_KQB` with ~1.47 × 10¹¹ positions (~587 GB working pair). Scheduling must
+therefore handle many tiny jobs and a heavy tail, rather than treating all files
+in one material family as one job.
 
 ### 9.2 Compute model and assumptions
 
-- **Reference cost:** ~2.6 µs per index position, single-threaded, on the
-  reference machine (AMD Ryzen 7 5700G, 5-piece generation, Section 2.2 counts
-  ~3.6 µs per *unique* position).
-- **Growth with the number of pieces:** the cost per position grew 2.4x from 4
-  to 5 pieces; assumed 1.5-2.4x per additional piece (central value 2x).
-- **Parallel efficiency:** 70%, plus ~30% idle cores at 6-7 pieces while
-  waiting for dependencies. Verification is not included (`--noverify`).
+- **Reference cost:** 1.95 µs per index position, measured over all 5-piece
+  tables with two threads on the reference AMD Ryzen 7 5700G. This is 19.27
+  core-hours, or 2.66 µs per *unique* position (Section 2.2).
+- **Growth with the number of pieces:** measured growth from 4 to 5 pieces is
+  only 1.11x per position, but deeper tables have more moves and can require
+  more low-yield ply scans. Retain a conservative 1.5-2.4x per additional piece
+  (central value 2x) until large 6-piece tables have been measured.
+- **Parallel efficiency:** 70% within jobs. Dependency stalls and fleet
+  scheduling can add further idle time. Verification is not included
+  (`--noverify`).
 - **Per-core speed (assumed, not measured):** one Zen 4 vCPU (`c7a`, `hpc7a`)
   ≈ one 5700G core; Zen 5 (`c8a`) ≈ 1.15x; Graviton4 ≈ 0.75x on this branchy
   integer code (see open question 7). On AMD 7th generation and later and on
   Graviton instances, one vCPU is one physical core. Intel instances (one vCPU
   is one hyperthread) were not considered.
 
-Resulting compute: ~40 core-hours for all 5-piece tables, ~12k (9k-14k) for
-all 6-piece tables, ~2.9M (1.6M-4.1M) for all 7-piece tables, in Zen-4
-core-hours.
+Resulting compute: 19.27 measured core-hours for all 5-piece tables, ~9k
+(7k-11k) for all 6-piece tables, and ~2.1M (1.2M-3.1M) for all 7-piece tables,
+in Zen-4-equivalent core-hours.
 
 ### 9.3 Instance choice
 
@@ -725,29 +740,36 @@ core-hours.
 - **7 pieces:** memory-optimized instances, in three tiers by pair size:
   `m8g`/`hpc7a` up to 300 GB, `r8g` up to 700 GB, `x8g` above. Blended cost
   ~$0.085 per Zen-equivalent core-hour on-demand, ~$0.027 on spot.
-- **Several jobs per instance** rather than one 192-thread job, while
-  finalization (compression) is serial: it took 19% of the single-thread time
-  on `KQB_KQ` (Step 4), capping a single job at ~5x speedup. About 8 jobs ×
-  24 threads per instance works for 6 pieces; at 7 pieces one table fills the
-  memory of an instance, so finalization must be parallelized first.
+- **Pack small jobs by CPU and memory.** The current layout provides 5,342
+  6-piece and 31,908 7-piece twin-pair jobs. Several jobs per instance amortize
+  startup and dependency loading and keep cores busy. Finalization already uses
+  the same Rayon pool as propagation, so it no longer imposes the old serial
+  compression cap. A large 7-piece pair can still fill an instance by itself;
+  scaling to 192 threads remains unmeasured.
 
 ### 9.4 Time and EC2 cost
 
+Per-table rows below are for a twin-pair job and span the cost-growth range in
+Section 9.2. They include propagation, initialization and parallel finalization
+through the measured per-position reference cost, but not verification or
+unmodeled dependency stalls.
+
 | Target | Fleet | Wall time | On-demand | Spot |
 |---|---|---|---:|---:|
-| All 5-piece | 1 × `c7a`/`c8a.24xlarge` | < 1 h | < $10 | ~$3 |
-| All 6-piece | 10 × `hpc7a.96xlarge` (or spot `c7a`/`m8g`) | ~1 day | $500-900 | $200-400 |
-| One median 7-piece table (~200 GB pair) | 1 × `hpc7a`/`m8g` | ~9-12 h | $50-150 | $20-50 |
-| One heavy one-pawn 7-piece table (e.g. `KRP_KQBN`, 4 pairs of 1.17 TB) | 1 × `x8g.48xlarge` | ~3 days | $700-1,800 | $200-500 |
-| One largest pawnless 7-piece table (e.g. `KQ_KQRBN`, 1.43 TB) | 1 × `x8g.48xlarge` | ~1 day | $200-550 | ~$100 |
-| All 7-piece | ~50 instances in three memory tiers (~9,600 vCPUs) | 3-5 weeks | $180k-460k (~$300k) | $60k-150k |
+| All 5-piece | 1 × `c7a`/`c8a.24xlarge` | < 1 h | < $5 | ~$2 |
+| All 6-piece | 2 × `hpc7a.96xlarge` (or spot `c7a`/`m8g`) | ~18-28 h | $300-500 | $125-200 |
+| Position-weighted median 7-piece pair (`KRRPb_KQB`, 587 GB) | 1 × `m8g.48xlarge` | ~4-9 h | $30-80 | $14-35 |
+| Heavy one-pawn 7-piece pair (`KRPa_KQBN`, 1.17 TB) | 1 × `x8g.48xlarge` | ~7-18 h | $130-340 | $32-83 |
+| Largest pawnless 7-piece pair (`KN_KQRBN`, 1.43 TB) | 1 × `x8g.48xlarge` | ~9-22 h | $160-420 | $40-100 |
+| All 7-piece | ~50 instances in three memory tiers (~9,600 vCPUs) | 2-4 weeks | $100k-260k (~$180k) | $33k-83k |
 
-- The 7-piece wall time is set by the dependency chain (heavy tables of ~3 days
-  each, chained through promotions), not by the fleet size: more instances do
-  not shorten it much.
+- Individual heavy jobs are now hours rather than days. The all-7-piece wall
+  time is instead dominated by total fleet throughput and promotion/capture
+  dependencies. The fleet must scale down around dependency stalls; leaving all
+  instances running while idle raises the cost above the table.
 - 1-year reserved pricing reduces the 7-piece bill by ~35-40%.
-- Spot requires checkpointing (Section 5.6): 7-piece jobs run for days, and
-  counter decrements cannot be safely replayed after an interruption.
+- Spot requires checkpointing (Section 5.6): counter decrements cannot be safely
+  replayed after an interruption, even though individual jobs are shorter.
 
 ### 9.5 S3 storage (per month)
 
@@ -756,7 +778,7 @@ Assumed compressed sizes: 0.85 bits per index position at 5 pieces (measured),
 
 | Set | Size | Standard ($0.023/GiB, $0.022 above 50 TiB) | Standard-IA ($0.0125) | Glacier Instant Retrieval ($0.004) | Deep Archive ($0.00099) |
 |---|---|---:|---:|---:|---:|
-| 5-piece | 3.5 GiB (measured) | $0.08 | $0.04 | ~$0.01 | ~$0 |
+| 5-piece | 3.51 GiB (measured) | $0.08 | $0.04 | ~$0.01 | ~$0 |
 | 6-piece | ~0.6-0.8 TiB | ~$16 | ~$9 | ~$3 | ~$1 |
 | 7-piece | ~80-120 TiB | $1.8k-2.7k (~$2.2k) | ~$1.2k | ~$390 | ~$95 (not usable for serving) |
 
@@ -769,12 +791,10 @@ Assumed compressed sizes: 0.85 bits per index position at 5 pieces (measured),
 ### 9.6 Prerequisites and levers
 
 - **6 pieces is feasible with the current code**, given simple orchestration:
-  one `--generate <endgame>` job per table, in dependency order, with
+  one `--generate <endgame>` job per twin pair, in dependency order, with
   dependencies read through `--input-path s3://...` (Step 5).
-- **7 pieces is not**, and the estimates above assume: parallel finalization
-  (compression), LRU eviction of the dependency cache, checkpoints (for spot),
-  and validated thread scaling up to 192 cores (only measured up to 4 threads:
-  1.94x, Step 4).
-- **Step 6 is the main lever:** a 3-5x lower cost per position (e.g. avoiding
-  the `from_setup` re-validation) brings the 7-piece bill to ~$60k-100k
-  on-demand.
+- **7 pieces is not**, and the estimates above assume: distributed scheduling,
+  LRU eviction of the dependency cache, checkpoints (for spot), and validated
+  thread scaling up to 192 cores. Parallel finalization is already implemented;
+  the full 5-piece run used 2 threads, and the older scaling measurement reached
+  only 4 threads (1.94x, Step 4).
