@@ -1,4 +1,4 @@
-use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
+use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, PositionError, Chess};
 use arrayvec::ArrayVec;
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 use crate::error::EgtResult;
@@ -593,7 +593,10 @@ impl Indexer {
         };
         setup.ep_square = ep_square;
 
-        if let Ok(position) = setup.position::<Chess>(CastlingMode::Standard) {
+        if let Ok(position) = setup
+            .position::<Chess>(CastlingMode::Standard)
+            .or_else(PositionError::ignore_impossible_check)
+        {
             if position.legal_ep_square() == ep_square {
                 Some(position)
             } else {

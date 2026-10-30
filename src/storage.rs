@@ -1,6 +1,6 @@
 //! Location parsing and the async boundary for synchronous tablebase operations.
 //!
-//! Each root requires an immutable `format.json` identifying format `ggegt-v1`.
+//! Each root requires an immutable `format.json` identifying the format.
 //! Generation creates it conditionally; readers only validate it. Table data and
 //! optional statistics use `TableId::relative_path("ggegt")` and `relative_path("json")`.
 //! Neither probing nor format validation requires statistics.
@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-const TABLEBASE_FORMAT: &str = "ggegt-v1";
+const TABLEBASE_FORMAT: &str = "ggegt-v0.9";
 pub(crate) const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 
 /// Root metadata is immutable and independent of optional per-table statistics.
@@ -219,7 +219,7 @@ mod tests {
         let after = block_on(location.store.get(&key)).unwrap();
         assert_eq!(before, block_on(after.bytes()).unwrap());
         let actual: serde_json::Value = serde_json::from_slice(&before).unwrap();
-        assert_eq!(actual, serde_json::json!({ "format": "ggegt-v1" }));
+        assert_eq!(actual, serde_json::json!({ "format": TABLEBASE_FORMAT }));
     }
 
     #[test]

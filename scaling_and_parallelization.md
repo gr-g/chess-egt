@@ -586,21 +586,6 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   `ObjectStoreScheme::parse`, not inferred by reparsing the display string.
   Generic HTTP is read-only and rejected early as a generation destination;
   HTTPS cloud URLs recognized by `object_store` retain backend write support.
-- Each exact canonical table has its own
-  `n/maxvmin/opK/Npawns/name.ggegt` object and optional `.json` statistics
-  sidecar, with both orientations sharing a directory split but not a filename.
-  Root `format.json` contains only `format: "ggegt-v1"`. Generation conditionally
-  creates or validates this immutable descriptor; reads only validate it, without
-  requiring statistics.
-- Lookups prefer `--input-path`, falling back to `--path` only on `NotFound`;
-  probing also honors the input location. After root format validation, readers
-  load the checksum-free seek table with one suffix GET, validate its frame
-  count before parsing, and fetch
-  one compressed frame range per cold miss. The shared in-memory dependency
-  cache is unchanged: **no LRU eviction yet**. Remote dependencies warm this
-  cache during generation, but cold requests add latency and request/transfer
-  costs. Local input with remote output is an alternative; measure these costs
-  before deploying a fleet.
 - One finalized table's compressed frame batches are retained in memory until
   its immediate publication. Publication streams segments and the final seek table through
   the `object_store` buffered writer: a small-object PUT or multipart upload with

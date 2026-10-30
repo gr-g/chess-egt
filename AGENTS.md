@@ -20,9 +20,13 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
+- Add option `--generate-stats`.
+- `--generate` does not replace existing table.
+- Rewrite README.
 - Internal module layout; visibility and public interface.
 - Experiment with approach using capture/promotion unmoves for initialization. Perhaps reconsider concurrency in `SharedFileCache` if only useful for validation.
 - Frontend, cloning https://syzygy-tables.info/
+- Explore possibility of generating tables that store together DTC and DTM for the same index, not only DTC.
 
 ## High-Level Architecture
 The project is built from the following main components:

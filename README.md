@@ -1,11 +1,11 @@
-# Chess Endgame Tablebases
-Work-in-progress repository with experiments to build from scratch [Chess Endgame Tablebases (EGTs)](https://www.chessprogramming.org/Endgame_Tablebases).
+# GG Endgame Tablebase
+Work-in-progress repository with experiments to build from scratch a [Chess Endgame Tablebase](https://www.chessprogramming.org/Endgame_Tablebases).
 
 Goals:
  - Provide tablebases with the Depth to Conversion (DTC) metric, particularly suitable for applications such as practicing endgames against the computer.
  - Provide a clean, readable Rust codebase that people interested in generating chess tablebase can understand, modify and use in other projects, even if performance is not super-optimized as in the state-of-the-art [Syzygy](https://www.chessprogramming.org/Syzygy_Bases) code.
 
-# Usage
+## Usage
 
 ```sh
 # Generate the prerequisites and all 3-piece tables locally.
@@ -51,16 +51,16 @@ Chess rules and position validation use the upstream
 [`shakmaty`](https://crates.io/crates/shakmaty) crate. Retrograde analysis
 is implemented locally for the tablebase solver.
 
-# Design Specifications
+## Design Specifications
 
-## 1. High-Level Architecture
+### 1. High-Level Architecture
 The project is built from the following main components:
 1. **Outcome Representation (`DtcOutcome`)**: Encodes the game outcome (Win/Loss/Draw), distance-to-conversion (DTC), and conversion type (Checkmate, Promotion, or Capture) into a compact 16-bit value.
 2. **Logical Indexing Layer (`Egt`, `Indexer`)**: Maps canonical chess board positions to a contiguous index space `[0, index_range)`.
 3. **Storage & Memory Layer (`EgtFileReader`, `EgtFileWriter`, `SharedFileCache`)**: Manages the physical access to files (via `object_store`), seekable Zstd compression/decompression (via `zeekstd`), and in-memory frame cache.
-4. **Retrograde Analysis** (`RetrogradeSolver`): The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
+4. **Retrograde Analysis (`RetrogradeSolver`)**: The backward-propagation algorithm to generate the outcomes, starting from terminal positions (checkmates and known winning/losing positions) and moving backwards to identify all other winning/losing positions.
 
-## 2. Outcome Representation (`DtcOutcome`)
+### 2. Outcome Representation (`DtcOutcome`)
 Each position's outcome is represented by a 16-bit `DtcOutcome` value.
 
 The 16 bits of a `DtcOutcome` are structured as follows:
@@ -73,13 +73,25 @@ The 16 bits of a `DtcOutcome` are structured as follows:
   - `0b011`: Loss - Opponent can force checkmate in n plies (n = 0 for checkmated positions)
   - `0b101`: Loss - Opponent can force a capture in n plies converting to a losing position
   - `0b111`: Loss - Opponent can force a promotion in n plies converting to a losing position
-- **Bits 3-15 (Distance to Conversion)**:
+- **Bits 3-15 (Depth to Conversion)**:
   - A 13-bit unsigned integer representing the number of plies to conversion. This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
-## 3. Indexing & Symmetries
+### 3. Indexing
 
-### 3.1 `Egt` and `Indexer`
-An `Egt` contains positions with fixed material, pawn files, and the exact color order of pawns on each file. An `Egt` has a name such as `KQ_KPc` (king and queen versus king and pawn on the c file). The name has the side-to-move (STM) on the left and the side-not-to-move (SNTM) on the right.
+The tablebase is designed to store DTC outcomes for a set of chess positions (_queryable positions_) defined as: _valid positions_ with up to 8 pieces without castling rights.
+
+For this purpose, a position is considered _valid_ if it fulfills the validity requirements defined by the `shakmaty` library [here](https://docs.rs/shakmaty/latest/shakmaty/struct.PositionErrorKinds.html), except that positions with "impossible checks" (such as positions where three pieces give a check at the same time) are also considered valid. In other words, `shakmaty::Chess` objects (with up to 8 pieces and without castling rights) returned from code such as the following correspond to positions that can be successfully queried.
+
+```rust
+let position: Chess = "8/8/8/8/8/8/P7/K6k w - -"
+    .parse::<Epd>()
+    .unwrap()
+    .into_position(CastlingMode::Standard)
+    .or_else(PositionError::ignore_impossible_check)?
+```
+
+#### 3.1 `Egt` and `Indexer`
+An `Egt` contains positions with fixed material, pawn files, and the exact color order of pawns on each file. An `Egt` has a name such as `KQ_KPc` (king and queen versus king and pawn on the _c_ file). The name has the side-to-move (STM) on the left and the side-not-to-move (SNTM) on the right.
 
 Pawn tokens are `Pa` through `Ph`, with a trailing `o` ("opposed") if the **nearest pawn ahead on that file** is an enemy pawn. A friendly pawn ahead, or no pawn ahead, leaves the token unmarked. Within each file, each side's tokens run from its own backrank toward promotion. For example:
 
@@ -99,7 +111,7 @@ The `Indexer` handles the mapping of positions to a contiguous local index range
 
 En-passant positions are encoded separately in different ranges of indices (sub-tables) managed internally by the `Indexer`. The `Indexer` exposes a single unified index range for the entire `Egt`.
 
-#### Local Indexing Algorithm (`board_to_index`)
+##### Local Indexing Algorithm (`board_to_index`)
 The `Indexer` maps a chess position to a unique integer in `[0, index_range)` using a multi-step compaction and combinatorial encoding process:
 
    - The indexer checks whether a legal en-passant capture is available. A raw EP square without a legal capture is equivalent to no EP.
@@ -120,14 +132,14 @@ The `Indexer` maps a chess position to a unique integer in `[0, index_range)` us
    - The final index is:
      $$\text{local\_index} = \text{index\_offset} + \text{aggregated\_combinations}$$
 
-### 3.2 Table identity and storage
+#### 3.2 Table identity and storage
 `TableId` is a validated canonical name (`String`); logical elements are parsed
 only for construction and planning. Probes build names in a stack buffer and
 borrow them for cache lookup, allocating an owned name only on a cache miss.
 `Egt` supplies the logical indexing; `EgtFileReader` holds one `Egt`, its identity,
 and its storage/frame cache.
 
-## 4. File Format & Compression
+### 4. File Format & Compression
 Each canonical table is one seekable Zstd object (via `zeekstd`), with an optional
 JSON statistics file at the same relative path:
 
@@ -140,8 +152,6 @@ JSON statistics file at the same relative path:
 Here `n` counts all pieces including kings, `max`/`min` are the two side piece
 counts in descending order, `K` counts mutually opposing pawn pairs (once per
 pair), and `N` counts pawns.
-
-The immutable root `format.json` contains only `format: "ggegt-v1"`.
 
 - Frames contain at most `256 * 1024` positions, with a short, unpadded final frame.
 - Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the single table's index range and validates it against the seek table.
@@ -157,7 +167,7 @@ The transposed buffer is always exactly `2 * N` bytes: high bytes for non-invali
 in frame order without recompression and appends one seek table through the
 `object_store` buffered writer.
 
-## 5. Memory Management
+### 5. Memory Management
 
 Generation uses separate flat `Vec<AtomicU16>` arrays for the pair being solved.
 These arrays are allocated with `try_reserve_exact`, so allocation failure is
@@ -170,15 +180,15 @@ Selected jobs run serially while reusing one Rayon pool and a `SharedFileCache`
 across jobs within each material family. Probing and verification use the same
 cache implementation.
 
-### 5.1 Frame Caching
+#### 5.1 Frame Caching
 A frame is either resident as uncompressed outcomes or absent. The shared cache
 tracks resident frames across all files and evicts the least recently used
 clean stored frame when over budget.
 
-## 6. Retrograde Analysis
+### 6. Retrograde Analysis
 Retrograde analysis generates endgame tablebases by working backward from terminal positions (checkmates, stalemates, and conversions) to determine the outcome and distance-to-conversion (DTC) for all other positions.
 
-### 6.1 Simultaneous Propagation
+#### 6.1 Simultaneous Propagation
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis is run on both tables simultaneously in a single unified loop. Both tables are initialized and propagated together.
 
 Quiet moves preserve the pawn color order on every file, so propagation stays within one table/twin pair. Captures (including en passant) and promotions probe existing dependency tables during initialization. Only one pair's working arrays are active; each finalized table is published independently.
@@ -195,7 +205,7 @@ blocks in the generation pool; standalone verification creates its own pool. See
 [`scaling_and_parallelization.md`](scaling_and_parallelization.md) for
 validation and measured scaling.
 
-### 6.2 `MaybeDtcOutcome` & Zero-Overhead Move Counters
+#### 6.2 `MaybeDtcOutcome` & Zero-Overhead Move Counters
 `MaybeDtcOutcome` is a wrapper around an `u16` used to represent the values
 that are updated during retrograde analysis and that will eventually become a `DtcOutcome`.
 
@@ -206,7 +216,7 @@ The move counter is generally initialized as the number of legal moves in a posi
 A formal approach is the following. Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent positions and `#p=4` if it represents 4 equivalent positions (with our choice of canonicalization, `#p=4` positions are positions with both kings on the a1-h8 diagonal). When initializing the counters, if there is a legal move `p -> p'` with `#p=8` and `#p'=4`, then there is a move (the symmetric along the diagonal) which goes from a non canonical position (the reflection of `p` along the diagonal) to a canonical position (the reflection of `p'` along the diagonal), which will be explored during backward propagation. To account for this, moves `p -> p'` with `#p=8` and `#p'=4` should increment the counter by 2 during initialization.
 Similarly, when retrograde propagation from `p'` finds a reverse move `p -> p'` with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the counter for the reflection of `p` along the diagonal should also be decremented (since the symmetric move contributed to the counter for the reflection of `p` but led to a non-canonical position).
 
-### 6.3 Initialization Phase
+#### 6.3 Initialization Phase
 Both tables in the pair are initialized independently, with each position updating
 only its own entry:
 
@@ -224,7 +234,7 @@ Dependencies have fewer pieces after captures or fewer pawns after promotions.
 Quiet predecessors of checkmates are visited in the first propagation phase;
 initialization does not generate capture or promotion unmoves.
 
-### 6.4 The Propagation Loop
+#### 6.4 The Propagation Loop
 Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions, aligned on each table's local indices) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**
    * Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For each of them:
@@ -243,7 +253,7 @@ Every resolved position stores its distance, so the positions to propagate at a 
 
 A phase only scans values at ply `n-1` and only writes values at ply `n` (or counters), so the result does not depend on the order in which positions are visited. Running the three conversion types separately makes the conversion type of a loss deterministic (the last one to decrement its counter, i.e. Promotion > Capture > Checkmate).
 
-### 6.5 Predecessor Generation
+#### 6.5 Predecessor Generation
 
 `quiet_unmoves()` in `src/retrograde.rs` returns predecessor indices in the twin
 table. Local pawnless and pawnful generators use reverse attacks onto empty
@@ -251,7 +261,7 @@ squares and reverse single/double pawn pushes. They construct each candidate
 through Shakmaty's checked `Setup` API. Castling, captures, and promotions are
 excluded.
 
-### 6.6 Alternative Conversion Initialization
+#### 6.6 Alternative Conversion Initialization
 
 An alternative to forward dependency probing would scan simpler endgames and
 generate reverse capture/promotion moves to update their predecessors. These
