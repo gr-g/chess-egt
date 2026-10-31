@@ -1,4 +1,4 @@
-use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, PositionError, Chess};
+use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 use crate::error::EgtResult;
@@ -421,10 +421,25 @@ impl Indexer {
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
     // If the index represents an invalid position, returns None.
     pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
-        //println!("position_from_index: {}", index);
+        self.position_from_index_impl::<true>(index, side_to_move)
+    }
+
+    /// Decodes an index already accepted by `position_from_index` for this table and turn.
+    /// Skips all position validation, including legal en passant. Panics if out of range.
+    pub(crate) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
+        self.position_from_index_impl::<false>(index, side_to_move)
+            .expect("position index out of range")
+    }
+
+    fn position_from_index_impl<const VALIDATE: bool>(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         if index >= self.index_range {
             return None;
         }
+        Self::position_from_setup::<VALIDATE>(self.setup_from_index(index, side_to_move))
+    }
+
+    // The caller must enforce the index range before decoding.
+    fn setup_from_index(&self, index: usize, side_to_move: Color) -> Setup {
         debug_assert!(index < self.index_range);
         let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
         // Now the en passant option reflects the en passant status as encoded in the index.
@@ -460,7 +475,7 @@ impl Indexer {
         //println!("buffer_coord: {:?}", buffer_coord);
 
         // All coordinates are in `buffer_coord`, we can place the pieces to create a new position.
-        self.coord_to_position(ep_idx, &buffer_coord, side_to_move)
+        self.coord_to_setup(ep_idx, &buffer_coord, side_to_move)
     }
 
     // Checks whether the position allows en passant and selects the corresponding
@@ -569,8 +584,8 @@ impl Indexer {
         }
     }
 
-    // Builds a position using the coordinates stored in `buffer_coord`.
-    fn coord_to_position(&self, ep_idx: usize, buffer_coord: &CoordBuf, side_to_move: Color) -> Option<Chess> {
+    // Builds a setup using the coordinates stored in `buffer_coord`.
+    fn coord_to_setup(&self, ep_idx: usize, buffer_coord: &CoordBuf, side_to_move: Color) -> Setup {
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
         for (&(mut r, f), mut piece) in buffer_coord.iter().zip(self.pieces.iter().copied()) {
@@ -582,7 +597,7 @@ impl Indexer {
             setup.board.set_piece_at(square, piece);
         }
 
-        let ep_square = if let Some(file) = self.ep_option(ep_idx).file {
+        setup.ep_square = if let Some(file) = self.ep_option(ep_idx).file {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
@@ -591,20 +606,23 @@ impl Indexer {
         } else {
             None
         };
-        setup.ep_square = ep_square;
+        setup
+    }
 
-        if let Ok(position) = setup
-            .position::<Chess>(CastlingMode::Standard)
-            .or_else(PositionError::ignore_impossible_check)
+    fn position_from_setup<const VALIDATE: bool>(setup: Setup) -> Option<Chess> {
+        // Indexing guarantees the material, pawn ranks, nonoverlap, and no castling.
+        // Impossible checks remain accepted, matching ignore_impossible_check.
+        if VALIDATE && (crate::position::opposite_check(&setup.board, setup.turn)
+            || !crate::position::valid_ep_square(&setup))
         {
-            if position.legal_ep_square() == ep_square {
-                Some(position)
-            } else {
-                None
-            }
-        } else {
-            None
+            return None;
         }
+        let ep_square = setup.ep_square;
+        let position = Chess::from_setup_unchecked(setup, CastlingMode::Standard);
+        if VALIDATE && position.legal_ep_square() != ep_square {
+            return None;
+        }
+        Some(position)
     }
 
     // For pawnless positions, this function applies symmetrical
@@ -764,7 +782,12 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shakmaty::PositionError;
     use EgtSide::{SideNotToMove as SNTM, SideToMove as STM};
+
+    fn coord_to_position(indexer: &Indexer, ep_idx: usize, coord: &CoordBuf, turn: Color) -> Option<Chess> {
+        Indexer::position_from_setup::<true>(indexer.coord_to_setup(ep_idx, coord, turn))
+    }
 
     fn pawn_group(file: File, order: &[EgtSide]) -> EgtElement {
         EgtElement::PawnGroup { file, order: order.iter().copied().collect() }
@@ -778,6 +801,147 @@ mod tests {
         ];
         elements.extend_from_slice(groups);
         Indexer::from_elements(&elements).unwrap()
+    }
+
+    // Independent oracle: retain Shakmaty's full validation and the old EP filter.
+    fn checked_position_from_setup(setup: Setup) -> Option<Chess> {
+        let ep_square = setup.ep_square;
+        setup.position::<Chess>(CastlingMode::Standard)
+            .or_else(PositionError::ignore_impossible_check)
+            .ok()
+            .filter(|position| position.legal_ep_square() == ep_square)
+    }
+
+    fn assert_decoder_matches(indexer: &Indexer, index: usize, turn: Color) -> Option<Chess> {
+        let expected = checked_position_from_setup(indexer.setup_from_index(index, turn));
+        assert_eq!(indexer.position_from_index(index, turn), expected, "index {index}, {turn:?}");
+        if let Some(position) = &expected {
+            assert_eq!(indexer.position_from_index_unchecked(index, turn), *position);
+        }
+        expected
+    }
+
+    #[test]
+    fn decoder_matches_checked_constructor() {
+        for name in ["K_K", "KQ_K", "KPa_K", "KPd_KPe", "KPdPdoPe_KPdo", "KNNNNNN_K"] {
+            let egt = crate::egt::Egt::from_tablename(name).unwrap();
+            let indexer = &egt.indexer;
+            let mut accepted = 0;
+            let mut rejected = 0;
+            for turn in [Color::White, Color::Black] {
+                for option in &indexer.ep_options {
+                    // Exhaust the small tables, and sample each EP range in larger ones.
+                    let stride = if indexer.n_pieces <= 3 { 1 } else {
+                        ((option.range_end - option.range_start) / 4096).max(1)
+                    };
+                    for index in (option.range_start..option.range_end).step_by(stride)
+                        .chain(std::iter::once(option.range_end - 1))
+                    {
+                        if assert_decoder_matches(indexer, index, turn).is_some() {
+                            accepted += 1;
+                        } else {
+                            rejected += 1;
+                        }
+                    }
+                }
+                assert_eq!(indexer.position_from_index(indexer.index_range, turn), None);
+                assert_eq!(indexer.position_from_index(usize::MAX, turn), None);
+            }
+            assert!(accepted > 0, "{name}");
+            if name != "K_K" {
+                assert!(rejected > 0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_checks_structural_and_legal_en_passant() {
+        use shakmaty::fen::Fen;
+
+        // Structural EP validity is not enough: the capture must also be legal.
+        for (fen, structural_ep, legal_ep) in [
+            ("7k/8/8/3Pp3/8/8/8/K7 w - e6 0 1", true, true),
+            // The EP capture can be the only way to escape a pawn check.
+            ("7k/8/8/3Pp3/3K4/8/8/8 w - e6 0 1", true, true),
+            // Occupied target and occupied double-push origin.
+            ("7k/8/4N3/3Pp3/8/8/8/K7 w - e6 0 1", false, false),
+            ("7k/4N3/8/3Pp3/8/8/8/K7 w - e6 0 1", false, false),
+            // No pawn next to the victim on its fifth rank.
+            ("7k/8/8/4p3/3P4/8/8/K7 w - e6 0 1", true, false),
+            // Removing both pawns exposes a horizontal rook check.
+            ("7k/8/8/K2Pp2r/8/8/8/8 w - e6 0 1", true, false),
+            // The capturing pawn is pinned, or EP does not evade a check.
+            ("3r3k/8/8/3Pp3/8/8/8/3K4 w - e6 0 1", true, false),
+            ("r6k/8/8/3Pp3/8/8/8/K7 w - e6 0 1", true, false),
+        ] {
+            let original = fen.parse::<Fen>().unwrap().into_setup();
+            let mut groups = vec![pawn_group(File::D, &[STM]), pawn_group(File::E, &[SNTM])];
+            for role in [Role::Rook, Role::Knight] {
+                for (color, side) in [(Color::White, STM), (Color::Black, SNTM)] {
+                    let multiplicity = (original.board.by_role(role) & original.board.by_color(color)).count();
+                    if multiplicity > 0 {
+                        groups.push(EgtElement::PieceGroup { role, side, multiplicity });
+                    }
+                }
+            }
+            let indexer = indexer(&groups);
+            for turn in [Color::White, Color::Black] {
+                let mut setup = original.clone();
+                if turn == Color::Black { setup.mirror(); }
+                assert_eq!(setup.turn, turn);
+                assert!(!crate::position::opposite_check(&setup.board, turn), "{fen}");
+                assert_eq!(crate::position::valid_ep_square(&setup), structural_ep, "{fen}");
+                let expected = checked_position_from_setup(setup.clone());
+                assert_eq!(expected.is_some(), legal_ep, "{fen}, {turn:?}");
+
+                // Force the encoded EP option even when no legal capture exists.
+                // Normal position_to_index would intentionally discard such an EP square.
+                let raw = Chess::from_setup_unchecked(setup.clone(), CastlingMode::Standard);
+                let mut coord = Indexer::filled_coord(indexer.n_pieces);
+                let mut pidx = Indexer::filled_pidx(indexer.n_pieces);
+                indexer.position_to_coord::<false>(1, &mut coord, &raw);
+                indexer.sort_coord_repeated_pieces(1, &mut coord);
+                indexer.coord_to_pidx(&coord, &mut pidx);
+                Indexer::compact_pidx(&mut pidx);
+                indexer.pawn_pidx_to_cpidx(1, &coord, &mut pidx);
+                let index = indexer.ep_option(1).range_start + indexer.cpidx_to_index(1, &pidx);
+                let decoded = indexer.setup_from_index(index, turn);
+                assert_eq!(decoded.board, setup.board, "{fen}");
+                assert_eq!(decoded.ep_square, setup.ep_square, "{fen}");
+                assert_eq!(assert_decoder_matches(&indexer, index, turn), expected, "{fen}");
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_opposite_check_but_accepts_impossible_check() {
+        use shakmaty::fen::Fen;
+
+        for (fen, opposite_check) in [
+            ("7k/8/8/8/8/8/8/K6R w - - 0 1", true),
+            // Adjacent kings are representable in pawnful tables, but invalid.
+            ("8/8/8/8/8/4P3/1k6/K7 w - - 0 1", true),
+            // Three simultaneous checkers are accepted by ignore_impossible_check.
+            ("r6b/7k/8/8/8/8/2n5/K7 w - - 0 1", false),
+        ] {
+            let original = fen.parse::<Fen>().unwrap().into_setup();
+            for mirrored in [false, true] {
+                let mut setup = original.clone();
+                if mirrored { setup.mirror(); }
+                assert!(setup.clone().position::<Chess>(CastlingMode::Standard).is_err(), "{fen}");
+                let expected = checked_position_from_setup(setup.clone());
+                assert_eq!(expected.is_none(), opposite_check, "{fen}");
+                assert_eq!(crate::position::opposite_check(&setup.board, setup.turn), opposite_check, "{fen}");
+                assert_eq!(Indexer::position_from_setup::<true>(setup), expected, "{fen}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "position index out of range")]
+    fn known_valid_decoder_enforces_index_range() {
+        let indexer = indexer(&[]);
+        indexer.position_from_index_unchecked(indexer.index_range, Color::White);
     }
 
     #[test]
@@ -815,7 +979,7 @@ mod tests {
                     coord[k] = (0, 0);
                     coord[k + 1] = (7, 7);
                     for turn in [Color::White, Color::Black] {
-                        if let Some(position) = indexer.coord_to_position(0, &coord, turn) {
+                        if let Some(position) = coord_to_position(&indexer, 0, &coord, turn) {
                             let mut gathered = Indexer::filled_coord(k + 2);
                             indexer.position_to_coord::<false>(0, &mut gathered, &position);
                             assert_eq!(gathered, coord);
@@ -868,7 +1032,7 @@ mod tests {
                     coord[k + 1] = (0, 0);
                     coord[k + 2] = (7, 7);
                     for turn in [Color::White, Color::Black] {
-                        let position = indexer.coord_to_position(1, &coord, turn).unwrap();
+                        let position = coord_to_position(&indexer, 1, &coord, turn).unwrap();
                         assert!(position.legal_ep_square().is_some());
                         let index = indexer.position_to_index(&position);
                         assert!((option.range_start..option.range_end).contains(&index));
@@ -882,7 +1046,7 @@ mod tests {
 
                     // A neighbor elsewhere on the file does not make EP legal.
                     coord[0].0 = 3;
-                    assert!(indexer.coord_to_position(1, &coord, Color::White).is_none());
+                    assert!(coord_to_position(&indexer, 1, &coord, Color::White).is_none());
                 }
             }
         }

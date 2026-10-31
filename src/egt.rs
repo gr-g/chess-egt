@@ -83,6 +83,12 @@ impl Egt {
         self.indexer.position_from_index(index, side_to_move)
     }
 
+    /// Decodes an index already accepted by `position_from_index` for this table and turn.
+    /// Skips all position validation, including legal en passant. Panics if out of range.
+    pub(crate) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
+        self.indexer.position_from_index_unchecked(index, side_to_move)
+    }
+
     // Pawnless positions are reduced to a canonical form through rotations and reflections
     // to take advantage of symmetries, so normally each index corresponds to 8 equivalent
     // position. However, if both kings are on a long diagonal, the diagonal symmetry is not
@@ -347,6 +353,32 @@ mod tests {
         if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
             assert_eq!(i, egt.indexer.position_to_index(&position));
         }
+    }
+
+    #[test]
+    fn known_valid_decoder_matches_public_decoder() {
+        for name in ["K_K", "KQ_K", "KPa_K", "KPd_KPe"] {
+            let egt = Egt::from_tablename(name).unwrap();
+            for turn in [Color::White, Color::Black] {
+                let mut accepted = 0;
+                for index in (0..egt.index_range()).step_by((egt.index_range() / 256).max(1)) {
+                    if let Some(position) = egt.position_from_index(index, turn) {
+                        assert_eq!(egt.position_from_index_unchecked(index, turn), position);
+                        accepted += 1;
+                    }
+                }
+                assert!(accepted > 0, "{name}, {turn:?}");
+                assert_eq!(egt.position_from_index(egt.index_range(), turn), None);
+                assert_eq!(egt.position_from_index(usize::MAX, turn), None);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "position index out of range")]
+    fn known_valid_decoder_enforces_index_range() {
+        let egt = Egt::from_tablename("K_K").unwrap();
+        egt.position_from_index_unchecked(egt.index_range(), Color::White);
     }
 
     #[test]

@@ -21,6 +21,7 @@ Average compression: 1.15 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`.
 - Add option `--generate-stats`.
+- `--list-one-side` and `--stats-on-side`?
 - `--generate` does not replace existing table.
 - Rewrite README.
 - Internal module layout; visibility and public interface.

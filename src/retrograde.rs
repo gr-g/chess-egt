@@ -39,7 +39,7 @@
 //! batches and published separately. Generation uses the caller's Rayon pool
 //! and shared dependency reader; it does not generate missing prerequisites.
 
-use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, PositionError, Role};
+use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
@@ -277,10 +277,10 @@ fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
             setup.board.discard_piece_at(to);
             setup.board.set_piece_at(from, piece);
 
-            if let Ok(predecessor) = setup.position::<Chess>(position.castles().mode())
-                .or_else(PositionError::ignore_impossible_check)
-            {
-                f(predecessor);
+            // Quiet relocation preserves material and kings; no pawns or EP
+            // need validation. Impossible checks remain accepted, as in indexing.
+            if !crate::position::opposite_check(&setup.board, setup.turn) {
+                f(Chess::from_setup_unchecked(setup, position.castles().mode()));
             }
         }
     }
@@ -339,10 +339,10 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
                     let mut successor = base_setup.clone();
                     successor.turn = position.turn();
                     successor.ep_square = Some(from);
-                    if successor.position::<Chess>(position.castles().mode())
-                        .or_else(PositionError::ignore_impossible_check)
-                        .is_ok_and(|successor| successor.legal_ep_square().is_none())
-                    {
+                    // The valid source supplies the board and turn; the pawn,
+                    // empty target, and empty origin establish structural EP.
+                    let successor = Chess::from_setup_unchecked(successor, position.castles().mode());
+                    if successor.legal_ep_square().is_none() {
                         emit(start, to);
                     }
                 }
@@ -355,14 +355,14 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
     use shakmaty::{CastlingMode, Rank, Square};
 
     debug_assert!(setup.ep_square.is_none());
-    // Reverse geometry and the valid successor replace forward replay. Each
-    // predecessor still needs validation, independently for every EP state.
-    // Like the indexer, accept impossible checks but reject all other errors.
-    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard)
-        .or_else(PositionError::ignore_impossible_check)
+    // Quiet relocation preserves kings and material (at most eight pieces).
+    // Validate the board once for all EP states, still accepting impossible checks.
+    if (setup.board.pawns() & Bitboard::BACKRANKS).any()
+        || crate::position::opposite_check(&setup.board, setup.turn)
     {
-        f(predecessor);
+        return;
     }
+    f(Chess::from_setup_unchecked(setup.clone(), CastlingMode::Standard));
 
     let inactive = !setup.turn;
     let occupied = setup.board.occupied();
@@ -379,16 +379,17 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
         }
         let mut setup_ep = setup.clone();
         setup_ep.ep_square = Some(ep);
-        if let Ok(predecessor) = setup_ep.position::<Chess>(CastlingMode::Standard)
-            .or_else(PositionError::ignore_impossible_check)
-        {
-            if predecessor.legal_ep_square() == Some(ep) {
-                f(predecessor);
-            }
+        // pushed_pawns and the empty target/origin establish structural EP;
+        // a legal capture is still required for this indexed EP state.
+        let predecessor = Chess::from_setup_unchecked(setup_ep, CastlingMode::Standard);
+        if predecessor.legal_ep_square() == Some(ep) {
+            f(predecessor);
         }
     }
 }
 
+/// Emits predecessors of an index already validated for this table and White.
+/// Propagation only passes resolved entries, which initialization validated.
 pub fn quiet_unmoves<F>(
     table: &Egt,
     twin: &Egt,
@@ -398,11 +399,7 @@ pub fn quiet_unmoves<F>(
 ) where
     F: FnMut(usize),
 {
-    let position = table.position_from_index(local_index, Color::White);
-    let position = match position {
-        Some(s) => s,
-        _ => return,
-    };
+    let position = table.position_from_index_unchecked(local_index, Color::White);
 
     debug_assert_eq!(mirrored, is_mirrored(table, twin));
 
@@ -951,6 +948,30 @@ mod tests {
             let position = test_position(fen);
             assert_quiet_unmoves_match_forward_play(&position);
             assert_quiet_unmoves_match_forward_play(&color_mirrored(&position));
+        }
+    }
+
+    #[test]
+    fn pawnful_predecessors_reject_invalid_boards_before_restoring_ep() {
+        for fen in [
+            "7k/8/8/3Pp3/8/8/K7/P7 w - - 0 1", // Backrank pawn.
+            "7k/8/8/3Pp3/8/8/K7/7R w - - 0 1", // Opposite check.
+        ] {
+            let original = fen.parse::<shakmaty::fen::Fen>().unwrap().into_setup();
+            for mirrored in [false, true] {
+                let mut setup = original.clone();
+                if mirrored { setup.mirror(); }
+                // Both no-EP and structurally valid restored EP states must fail.
+                for ep in [None, Some(if mirrored { shakmaty::Square::E3 } else { shakmaty::Square::E6 })] {
+                    let mut candidate = setup.clone();
+                    candidate.ep_square = ep;
+                    assert!(candidate.position::<Chess>(shakmaty::CastlingMode::Standard)
+                        .or_else(shakmaty::PositionError::ignore_impossible_check).is_err());
+                }
+                let mut emitted = 0;
+                emit_pawnful_predecessors(&setup, &mut |_| emitted += 1);
+                assert_eq!(emitted, 0, "invalid predecessor board accepted: {fen}, {mirrored}");
+            }
         }
     }
 

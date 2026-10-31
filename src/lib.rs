@@ -17,6 +17,7 @@ pub mod error;
 mod finalization;
 mod finalization_stats;
 pub mod piece_set;
+mod position;
 mod retrograde;
 mod selection;
 mod stats;
