@@ -47,9 +47,9 @@ Run the test suite with:
 cargo test --release
 ```
 
-Chess rules and position validation use the upstream
-[`shakmaty`](https://crates.io/crates/shakmaty) crate. Retrograde analysis
-is implemented locally for the tablebase solver.
+Chess rules and position validation use a `shakmaty` fork that adds
+`Chess::from_setup_unchecked` for callers that already establish position
+invariants.
 
 ## Design Specifications
 

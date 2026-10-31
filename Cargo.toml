@@ -19,6 +19,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }
 url = "2"
 bytes = "1"
 
+[patch.crates-io]
+shakmaty = { git = "https://github.com/gr-g/shakmaty", rev = "aac0926906820065421964bb98b12c3bbe51829e" }
+
 [[bin]]
 name = "chess-egt"
 path = "src/bin/main.rs"
