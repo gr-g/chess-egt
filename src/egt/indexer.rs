@@ -551,7 +551,7 @@ impl Indexer {
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
     fn position_to_coord<const REFLECTED: bool>(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
-        assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
+        debug_assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
         for p in self.piece_set(ep_idx) {
             match &p.element {
                 EgtElement::PawnGroup { file, order } => {
@@ -559,7 +559,7 @@ impl Indexer {
                     // Piece groups describe target files, not reflected source files.
                     let source_file = if REFLECTED { File::new(7 - file.to_u32()) } else { *file };
                     let mut bb = position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file);
-                    assert_eq!(bb.count(), order.len(), "pawn file does not match the piece set");
+                    debug_assert_eq!(bb.count(), order.len(), "pawn file does not match the piece set");
                     for (i, expected_side) in (p.span.0..p.span.1).zip(order.iter().rev()) {
                         let square = if position.turn() == Color::Black { bb.pop_front() } else { bb.pop_back() }.unwrap();
                         debug_assert_eq!(position.board().by_color(position.turn()).contains(square),
@@ -572,7 +572,7 @@ impl Indexer {
                 EgtElement::PieceGroup { role, side, .. } => {
                     let color = if *side == EgtSide::SideToMove { position.turn() } else { !position.turn() };
                     let bb = position.board().by_role(*role) & position.board().by_color(color);
-                    assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
+                    debug_assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
                     for (square, i) in bb.into_iter().zip(p.span.0..p.span.1) {
                         let square = if REFLECTED { square.flip_horizontal() } else { square };
                         let rank = square.rank().to_usize();

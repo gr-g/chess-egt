@@ -629,7 +629,6 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 
 - Pawn-rank slicing: solve slices of pawnful `Egt`s in dependency order. Inject
   successors in already solved slices at the matching ply (Section 3, Level 1).
-- Avoid `from_setup` re-validation in source decoding.
 - Evaluate a generation-specific index layout (Section 6.2).
 
 ---

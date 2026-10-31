@@ -19,15 +19,18 @@ Generated 1496 tables: 26087443599 unique positions, 3591.12 MiB in 09h39m47s.
 Average compression: 1.15 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO
-- Parallelization: see the roadmap in `scaling_and_parallelization.md`.
+- Parallelization: see the roadmap in `scaling_and_parallelization.md`. Test on c6g.
+- Redo valgrind stats.
 - Add option `--generate-stats`.
-- `--list-one-side` and `--stats-on-side`?
+- `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
-- Rewrite README.
+- Rewrite README. Cite paper on indexing and mbeval-sys.
+- Split statistics for invalid indexes (opposite_check, no_ep_capture, illegal_ep_capture)?
 - Internal module layout; visibility and public interface.
-- Experiment with approach using capture/promotion unmoves for initialization. Perhaps reconsider concurrency in `SharedFileCache` if only useful for validation.
+- Experiment with approach using capture/promotion unmoves for initialization. Perhaps reconsider concurrency in `SharedFileCache` if only useful for validation (collect all dependencies during init?).
 - Frontend, cloning https://syzygy-tables.info/
 - Explore possibility of generating tables that store together DTC and DTM for the same index, not only DTC.
+- General cleanup.
 
 ## High-Level Architecture
 The project is built from the following main components:
