@@ -258,8 +258,9 @@ A phase only scans values at ply `n-1` and only writes values at ply `n` (or cou
 `quiet_unmoves()` in `src/retrograde.rs` returns predecessor indices in the twin
 table. Local pawnless and pawnful generators use reverse attacks onto empty
 squares and reverse single/double pawn pushes. They construct each candidate
-through Shakmaty's checked `Setup` API. Castling, captures, and promotions are
-excluded.
+through Shakmaty's checked `Setup` API, ignoring `IMPOSSIBLE_CHECK` just as the
+indexer does, while retaining all other validity checks. En-passant states must
+allow a legal en-passant capture. Castling, captures, and promotions are excluded.
 
 #### 6.6 Alternative Conversion Initialization
 

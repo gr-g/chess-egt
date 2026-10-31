@@ -4,7 +4,7 @@ use chess_egt::{
 };
 use clap::Parser;
 use shakmaty::fen::Fen;
-use shakmaty::{CastlingMode, Position};
+use shakmaty::{CastlingMode, Position, PositionError};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -112,6 +112,7 @@ fn run() -> Result<(), EgtError> {
             .map_err(|e| EgtError::InvalidPosition(format!("invalid FEN: {e:?}")))?;
         let position = fen_obj
             .into_position(CastlingMode::Standard)
+            .or_else(PositionError::ignore_impossible_check)
             .map_err(|e| EgtError::InvalidPosition(format!("invalid position: {e:?}")))?;
         let mut prober = configured_prober(&cli)?;
         let outcome = prober.probe(&position)?;

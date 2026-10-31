@@ -39,7 +39,7 @@
 //! batches and published separately. Generation uses the caller's Rayon pool
 //! and shared dependency reader; it does not generate missing prerequisites.
 
-use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
+use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, PositionError, Role};
 
 use crate::ConversionType;
 use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
@@ -277,7 +277,9 @@ fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
             setup.board.discard_piece_at(to);
             setup.board.set_piece_at(from, piece);
 
-            if let Ok(predecessor) = setup.position::<Chess>(position.castles().mode()) {
+            if let Ok(predecessor) = setup.position::<Chess>(position.castles().mode())
+                .or_else(PositionError::ignore_impossible_check)
+            {
                 f(predecessor);
             }
         }
@@ -338,6 +340,7 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
                     successor.turn = position.turn();
                     successor.ep_square = Some(from);
                     if successor.position::<Chess>(position.castles().mode())
+                        .or_else(PositionError::ignore_impossible_check)
                         .is_ok_and(|successor| successor.legal_ep_square().is_none())
                     {
                         emit(start, to);
@@ -354,7 +357,10 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
     debug_assert!(setup.ep_square.is_none());
     // Reverse geometry and the valid successor replace forward replay. Each
     // predecessor still needs validation, independently for every EP state.
-    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard) {
+    // Like the indexer, accept impossible checks but reject all other errors.
+    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard)
+        .or_else(PositionError::ignore_impossible_check)
+    {
         f(predecessor);
     }
 
@@ -373,7 +379,9 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
         }
         let mut setup_ep = setup.clone();
         setup_ep.ep_square = Some(ep);
-        if let Ok(predecessor) = setup_ep.position::<Chess>(CastlingMode::Standard) {
+        if let Ok(predecessor) = setup_ep.position::<Chess>(CastlingMode::Standard)
+            .or_else(PositionError::ignore_impossible_check)
+        {
             if predecessor.legal_ep_square() == Some(ep) {
                 f(predecessor);
             }
@@ -838,12 +846,14 @@ mod tests {
 
     fn test_position(fen: &str) -> Chess {
         fen.parse::<shakmaty::fen::Fen>().unwrap()
-            .into_position(shakmaty::CastlingMode::Standard).unwrap()
+            .into_position(shakmaty::CastlingMode::Standard)
+            .or_else(shakmaty::PositionError::ignore_impossible_check).unwrap()
     }
 
     fn color_mirrored(position: &Chess) -> Chess {
         position.to_setup(EnPassantMode::Always).into_mirrored()
-            .position(shakmaty::CastlingMode::Standard).unwrap()
+            .position(shakmaty::CastlingMode::Standard)
+            .or_else(shakmaty::PositionError::ignore_impossible_check).unwrap()
     }
 
     // Exhaust all empty origins and canonical EP states. Checked forward play
@@ -868,7 +878,9 @@ mod tests {
                     .map(|file| Some(Square::from_coords(file, ep_rank))))
                 {
                     setup.ep_square = ep;
-                    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard) {
+                    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard)
+                        .or_else(shakmaty::PositionError::ignore_impossible_check)
+                    {
                         if predecessor.legal_ep_square() == ep
                             && predecessor.clone().play(m).is_ok_and(|next| next == *position)
                         {
