@@ -61,7 +61,7 @@ pub(crate) fn validate_elements(elements: &[EgtElement]) -> EgtResult<()> {
         match element {
             EgtElement::PawnGroup { file, order } => {
                 if order.is_empty() || seen_files[file.to_usize()] {
-                    return Err(EgtError::InvalidPieceConfig(
+                    return Err(EgtError::UnsupportedPosition(
                         "pawn file groups must be unique and nonempty",
                     ));
                 }
@@ -74,19 +74,19 @@ pub(crate) fn validate_elements(elements: &[EgtElement]) -> EgtResult<()> {
                 multiplicity,
             } => {
                 if *role == Role::Pawn {
-                    return Err(EgtError::InvalidPieceConfig(
+                    return Err(EgtError::UnsupportedPosition(
                         "pawns must be represented by pawn file groups",
                     ));
                 }
                 let seen =
                     &mut seen_pieces[*role][usize::from(*side == EgtSide::SideNotToMove)];
                 if *multiplicity == 0 || *seen {
-                    return Err(EgtError::InvalidPieceConfig(
+                    return Err(EgtError::UnsupportedPosition(
                         "piece groups must be unique and nonempty",
                     ));
                 }
                 if *role == Role::King && *multiplicity != 1 {
-                    return Err(EgtError::InvalidPieceConfig(
+                    return Err(EgtError::UnsupportedPosition(
                         "each side must have exactly one king",
                     ));
                 }
@@ -95,15 +95,15 @@ pub(crate) fn validate_elements(elements: &[EgtElement]) -> EgtResult<()> {
         }
         n_pieces = n_pieces
             .checked_add(element.multiplicity())
-            .ok_or(EgtError::InvalidPieceConfig("piece count overflow"))?;
+            .ok_or(EgtError::UnsupportedPosition("piece count overflow"))?;
         if n_pieces > MAX_PIECES {
-            return Err(EgtError::InvalidPieceConfig(
+            return Err(EgtError::UnsupportedPosition(
                 "at most eight physical pieces are supported",
             ));
         }
     }
     if seen_pieces.king != [true, true] {
-        return Err(EgtError::InvalidPieceConfig(
+        return Err(EgtError::UnsupportedPosition(
             "each side must have exactly one king",
         ));
     }

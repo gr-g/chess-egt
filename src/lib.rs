@@ -266,6 +266,7 @@ impl EgtProber {
         load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)
     }
 
+    /// Probes a position.
     pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
         self.cache.probe_direct_outcome(position)
     }
@@ -879,6 +880,34 @@ mod tests {
             .find_map(|index| egt.position_from_index(index, Color::White))
             .unwrap();
         prober.probe(&position).unwrap();
+    }
+
+    #[test]
+    fn probing_rejects_castling_rights_before_table_lookup() {
+        use shakmaty::{CastlingMode, fen::Fen};
+
+        let dir = TestDir::new("probing_castling_rights");
+        let mut prober = EgtProber::new(&dir.0).unwrap();
+        for (board, rights) in [
+            ("4k3/8/8/8/8/8/8/4K2R", "K"),
+            ("4k3/8/8/8/8/8/8/R3K3", "Q"),
+            ("4k2r/8/8/8/8/8/8/4K3", "k"),
+            ("r3k3/8/8/8/8/8/8/4K3", "q"),
+            ("4k3/8/8/8/8/8/8/4KB1R", "K"),
+        ] {
+            for turn in ["w", "b"] {
+                let fen = format!("{board} {turn} {rights} - 0 1");
+                let position = fen
+                    .parse::<Fen>()
+                    .unwrap()
+                    .into_position(CastlingMode::Standard)
+                    .unwrap();
+                assert!(
+                    matches!(prober.probe(&position), Err(EgtError::UnsupportedPosition(_))),
+                    "{fen}"
+                );
+            }
+        }
     }
 
     #[test]

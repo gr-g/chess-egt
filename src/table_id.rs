@@ -69,7 +69,7 @@ impl TableId {
     pub fn from_elements(elements: Vec<EgtElement>) -> EgtResult<Self> {
         validate_elements(&elements)?;
         if PawnKey::from_elements(&elements).canonicalized().1 {
-            return Err(EgtError::InvalidPieceConfig(
+            return Err(EgtError::UnsupportedPosition(
                 "noncanonical horizontal pawn-file orientation",
             ));
         }
@@ -147,8 +147,13 @@ impl TableId {
 
 /// Warm probes borrow this stack name; only cache misses need an owned identity.
 pub(crate) fn position_table_name(position: &Chess) -> EgtResult<(TableName, bool)> {
+    if !position.castles().is_empty() {
+        return Err(EgtError::UnsupportedPosition(
+            "positions with castling rights are not supported",
+        ));
+    }
     if position.board().occupied().count() > MAX_PIECES {
-        return Err(EgtError::InvalidPieceConfig(
+        return Err(EgtError::UnsupportedPosition(
             "at most eight physical pieces are supported",
         ));
     }
@@ -307,7 +312,7 @@ pub(crate) fn parse_elements(tablename: &str) -> EgtResult<Vec<EgtElement>> {
     }
     elements.sort();
     crate::piece_set::validate_elements(&elements).map_err(|error| match error {
-        EgtError::InvalidPieceConfig(reason) => invalid(reason),
+        EgtError::UnsupportedPosition(reason) => invalid(reason),
         other => other,
     })?;
     if compute_tablename(&elements) != tablename {

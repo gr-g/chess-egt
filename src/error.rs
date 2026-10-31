@@ -14,12 +14,12 @@ pub enum EgtError {
         reason: &'static str,
     },
 
-    /// A piece-set/table configuration is not supported (too many pieces,
-    /// missing king, duplicate pawns on the same file, etc.).
+    /// A position is not supported (too many pieces, position has
+    /// castling rights).
     #[error("invalid piece configuration: {0}")]
-    InvalidPieceConfig(&'static str),
+    UnsupportedPosition(&'static str),
 
-    /// A FEN or position could not be parsed or is illegal.
+    /// A FEN or position could not be parsed or is invalid.
     #[error("invalid position: {0}")]
     InvalidPosition(String),
 

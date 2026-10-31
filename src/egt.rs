@@ -309,7 +309,7 @@ mod tests {
             elements.extend(extra);
             assert!(matches!(
                 Egt::from_elements(elements),
-                Err(EgtError::InvalidPieceConfig(_))
+                Err(EgtError::UnsupportedPosition(_))
             ));
         }
         for elements in [
@@ -327,7 +327,7 @@ mod tests {
         ] {
             assert!(matches!(
                 Egt::from_elements(elements),
-                Err(EgtError::InvalidPieceConfig(_))
+                Err(EgtError::UnsupportedPosition(_))
             ));
         }
     }
