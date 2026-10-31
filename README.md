@@ -235,7 +235,17 @@ Quiet predecessors of checkmates are visited in the first propagation phase;
 initialization does not generate capture or promotion unmoves.
 
 #### 6.4 The Propagation Loop
-Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). A per-block summary (the last ply resolved in each block of 4096 positions, aligned on each table's local indices) lets the scans skip blocks that cannot contain values of the scanned ply. The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
+Every resolved position stores its distance, so the positions to propagate at a given ply are found by scanning the tables for the values of the previous ply (no queues are needed). Per-block summaries let scans skip blocks that cannot contain matching values.
+
+`PlySummary` stores four `AtomicU16` upper bounds per 4096-position block:
+all losses, Checkmate wins, Capture wins, and Promotion wins. Zero means empty;
+otherwise the bound encodes maximum ply plus one. Initialization chunks produce
+accurate initial summaries. W scans use the loss bound; each L sub-phase uses
+its win-type bound. Bounds increase monotonically; same-ply upgrades record the
+new type without increasing newly resolved totals, retaining old bounds conservatively.
+See [Step 2](scaling_and_parallelization.md#step-2-per-block-ply-summary) for details.
+
+The main loop runs for $n = 1, 2, \dots$ until no new positions are marked:
 1. **Propagate Losses to Wins:**
    * Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For each of them:
      * Call `quiet_unmoves`.

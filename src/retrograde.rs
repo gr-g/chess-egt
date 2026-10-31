@@ -5,8 +5,8 @@
 //! lose (see `README.md`, 6.2). Every resolved position stores its distance, so
 //! the positions to propagate at ply `p` are exactly the values at ply `p - 1`,
 //! found by scanning the tables. A per-block summary (`PlySummary`) lets the
-//! scans skip the blocks that cannot contain values of the scanned ply. Per
-//! ply `p`, the loop runs:
+//! scans skip blocks by ply and source kind: all losses, or wins of each
+//! conversion type. Per ply `p`, the loop runs:
 //! 1. Phase W(p): unmoves from losses at ply `p - 1` mark their unknown
 //!    predecessors as wins at ply `p`.
 //! 2. Phase L(p), in three sub-phases for Checkmate, Capture and Promotion (in
@@ -76,6 +76,13 @@ struct WorkingPair {
     values: Vec<Vec<AtomicU16>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WinUpdate {
+    Unchanged,
+    NewlyResolved,
+    Upgraded,
+}
+
 impl WorkingPair {
     fn new<'a>(tables: impl IntoIterator<Item = (&'a str, usize)>) -> EgtResult<Self> {
         let mut values = Vec::new();
@@ -105,17 +112,17 @@ impl WorkingPair {
     }
 
     /// CAS preserves the best same-ply conversion even when workers race.
-    fn mark_win(&self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> bool {
+    fn mark_win(&self, slot: usize, idx: usize, ct: ConversionType, plies: u16) -> WinUpdate {
         let cell = &self.values[slot][idx];
         let mut raw = cell.load(Ordering::Relaxed);
         loop {
             let v = MaybeDtcOutcome::from_u16(raw);
             let newly_resolved = v.is_unknown();
             if !newly_resolved && !(v.is_win() && ply(v) == plies && ct > outcome_ct(v)) {
-                return false;
+                return WinUpdate::Unchanged;
             }
             match cell.compare_exchange_weak(raw, MaybeDtcOutcome::new_win(ct, plies).to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return newly_resolved,
+                Ok(_) => return if newly_resolved { WinUpdate::NewlyResolved } else { WinUpdate::Upgraded },
                 Err(current) => raw = current,
             }
         }
@@ -180,28 +187,53 @@ fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionTyp
 /// Number of positions per pair-local summary block.
 const SUMMARY_BLOCK_SIZE: usize = 4096;
 
-/// Per local block, an upper bound on the plies of its resolved values.
+#[derive(Clone, Copy)]
+enum SummaryKind {
+    Loss,
+    Win(ConversionType),
+}
+
+impl SummaryKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Loss => 0,
+            Self::Win(ConversionType::Checkmate) => 1,
+            Self::Win(ConversionType::Capture) => 2,
+            Self::Win(ConversionType::Promotion) => 3,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlockSummary {
+    // Zero means empty; otherwise the bound is the maximum recorded ply + 1.
+    ply_bounds: [AtomicU16; 4],
+}
+
+/// Conservative per-block ply bounds, separated by source kind.
 struct PlySummary {
     size: usize,
-    last_ply: Vec<AtomicU16>,
+    blocks: Vec<BlockSummary>,
 }
 
 impl PlySummary {
-    /// Initialization resolves values only at plies 0 and 1.
     fn new(size: usize) -> Self {
-        Self { size, last_ply: (0..size.div_ceil(SUMMARY_BLOCK_SIZE)).map(|_| AtomicU16::new(1)).collect() }
+        Self { size, blocks: (0..size.div_ceil(SUMMARY_BLOCK_SIZE)).map(|_| BlockSummary::default()).collect() }
     }
 
-    fn record(&self, local_index: usize, plies: u16) {
-        let last = &self.last_ply[local_index / SUMMARY_BLOCK_SIZE];
-        if last.load(Ordering::Relaxed) < plies {
-            last.fetch_max(plies, Ordering::Relaxed);
+    fn record(&self, local_index: usize, kind: SummaryKind, plies: u16) {
+        let last = &self.blocks[local_index / SUMMARY_BLOCK_SIZE].ply_bounds[kind.index()];
+        let ply_bound = plies + 1;
+        if last.load(Ordering::Relaxed) < ply_bound {
+            last.fetch_max(ply_bound, Ordering::Relaxed);
         }
     }
 
-    fn blocks_with(&self, plies: u16) -> Vec<(usize, usize)> {
-        self.last_ply.iter().enumerate()
-            .filter(|(_, last)| last.load(Ordering::Relaxed) >= plies)
+    fn blocks_with(&self, kind: SummaryKind, plies: u16) -> Vec<(usize, usize)> {
+        let kind = kind.index();
+        let ply_bound = plies + 1;
+        self.blocks.iter().enumerate()
+            .filter(|(_, block)| block.ply_bounds[kind].load(Ordering::Relaxed) >= ply_bound)
             .map(|(b, _)| {
                 let start = b * SUMMARY_BLOCK_SIZE;
                 (start, (start + SUMMARY_BLOCK_SIZE).min(self.size))
@@ -210,7 +242,7 @@ impl PlySummary {
     }
 
     fn num_blocks(&self) -> usize {
-        self.last_ply.len()
+        self.blocks.len()
     }
 }
 
@@ -512,12 +544,15 @@ struct InitCounts {
 fn initialize_table(
     egt: &Egt,
     values: &mut [AtomicU16],
+    summary: &PlySummary,
     reader: &SharedFileCache,
 ) -> EgtResult<InitCounts> {
     let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
     debug_assert_eq!(values.len(), size);
+    debug_assert_eq!(summary.size, size);
     values.par_chunks_mut(SUMMARY_BLOCK_SIZE).enumerate().map(|(block, chunk)| {
         let mut counts = InitCounts::default();
+        let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
             let idx = block * SUMMARY_BLOCK_SIZE + offset;
             let position_opt = egt.position_from_index(idx, Color::White);
@@ -532,6 +567,7 @@ fn initialize_table(
                 if position.is_check() {
                     *cell.get_mut() = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0).to_u16();
                     counts.checkmates += 1;
+                    ply_bounds[SummaryKind::Loss.index()] = ply_bounds[SummaryKind::Loss.index()].max(1);
                 } else {
                     *cell.get_mut() = MaybeDtcOutcome::DRAW.to_u16();
                     counts.stalemates += 1;
@@ -569,10 +605,12 @@ fn initialize_table(
                 // A checkmate in 1 found by phase W(1) may still upgrade the
                 // conversion type.
                 counts.found.wins += 1;
+                ply_bounds[SummaryKind::Win(ct).index()] = 2;
                 MaybeDtcOutcome::new_win(ct, 1)
             } else if counter == 0 {
                 // All moves are conversions to won positions.
                 counts.found.losses += 1;
+                ply_bounds[SummaryKind::Loss.index()] = 2;
                 MaybeDtcOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
             } else {
                 MaybeDtcOutcome::new_unknown(counter)
@@ -580,6 +618,10 @@ fn initialize_table(
             *cell.get_mut() = outcome.to_u16();
         }
 
+        // Each initialization chunk owns one block; propagation starts after joining.
+        for (bound, value) in summary.blocks[block].ply_bounds.iter().zip(ply_bounds) {
+            bound.store(value, Ordering::Relaxed);
+        }
         Ok(counts)
     }).try_reduce(InitCounts::default, |a, b| Ok(InitCounts {
         checkmates: a.checkmates + b.checkmates,
@@ -625,11 +667,14 @@ fn solve_pair(
         (table_name(solver, table), egt(table).index_range())
     }))?;
 
+    // Indexed by slot. A symmetric pair has a single table and summary.
+    let summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
+
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
     let mut previous = [Found::default(); 2];
     let mut found_by_conversion = [Found::default(); 2];
     for &(table, _, _, slot, _) in &tables {
-        let counts = initialize_table(egt(table), &mut working.values[slot], reader)?;
+        let counts = initialize_table(egt(table), &mut working.values[slot], &summaries[slot], reader)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
         previous[slot].losses = counts.checkmates;
         found_by_conversion[slot] = counts.found;
@@ -641,8 +686,6 @@ fn solve_pair(
     let mut max_win = [0u16; 2];
     let mut max_loss = [0u16; 2];
 
-    // Indexed by slot. A symmetric pair has a single table and summary.
-    let summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
     // Blocks visited by the scans, and blocks the same scans would visit
     // without the summaries.
     let mut blocks_scanned = 0usize;
@@ -661,15 +704,25 @@ fn solve_pair(
             }
             // Blocks written during the scan only receive values at `plies`,
             // which the scan does not look for, so the snapshot is complete.
-            let blocks = summaries[slot].blocks_with(plies - 1);
+            let blocks = summaries[slot].blocks_with(SummaryKind::Loss, plies - 1);
             blocks_scanned += blocks.len();
             blocks_total += summaries[slot].num_blocks();
+            if blocks.is_empty() {
+                continue;
+            }
             let newly = scan_table(&working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v, local| {
                 let ct = outcome_ct(v);
                 quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
-                    if working.mark_win(twin_slot, pred_idx, ct, plies) {
-                        local.wins += 1;
-                        summaries[twin_slot].record(pred_idx, plies);
+                    match working.mark_win(twin_slot, pred_idx, ct, plies) {
+                        WinUpdate::NewlyResolved => {
+                            local.wins += 1;
+                            summaries[twin_slot].record(pred_idx, SummaryKind::Win(ct), plies);
+                        }
+                        WinUpdate::Upgraded => {
+                            // Keep the old kind's bound: stale bounds only add scans.
+                            summaries[twin_slot].record(pred_idx, SummaryKind::Win(ct), plies);
+                        }
+                        WinUpdate::Unchanged => {}
                     }
                 });
             });
@@ -684,14 +737,17 @@ fn solve_pair(
                 if previous[slot].wins == 0 {
                     continue;
                 }
-                let blocks = summaries[slot].blocks_with(plies - 1);
+                let blocks = summaries[slot].blocks_with(SummaryKind::Win(ct), plies - 1);
                 blocks_scanned += blocks.len();
                 blocks_total += summaries[slot].num_blocks();
+                if blocks.is_empty() {
+                    continue;
+                }
                 let newly = scan_table(&working, slot, &blocks, |v| v == target, |working, idx, _, local| {
                     quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
                         if working.decrement(twin_slot, pred_idx, ct, plies) {
                             local.losses += 1;
-                            summaries[twin_slot].record(pred_idx, plies);
+                            summaries[twin_slot].record(pred_idx, SummaryKind::Loss, plies);
                         }
                     });
                 });
@@ -1125,12 +1181,19 @@ mod tests {
             };
             let mut preferred = ConversionType::Promotion;
             for (i, ct) in order.into_iter().enumerate() {
-                assert_eq!(working.mark_win(0, 0, ct, 7), i == 0);
+                let expected = if i == 0 {
+                    WinUpdate::NewlyResolved
+                } else if ct > preferred {
+                    WinUpdate::Upgraded
+                } else {
+                    WinUpdate::Unchanged
+                };
+                assert_eq!(working.mark_win(0, 0, ct, 7), expected);
                 preferred = preferred.max(ct);
                 assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(preferred, 7));
             }
             assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
-            assert!(!working.mark_win(0, 0, ConversionType::Checkmate, 7));
+            assert_eq!(working.mark_win(0, 0, ConversionType::Checkmate, 7), WinUpdate::Unchanged);
         }
 
         let existing = vec![
@@ -1141,7 +1204,7 @@ mod tests {
         ];
         let working = WorkingPair { values: vec![atomic_values(existing.clone())] };
         for idx in 0..existing.len() {
-            assert!(!working.mark_win(0, idx, ConversionType::Checkmate, 3));
+            assert_eq!(working.mark_win(0, idx, ConversionType::Checkmate, 3), WinUpdate::Unchanged);
         }
         assert_eq!(plain_values(&working.values[0]), existing);
     }
@@ -1178,22 +1241,50 @@ mod tests {
     fn pair_local_ply_summary_clips_tails_and_keeps_maximum() {
         let block = SUMMARY_BLOCK_SIZE;
         let summary = PlySummary::new(2 * block + 3);
+        let loss = SummaryKind::Loss;
+        let capture = SummaryKind::Win(ConversionType::Capture);
         assert_eq!(summary.num_blocks(), 3);
-        assert_eq!(summary.blocks_with(0), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
-        assert_eq!(summary.blocks_with(1), summary.blocks_with(0));
-        assert!(summary.blocks_with(2).is_empty());
-        summary.record(block - 1, 4);
-        summary.record(block, 6);
-        summary.record(2 * block + 2, 9);
-        summary.record(2 * block, 2);
-        assert_eq!(summary.blocks_with(5), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
-        assert_eq!(summary.blocks_with(9), vec![(2 * block, 2 * block + 3)]);
-        assert!(summary.blocks_with(10).is_empty());
-        assert_eq!(PlySummary::new(block).blocks_with(1), vec![(0, block)]);
-        assert_eq!(PlySummary::new(3).blocks_with(1), vec![(0, 3)]);
+        assert!(summary.blocks_with(loss, 0).is_empty());
+        summary.record(0, loss, 0);
+        assert_eq!(summary.blocks_with(loss, 0), vec![(0, block)]);
+        assert!(summary.blocks_with(loss, 1).is_empty());
+        summary.record(block - 1, capture, 4);
+        summary.record(block, capture, 6);
+        summary.record(2 * block + 2, capture, 9);
+        summary.record(2 * block, capture, 2);
+        assert_eq!(summary.blocks_with(capture, 5), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
+        assert_eq!(summary.blocks_with(capture, 9), vec![(2 * block, 2 * block + 3)]);
+        assert!(summary.blocks_with(capture, 10).is_empty());
+        assert_eq!(summary.blocks_with(loss, 0), vec![(0, block)]);
+        assert!(summary.blocks_with(SummaryKind::Win(ConversionType::Checkmate), 0).is_empty());
+        assert!(summary.blocks_with(SummaryKind::Win(ConversionType::Promotion), 0).is_empty());
         let empty = PlySummary::new(0);
         assert_eq!(empty.num_blocks(), 0);
-        assert!(empty.blocks_with(0).is_empty());
+        assert!(empty.blocks_with(loss, 0).is_empty());
+    }
+
+    #[test]
+    fn initialization_populates_only_matching_summary_kinds() {
+        let dir = crate::TestDir::new("initial_summary");
+        EgtGenerator::new(&dir.0).unwrap().generate("K_K").unwrap();
+        let location = Location::parse(&dir.0).unwrap();
+        let reader = SharedFileCache::new(&location, None, None);
+        let egt = table("K_KQ");
+        let mut values = atomic_values(vec![MaybeDtcOutcome::INVALID; egt.index_range()]);
+        let summary = PlySummary::new(values.len());
+        let counts = initialize_table(&egt, &mut values, &summary, &reader).unwrap();
+        assert!(counts.checkmates > 0);
+        let expected: Vec<_> = values.chunks(SUMMARY_BLOCK_SIZE).enumerate()
+            .filter(|(_, chunk)| chunk.iter().any(|cell| MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
+            .map(|(block, chunk)| {
+                let start = block * SUMMARY_BLOCK_SIZE;
+                (start, start + chunk.len())
+            }).collect();
+        assert_eq!(summary.blocks_with(SummaryKind::Loss, 0), expected);
+        assert!(summary.blocks_with(SummaryKind::Loss, 1).is_empty());
+        for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
+            assert!(summary.blocks_with(SummaryKind::Win(ct), 0).is_empty());
+        }
     }
 
     #[test]
@@ -1254,7 +1345,7 @@ mod tests {
                 let working = WorkingPair { values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(96)])] };
                 let wins: usize = (0..96).into_par_iter().map(|i| {
                     let ct = [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate][i % 3];
-                    usize::from(working.mark_win(0, 0, ct, 7))
+                    usize::from(working.mark_win(0, 0, ct, 7) == WinUpdate::NewlyResolved)
                 }).sum();
                 assert_eq!(wins, 1);
                 assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
@@ -1279,22 +1370,29 @@ mod tests {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     barrier.wait();
-                    for stamp in (2..=32u16).rev() {
-                        // All workers contend on the first block, then stamp
-                        // distinct positions in both remaining blocks.
-                        summary.record(worker, stamp);
-                        summary.record(block + worker, stamp + 8);
-                        summary.record(2 * block + worker % 3, stamp + 16);
+                    let kinds = [SummaryKind::Loss, SummaryKind::Win(ConversionType::Checkmate),
+                        SummaryKind::Win(ConversionType::Capture), SummaryKind::Win(ConversionType::Promotion)];
+                    for plies in (2..=32u16).rev() {
+                        // All workers contend on each kind in the first block.
+                        for kind in kinds {
+                            summary.record(worker, kind, plies);
+                        }
+                        summary.record(block + worker, kinds[worker], plies + 8);
+                        summary.record(2 * block + worker % 3, kinds[worker], plies + 16);
                     }
                 });
             }
         });
         assert_eq!(summary.num_blocks(), 3);
-        assert_eq!(summary.last_ply.iter().map(|v| v.load(Ordering::Relaxed)).collect::<Vec<_>>(), vec![32, 40, 48]);
-        assert_eq!(summary.blocks_with(32), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
-        assert_eq!(summary.blocks_with(33), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
-        assert_eq!(summary.blocks_with(41), vec![(2 * block, 2 * block + 3)]);
-        assert!(summary.blocks_with(49).is_empty());
+        for kind in [SummaryKind::Loss, SummaryKind::Win(ConversionType::Checkmate),
+            SummaryKind::Win(ConversionType::Capture), SummaryKind::Win(ConversionType::Promotion)]
+        {
+            assert_eq!(summary.blocks.iter().map(|b| b.ply_bounds[kind.index()].load(Ordering::Relaxed)).collect::<Vec<_>>(), vec![33, 41, 49]);
+            assert_eq!(summary.blocks_with(kind, 32), vec![(0, block), (block, 2 * block), (2 * block, 2 * block + 3)]);
+            assert_eq!(summary.blocks_with(kind, 33), vec![(block, 2 * block), (2 * block, 2 * block + 3)]);
+            assert_eq!(summary.blocks_with(kind, 41), vec![(2 * block, 2 * block + 3)]);
+            assert!(summary.blocks_with(kind, 49).is_empty());
+        }
     }
 
     #[test]
@@ -1340,7 +1438,7 @@ mod tests {
         let resolved: usize = pool.install(|| {
             (0..384).into_par_iter().map(|i| {
                 let ct = [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion][i % 3];
-                usize::from(working.mark_win(0, i % existing.len(), ct, 7))
+                usize::from(working.mark_win(0, i % existing.len(), ct, 7) == WinUpdate::NewlyResolved)
             }).sum()
         });
         assert_eq!(resolved, 0);
@@ -1366,8 +1464,12 @@ mod tests {
                 };
                 let visits: Vec<_> = (0..size).map(|_| AtomicU16::new(0)).collect();
                 let summary = PlySummary::new(size);
+                let kind = if source_is_loss { SummaryKind::Loss } else { SummaryKind::Win(ConversionType::Capture) };
+                for idx in (0..size).step_by(SUMMARY_BLOCK_SIZE) {
+                    summary.record(idx, kind, plies - 1);
+                }
 
-                let blocks = summary.blocks_with(1);
+                let blocks = summary.blocks_with(kind, plies - 1);
                 assert_eq!(blocks.len(), 4);
                 assert_eq!(blocks.last(), Some(&(3 * SUMMARY_BLOCK_SIZE, size)));
                 let found = scan_table(&working, 0, &blocks,
@@ -1379,7 +1481,7 @@ mod tests {
                         // shifted across blocks within the same working array.
                         let target = (idx + 2 * SUMMARY_BLOCK_SIZE) % size + 1;
                         if source_is_loss {
-                            if working.mark_win(0, target, ConversionType::Capture, plies) {
+                            if working.mark_win(0, target, ConversionType::Capture, plies) == WinUpdate::NewlyResolved {
                                 local.wins += 1;
                             }
                         } else if working.decrement(0, target, ConversionType::Capture, plies) {

@@ -11,6 +11,7 @@ loops in its Section 2.A.
 
 **Status:** Steps 1-4, selector-based serial job scheduling and object storage in
 Step 5, and the local per-position optimizations in Step 6 are implemented.
+
 Distributed job scheduling/completion manifests and the worker backend in Step 7
 remain proposals. Historical benchmark results are marked as such; Sections 2.2
 and 9 use generation runs with the current individual-table storage layout.
@@ -253,11 +254,11 @@ Why this gives exactly today's output:
 Scan cost:
 - Each phase is a vectorizable linear scan: ~1 s for a 25 GB 6-piece pair on a
   multi-core node, which is negligible.
-- At 7 pieces (1.4 TB × up to ~1,000 plies) scans add up to hours. A per-block
-  summary (one `u16` per block of 4K positions: "last ply at which this block
-  received a resolved value") lets scans skip untouched blocks (implemented,
-  see Step 2). It also fixes the case where the sweep does worst: deep tables
-  where each ply resolves only a few positions (`KNN_KP`: +53% for the sweep).
+- At 7 pieces (1.4 TB × up to ~1,000 plies) scans add up to hours. Per-block
+  summaries let scans skip blocks that cannot contain matching values. The
+  four-category `PlySummary` uses four `AtomicU16` upper bounds per block
+  of 4096 positions: all losses and wins of each conversion type. W scans use
+  the loss bound; each L sub-phase uses its respective win bound (see Step 2).
 
 What this means for the existing implementations:
 - **Counters + queues** become redundant once the hybrid is verified. Its
@@ -437,18 +438,27 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
 
 ### Step 2: per-block ply summary
 
-- **Status: implemented.** `PlySummary` in `retrograde.rs` stores one
-  `AtomicU16` per block of 4096 positions, aligned on each table's local
-  indices and independent of storage frames. `solve_pair` creates one summary
-  per working array; a self-twin shares one array and summary.
-- Every block starts at ply 1, covering initialization. When `mark_win` or
-  `decrement` newly resolves a position, the callback stamps its block using
-  an atomic maximum. A scan for values at `p - 1` visits blocks stamped at
-  `p - 1` or later. This conservative filter also admits blocks stamped at `p`
-  without omitting earlier matches. The block list is taken before each scan;
-  writes at `p` cannot create new matches at `p - 1`.
-- **Implementation-era measurements** (single-threaded, baseline and new
-  binaries run concurrently on the same machine):
+- **Status: implemented.** `PlySummary` in `retrograde.rs` stores four
+  `AtomicU16` upper bounds per block of 4096 positions: all losses,
+  Checkmate wins, Capture wins, and
+  Promotion wins. Blocks align on each table's local indices, independently of
+  storage frames. `solve_pair` creates one summary per working array; a
+  self-twin shares one array and summary.
+- Zero means an empty category; otherwise the bound encodes its maximum ply
+  plus one. Initialization chunks produce accurate initial summaries from
+  their resolved values. W scans consult the all-losses bound;
+  L(Checkmate), L(Capture), and L(Promotion)
+  scans consult their respective win bounds. A scan for ply `q` visits blocks
+  whose selected bound is at least `q + 1`, then checks individual values.
+- Bounds only increase through atomic maxima. New resolutions record their
+  category; same-ply win conversion upgrades also record the new category,
+  without incrementing newly resolved totals. The old type's bound is retained
+  conservatively, so stale bounds can admit extra blocks but cannot omit a
+  match. The block list is taken before each scan; writes at `p` cannot create
+  new matches at `p - 1`. Working-value and summary operations use relaxed
+  atomics, with phase joins providing synchronization (Step 4).
+- **Historical measurements of the single-bound summary** (single-threaded,
+  baseline and new binaries run concurrently on the same machine):
 
   | Set / Endgame | Blocks visited | Propagation before | After | Δ |
   |---|---:|---:|---:|---:|
@@ -460,9 +470,8 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   4-piece tables, `KNN_KP`, and `KBB_KN`. The `KNN_KP` gain largely offset
   the scan overhead measured in the algorithm comparison (+10%). `KBB_KN`
   gained little because positions resolved at a ply were spread over most
-  blocks. The summary pays off when the frontier is thin in blocks, not just
-  in positions. Separate win/loss summaries or smaller blocks remain possible
-  refinements; these results are not current upstream performance measurements.
+  blocks. These results concern the single-bound summary, not the
+  four-category summary or current upstream performance.
 
 ### Step 3: flat working arrays, individual-table output
 
@@ -518,10 +527,11 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
   joins preserve W, then L(Checkmate), L(Capture), L(Promotion), then next-ply
   ordering. Self-twins retain one array. Scans snapshot matches per block;
   writes at ply `p` cannot change matches selected at `p - 1`.
-- `PlySummary` uses atomic maxima and retains conservative `last_ply >= scanned_ply`
-  filtering. A load guard avoids unnecessary RMWs when a block is already stamped.
-  Working-value and summary operations use relaxed atomics: outcomes have no
-  separately published payload, and Rayon joins synchronize successive phases.
+- `PlySummary` uses atomic maxima; its four-category bounds use
+  conservative `bound >= scanned_ply + 1` filtering (Step 2). A load guard
+  avoids unnecessary RMWs when a bound is already sufficient. Working-value
+  and summary operations retain relaxed atomics: outcomes have no separately
+  published payload, and Rayon joins synchronize successive phases.
 - Initialization assigns disjoint mutable chunks to tasks, writing through
   exclusive atomic access rather than CAS. Dependency files and decompressed
   frames are shared, not duplicated per thread. A read/write-locked registry
@@ -641,8 +651,9 @@ excluding physical fields such as `bytes`, `sha256`, and `num_frames`.
    partitioning, per endgame. This decides between range and hash assignment of
    blocks.
 3. The cost of the scan per ply, with and without the block summary, on deep
-   tables where each ply resolves few positions. Answered for 5 pieces in
-   Step 2: -8-9% propagation time on `KNN_KP`, -1% on `KBB_KN`.
+   tables where each ply resolves few positions. Historical single-bound
+   measurements for 5 pieces are in Step 2: -8-9% propagation time on
+   `KNN_KP`, -1% on `KBB_KN`; they do not measure the four-category design.
 4. The distribution of maximum DTC for 6-piece tables. This sets the number of
    phases, and hence of barriers, in the swarm model.
 5. Whether the conversion-type sub-phases (3 per ply) or a forward pass on new
