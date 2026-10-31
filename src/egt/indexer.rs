@@ -179,6 +179,9 @@ pub struct Indexer {
     // Coordinate slots in normalized colors: White denotes the side to move.
     pieces: ArrayVec<Piece, MAX_PIECES>,
 
+    // Spans of repeated non-pawn coordinates.
+    repeated_piece_spans: ArrayVec<(usize, usize), MAX_PIECES>,
+
     // The following field provides information on the en passant status.
     ep_options: Vec<EnpassantOption>,
 
@@ -212,6 +215,10 @@ impl Indexer {
 
         // Compute n_squares, combinations, span.
         Self::compute_piece_squares(&mut piece_set);
+        let repeated_piece_spans = piece_set[n_pawn_groups..].iter()
+                    .filter(|p| p.span.1 - p.span.0 > 1)
+                    .map(|p| (p.span.0, p.span.1))
+                    .collect();
         let mut pieces = ArrayVec::new();
         for p in &piece_set {
             let (role, sides): (_, ArrayVec<_, MAX_PIECES>) = match &p.element {
@@ -249,6 +256,7 @@ impl Indexer {
             n_pawn_groups,
             index_range,
             pieces,
+            repeated_piece_spans,
             ep_options,
             nonking_combinations,
         })
@@ -385,7 +393,7 @@ impl Indexer {
             //println!("buffer_coord: {:?}", buffer_coord);
         }
 
-        self.sort_coord_repeated_pieces(ep_idx, &mut buffer_coord);
+        self.sort_coord_repeated_pieces(&mut buffer_coord);
         // Now `buffer_coord` has the sorted coordinates for repeated pieces.
         //println!("buffer_coord: {:?}", buffer_coord);
 
@@ -537,7 +545,7 @@ impl Indexer {
         if kings_on_diagonal {
             // Swap coordinates and recode
             for p in buffer_coord.iter_mut() { *p = (p.1, p.0); };
-            self.sort_coord_repeated_pieces(ep_idx, &mut buffer_coord);
+            self.sort_coord_repeated_pieces(&mut buffer_coord);
             self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
             Self::compact_pidx(&mut buffer_pidx);
             Self::map_kings(&mut buffer_pidx);
@@ -546,8 +554,6 @@ impl Indexer {
             None
         }
     }
-
-
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
     fn position_to_coord<const REFLECTED: bool>(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
@@ -646,11 +652,9 @@ impl Indexer {
     }
 
     // Sort repeated non-pawns from highest to lowest; pawns are already ordered.
-    fn sort_coord_repeated_pieces(&self, ep_idx: usize, buffer_coord: &mut CoordBuf) {
-        for p in &self.piece_set(ep_idx)[self.n_pawn_groups..] {
-            if p.span.1 - p.span.0 > 1 {
-                buffer_coord[p.span.0..p.span.1].sort_by_key(|v| Reverse(*v));
-            }
+    fn sort_coord_repeated_pieces(&self, buffer_coord: &mut CoordBuf) {
+        for span in &self.repeated_piece_spans {
+            buffer_coord[span.0..span.1].sort_by_key(|v| Reverse(*v));
         }
     }
 
@@ -900,7 +904,7 @@ mod tests {
                 let mut coord = Indexer::filled_coord(indexer.n_pieces);
                 let mut pidx = Indexer::filled_pidx(indexer.n_pieces);
                 indexer.position_to_coord::<false>(1, &mut coord, &raw);
-                indexer.sort_coord_repeated_pieces(1, &mut coord);
+                indexer.sort_coord_repeated_pieces(&mut coord);
                 indexer.coord_to_pidx(&coord, &mut pidx);
                 Indexer::compact_pidx(&mut pidx);
                 indexer.pawn_pidx_to_cpidx(1, &coord, &mut pidx);
