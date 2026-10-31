@@ -517,7 +517,6 @@ fn initialize_table(
             let idx = block * SUMMARY_BLOCK_SIZE + offset;
             let position_opt = egt.position_from_index(idx, Color::White);
 
-
             let Some(position) = position_opt else {
                 *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
                 continue;
