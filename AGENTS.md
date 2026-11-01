@@ -20,7 +20,6 @@ Average compression: 1.15 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`. Test on c6g.
-- Summary csv file with data per folder.
 - `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
 - Rewrite README. Cite paper on indexing and mbeval-sys.

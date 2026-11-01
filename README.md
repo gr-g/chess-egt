@@ -57,6 +57,14 @@ Chess rules and position validation use a `shakmaty` fork that adds
 `Chess::from_setup_unchecked` for callers that already establish position
 invariants.
 
+Two Python scripts export statistics from a **local, current tablebase root**.
+
+```sh
+cargo run --release -- --path ROOT --cache-stats 3/ 4/ 5/ 6/
+python3 scripts/export_table_stats.py ROOT table_stats.csv
+python3 scripts/export_summary_stats.py ROOT summary_stats.csv
+```
+
 ## Design Specifications
 
 ### 1. High-Level Architecture
