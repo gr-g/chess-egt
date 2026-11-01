@@ -107,24 +107,31 @@ For each file, both sides must have the same number of `o` markers. Together wit
 
 Internally, material is represented by a vector of `EgtElement`: an element encodes either a group of pawns on the same file with a specific sequence of colors, or a group of non-pawn pieces of one type and color.
 
-The `Indexer` handles the mapping of positions to a contiguous local index range `[0, index_range)`.
+The `Indexer` handles the mapping of positions to a contiguous local index range `[0, index_range)` with three symmetry cases:
+
+- **Pawnless tables:** use the existing board symmetries (horizontal, vertical, diagonal) to assign equivalent positions to the same index.
+- **Tables with asymmetric pawn key:** only one of the two horizontally reflected tables is generated.
+- **Table with symmetric pawn key:** the complete pawn arrangement on each file equals that on its reflected file. Keep one position per horizontal-reflection pair by ordering the STM and SNTM kings, and encode them jointly as a two-square combination.
+
+For symmetric pawn tables, square numbers are `8 * file + rank` on files a–d and `8 * file + (7 - rank)` on e–h, using zero-based files and STM-normalized ranks. In this way horizontal reflection sends square number `i` to `63 - i`, so that exactly one of the reflected or non-reflected positions will have the STM and SNTM king in the right order.
 
 En-passant positions are encoded separately in different ranges of indices (sub-tables) managed internally by the `Indexer`. The `Indexer` exposes a single unified index range for the entire `Egt`.
 
-##### Local Indexing Algorithm (`board_to_index`)
+##### Local Indexing Algorithm (`position_to_index`)
 The `Indexer` maps a chess position to a unique integer in `[0, index_range)` using a multi-step compaction and combinatorial encoding process:
 
+   - For symmetric pawn tables, choose the horizontal orientation from the king order first, including the reflected EP file.
    - The indexer checks whether a legal en-passant capture is available. A raw EP square without a legal capture is equivalent to no EP.
    - If so, it selects the corresponding sub-table and adjusts the `index_offset`. The SNTM victim is the highest pawn on its file in STM-normalized ranks, fixed on rank 5. The remaining $k-1$ pawns on that file occupy ranks 2–4, contributing $\binom{3}{k-1}$ combinations. The sequence must end in SNTM and contain at most four pawns. Decoding still checks that an en-passant capture is legal.
    - The board position is converted into coordinates `(rank, file)` for each piece.
-   - Coordinates are ordered descending within each group. Pawns are gathered directly in rank order on their file; only repeated non-pawn pieces need sorting. Decoding uses precomputed piece/color slots for each pawn sequence and non-pawn group.
+   - Pawns are gathered in descending rank order on their file. Repeated non-pawn pieces are sorted by descending square number; the joint king group already has its canonical order. Decoding uses precomputed piece/color slots.
    - If there are no pawns, the first king's position is restricted to 10 canonical squares (representing one octant of the board) using horizontal, vertical, and diagonal reflections. All other pieces are reflected accordingly to preserve relative positions.
-   - Each coordinate is converted to a raw square index in `0..64` (rank x 8 + file).
+   - Each coordinate is converted to a raw square index in `0..64`: `rank * 8 + file`, except for the reflection-reversing numbering used by symmetric pawn tables.
    - Since no two pieces can occupy the same square, the raw square indices are compacted to remove "holes" caused by already occupied squares. For each piece, its index is adjusted by subtracting the number of preceding pieces that occupy a lower square index. This maps the indices sequentially to ranges `[0..64, 0..63, 0..62, 0..61, ...]`.
    - Pawns are restricted to ranks 2-7 (6 possible squares on their designated file). Their positions are converted to compact indices in `0..6` ($rank - 1$).
    - A file containing $k$ pawns contributes $\binom{6}{k}$ rank subsets, with its fixed color sequence supplying the colors.
-   - For pawnless endgames, the positions of the two kings are mapped together. Since they cannot stand on adjacent or identical squares, a precomputed lookup table (`kings_map_to_index`) maps the valid joint positions of both kings to a single index in `0..462`.
-   - The compacted indices of each piece group are aggregated into a single integer using a mixed-radix system. For a group of $k$ identical pieces of a type that can occupy $n$ available squares, the number of combinations is given by the binomial coefficient $\binom{n}{k}$ (using a precomputed table).
+   - Pawnless and symmetric pawn tables both use an internal `IndexerGroup::KingPair`. For pawnless endgames, a precomputed lookup table (`KINGS_MAP`) maps valid canonical king pairs (excluding adjacent or identical squares) to a single index in `0..462`; symmetric pawn tables use the two-square combination described above.
+   - The compacted indices of each piece group are aggregated into a single integer using a mixed-radix system. A group of $k$ identical pieces, or the ordered king pair in a symmetric pawn table, contributes $\binom{n}{k}$ combinations among $n$ available squares (using a precomputed table).
    - The combination index for these $k$ pieces with compacted indices $c_0 > c_1 > \dots > c_{k-1}$ is computed using the combinatorial number system (combinadics):
      $$\text{group\_index} = \sum_{j=0}^{k-1} \binom{c_j}{k-j}$$
      *(Note: for $k=1$, it is simply $c_0$).*
@@ -149,7 +156,9 @@ JSON statistics file at the same relative path:
 <root>/<n>/<max>v<min>/op<K>/<N>pawns/<tablename>.json
 ```
 
-Here `n` counts all pieces including kings, `max`/`min` are the two side piece
+The root descriptor is `{"format":"ggegt-v0.10"}`. Different formats are rejected.
+
+In the path, `n` counts all pieces including kings, `max`/`min` are the two side piece
 counts in descending order, `K` counts mutually opposing pawn pairs (once per
 pair), and `N` counts pawns.
 

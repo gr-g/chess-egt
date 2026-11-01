@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-const TABLEBASE_FORMAT: &str = "ggegt-v0.9";
+const TABLEBASE_FORMAT: &str = "ggegt-v0.10";
 pub(crate) const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
 
 /// Root metadata is immutable and independent of optional per-table statistics.
@@ -265,6 +265,7 @@ mod tests {
         location.ensure_format().unwrap();
         let key = location.prefix.clone().join("format.json");
         for bytes in [
+            serde_json::to_vec(&serde_json::json!({ "format": "ggegt-v0.9" })).unwrap(),
             serde_json::to_vec(&serde_json::json!({ "format": "other" })).unwrap(),
             serde_json::to_vec(&serde_json::json!({
                 "format": TABLEBASE_FORMAT,

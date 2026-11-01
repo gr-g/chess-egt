@@ -985,6 +985,64 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_pawn_quiet_edge_multiplicities() {
+        let mut ep_predecessors = 0;
+        let mut ep_successors = 0;
+        for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe"] {
+            let id = TableId::parse(name).unwrap();
+            let (twin_id, mirrored) = id.twin().unwrap();
+            let egt = Egt::from_elements(id.parse_elements()).unwrap();
+            let twin = Egt::from_elements(twin_id.parse_elements()).unwrap();
+            let reverse_mirrored = is_mirrored(&twin, &egt);
+            let stride = (egt.index_range() / 128).max(1);
+            let mut samples: Vec<_> = (0..egt.index_range()).step_by(stride).collect();
+            if name == "KPcPf_KPdPe" {
+                // Exercise both reflected EP files, EP expiry, and double pushes creating EP.
+                for fen in [
+                    "7k/8/8/2PppP2/8/8/8/K7 w - d6 0 1",
+                    "7k/8/8/2PppP2/8/8/8/K7 w - e6 0 1",
+                    "7k/8/8/8/3pp3/8/2P2P2/K7 w - - 0 1",
+                ] {
+                    samples.push(egt.position_to_index(&test_position(fen)));
+                }
+            }
+            let mut checked = 0;
+            for turn in [Color::White, Color::Black] {
+                for &pred_idx in &samples {
+                    let Some(position) = egt.position_from_index(pred_idx, turn) else { continue };
+                    assert_eq!(egt.position_to_index(&position), pred_idx);
+                    ep_predecessors += usize::from(position.legal_ep_square().is_some());
+                    let mut successors = HashMap::new();
+                    for m in position.legal_moves() {
+                        if m.is_capture() || m.is_promotion() { continue; }
+                        let successor = position.clone().play(m).unwrap();
+                        ep_successors += usize::from(successor.legal_ep_square().is_some());
+                        let succ_idx = if mirrored {
+                            twin.reflected_position_to_index(&successor)
+                        } else {
+                            twin.position_to_index(&successor)
+                        };
+                        *successors.entry(succ_idx).or_insert(0usize) += 1;
+                    }
+                    for (succ_idx, expected) in successors {
+                        assert!(twin.position_from_index(succ_idx, Color::White).is_some());
+                        let mut actual = 0;
+                        quiet_unmoves(&twin, &egt, succ_idx, reverse_mirrored, |idx| {
+                            if idx == pred_idx { actual += 1; }
+                        });
+                        assert_eq!(actual, expected,
+                            "{name}, {turn:?}, predecessor {pred_idx}, successor {succ_idx}");
+                    }
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "no valid samples for {name}");
+        }
+        assert!(ep_predecessors > 0, "samples must include EP expiry");
+        assert!(ep_successors > 0, "samples must include double pushes creating EP");
+    }
+
+    #[test]
     fn pawnful_unmoves_match_forward_play_in_ep_and_blocked_positions() {
         for fen in [
             "7k/8/8/8/8/4P3/8/K7 b - - 0 1", // Single pawn push.

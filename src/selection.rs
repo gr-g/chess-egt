@@ -19,7 +19,9 @@ use shakmaty::{ByRole, Role};
 
 use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES};
-use crate::table_id::{TableId, get_file_combinations, is_canonical, pawn_order_combinations};
+use crate::table_id::{
+    PawnKey, TableId, get_file_combinations, is_canonical, pawn_order_combinations,
+};
 
 #[derive(Clone, Debug, Default)]
 struct Prefix {
@@ -123,6 +125,9 @@ impl Material {
                     continue;
                 }
                 for mut elements in pawn_order_combinations(a, b) {
+                    if PawnKey::from_elements(&elements).canonicalized().1 {
+                        continue;
+                    }
                     elements.extend_from_slice(&self.pieces);
                     let table = TableId::from_elements(elements)?;
                     if prefix.matches(&table) {
@@ -490,6 +495,11 @@ mod tests {
         // 144 canonical file multisets, plus 8 extra same-file words and
         // 28 extra words with the enemy sharing one of two distinct files.
         assert_eq!(resolve("KPP_KP").len(), 180);
+        let tables = resolve("KPP_KPP");
+        let selected = names(&tables);
+        assert!(selected.contains(&"KPaPho_KPaPho"));
+        assert!(!selected.contains(&"KPaoPh_KPaoPh"));
+        assert!(selected.contains(&"KPaoPho_KPaoPho"));
     }
 
     #[test]

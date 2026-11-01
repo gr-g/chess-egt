@@ -1,7 +1,7 @@
 //! Validated canonical table names and allocation-free position routing.
 //!
-//! Horizontal canonicalization compares pawn-file multisets, not color words.
-//! Reflection ties deliberately retain both color-word orientations.
+//! Horizontal canonicalization compares STM then SNTM pawn-file multisets,
+//! breaking ties with the full pawn color words.
 
 use arrayvec::ArrayString;
 use shakmaty::{ByRole, Chess, Color, File, Position, Role};
@@ -60,7 +60,8 @@ impl TableId {
         Ok(Self(name.to_owned()))
     }
 
-    /// Routes a position, returning whether indexing requires file reflection.
+    /// Routes a position, returning whether its table identity requires file reflection.
+    /// This flag does not include king normalization within a symmetric table.
     pub fn from_position(position: &Chess) -> EgtResult<(Self, bool)> {
         let (name, reflected) = position_table_name(position)?;
         Ok((Self(name.to_string()), reflected))
@@ -394,6 +395,10 @@ impl PawnKey {
         Self { files }
     }
 
+    pub(crate) fn is_symmetric(self) -> bool {
+        self == self.reflected()
+    }
+
     pub(crate) fn twin(self) -> Self {
         let mut files = [1; 8];
         for (target, word) in files.iter_mut().zip(self.files) {
@@ -421,10 +426,13 @@ impl PawnKey {
                 files.push(File::new(file as u32));
             }
         }
-        if is_canonical(&stm, &sntm) {
+        let reflected = self.reflected();
+        if compare_file_reflection(&stm, &sntm).then_with(|| self.cmp(&reflected))
+            != Ordering::Greater
+        {
             (self, false)
         } else {
-            (self.reflected(), true)
+            (reflected, true)
         }
     }
 
@@ -451,19 +459,19 @@ impl PawnKey {
     }
 }
 
-/// Both slices must be sorted ascending. Ties deliberately ignore color words.
+/// Coarse filter for sorted file lists; color-word ties are resolved by `PawnKey`.
 pub(crate) fn is_canonical(stm: &[File], sntm: &[File]) -> bool {
+    compare_file_reflection(stm, sntm) != Ordering::Greater
+}
+
+fn compare_file_reflection(stm: &[File], sntm: &[File]) -> Ordering {
     fn compare(files: &[File]) -> Ordering {
         files
             .iter()
             .map(|f| f.to_usize())
             .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
     }
-    match compare(stm) {
-        Ordering::Less => true,
-        Ordering::Greater => false,
-        Ordering::Equal => compare(sntm) != Ordering::Greater,
-    }
+    compare(stm).then_with(|| compare(sntm))
 }
 
 /// Enumerates rank color words for fixed pawn-file multisets, without indexers.
@@ -613,6 +621,9 @@ mod tests {
             ("7k/8/8/8/3pP3/8/8/K7 b - e3 0 1", "KPd_KPe", false),
             ("7k/8/8/p7/P7/8/8/K7 w - - 0 1", "KPao_KPao", false),
             ("7k/8/8/P7/p7/8/8/K7 w - - 0 1", "KPa_KPa", false),
+            ("7k/8/8/p6P/P6p/8/8/K7 w - - 0 1", "KPaPho_KPaPho", true),
+            ("7k/8/8/P6p/p6P/8/8/K7 w - - 0 1", "KPaPho_KPaPho", false),
+            ("k7/8/8/8/8/8/P6P/7K w - - 0 1", "KPaPh_K", false),
         ] {
             let (id, actual_reflection) = TableId::from_position(&position(fen)).unwrap();
             assert_eq!(id.tablename(), name, "{fen}");
@@ -650,17 +661,25 @@ mod tests {
     }
 
     #[test]
-    fn color_order_does_not_break_file_multiplicity_ties() {
+    fn color_order_breaks_file_multiplicity_ties() {
         // Both sides' file multisets are invariant under reflection, but their
-        // color words differ. The historical policy keeps both orientations.
-        let a = TableId::parse("KPaoPh_KPaoPh").unwrap();
-        let b = TableId::parse("KPaPho_KPaPho").unwrap();
-        assert_ne!(a, b);
-        for table in [&a, &b] {
-            let key = PawnKey::from_elements(&table.parse_elements());
-            assert!(!key.canonicalized().1);
-            assert!(!key.reflected().canonicalized().1);
-            assert_ne!(key, key.reflected());
+        // color words differ. Only the smaller full key is canonical.
+        let elements = parse_elements("KPaoPh_KPaoPh").unwrap();
+        let table = TableId::parse("KPaPho_KPaPho").unwrap();
+        let key = PawnKey::from_elements(&table.parse_elements());
+        assert!(TableId::parse("KPaoPh_KPaoPh").is_err());
+        assert!(TableId::from_elements(elements.clone()).is_err());
+        assert_eq!(
+            PawnKey::from_elements(&elements).canonicalized(),
+            (key, true)
+        );
+        assert_eq!(key.canonicalized(), (key, false));
+        assert_eq!(key.reflected().canonicalized(), (key, true));
+        assert!(!key.is_symmetric());
+        for name in ["K_K", "KPaPh_K", "KPaoPho_KPaoPho"] {
+            let key = PawnKey::from_elements(&TableId::parse(name).unwrap().parse_elements());
+            assert!(key.is_symmetric());
+            assert_eq!(key.canonicalized(), (key, false));
         }
     }
 
