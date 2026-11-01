@@ -596,7 +596,8 @@ mod tests {
 
     #[test]
     fn ordering_is_consistent_with_identity() {
-        let tables = crate::resolve_selectors(&["2/", "3/", "4/", "KPP_KP"]).unwrap();
+        let mut tables = crate::resolve_selectors(&["2/", "3/", "4/"]).unwrap();
+        tables.extend(crate::resolve_selectors(&["KPP_KP"]).unwrap());
         for a in &tables {
             for b in &tables {
                 assert_eq!(a.cmp(b).is_eq(), a == b);

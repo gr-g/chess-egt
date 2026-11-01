@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(name = "chess-egt")]
 #[command(about = "Chess Endgame Tablebase Tool", long_about = None)]
 #[command(group(clap::ArgGroup::new("action")
-    .args(["generate", "verify", "stats", "list", "position"])
+    .args(["generate", "verify", "stats", "cache_stats", "list", "position"])
     .multiple(false)))]
 struct Cli {
     #[arg(long, default_value = "./ggegt")]
@@ -19,7 +19,7 @@ struct Cli {
 
     /// Additional path used to look up dependency tables, in addition to --path.
     /// If not given, --path is used for dependencies as well.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["stats", "cache_stats"])]
     input_path: Option<PathBuf>,
 
     /// Retained frame-cache memory (bytes, B, KiB, MiB, or GiB).
@@ -42,12 +42,16 @@ struct Cli {
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     stats: Vec<String>,
 
+    /// Cache missing table metadata and rebuild selected hierarchy summaries.
+    #[arg(long, value_name = "SELECTOR", num_args = 1..)]
+    cache_stats: Vec<String>,
+
     /// List canonical table names by piece count, pawn count, then Q/R/B/N/P order.
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     list: Vec<String>,
 
     /// Skip the internal consistency check performed after generation.
-    #[arg(long, requires = "generate", conflicts_with_all = ["verify", "stats", "list", "position"])]
+    #[arg(long, requires = "generate", conflicts_with_all = ["verify", "stats", "cache_stats", "list", "position"])]
     noverify: bool,
 
     /// Probe a quoted FEN position (mutually exclusive with selector actions).
@@ -105,6 +109,11 @@ fn run() -> Result<(), EgtError> {
         let selectors: Vec<_> = cli.stats.iter().map(String::as_str).collect();
         let prober = configured_prober(&cli)?;
         let stats = prober.stats(&selectors)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else if !cli.cache_stats.is_empty() {
+        let selectors: Vec<_> = cli.cache_stats.iter().map(String::as_str).collect();
+        let prober = configured_prober(&cli)?;
+        let stats = prober.cache_stats(&selectors)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else if let Some(ref fen) = cli.position {
         let fen_obj: Fen = fen
@@ -184,16 +193,20 @@ fn generation_summary(
     lowest_compression: Option<(&str, f64)>,
 ) -> String {
     let seconds = elapsed.as_secs();
-    let average_compression = if total.unique_positions > 0 {
-        total.bytes as f64 * 8.0 / total.unique_positions as f64
+    let unique_positions = total
+        .unique_positions
+        .expect("generation statistics are complete");
+    let bytes = total.bytes.expect("generation statistics are complete");
+    let average_compression = if unique_positions > 0 {
+        bytes as f64 * 8.0 / unique_positions as f64
     } else {
         0.0
     };
     let mut summary = format!(
         "Generated {} tables: {} unique positions, {:.2} MiB in {:02}h{:02}m{:02}s.\nAverage compression: {:.2} bits/pos.",
-        total.loaded_tables,
-        total.unique_positions,
-        total.bytes as f64 / (1024.0 * 1024.0),
+        total.available_tables,
+        unique_positions,
+        bytes as f64 / (1024.0 * 1024.0),
         seconds / 3600,
         seconds / 60 % 60,
         seconds % 60,
@@ -257,22 +270,29 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
-    const ACTIONS: [&str; 4] = ["--generate", "--verify", "--stats", "--list"];
+    const ACTIONS: [&str; 5] = [
+        "--generate",
+        "--verify",
+        "--stats",
+        "--cache-stats",
+        "--list",
+    ];
     const FEN: &str = "8/8/8/8/8/8/3K4/k7 w - - 0 1";
 
     #[test]
     fn selector_actions_accept_multiple_selectors_without_a_path() {
         for action in ACTIONS {
-            let cli = Cli::try_parse_from(["chess-egt", action, "3", "KQ_K"]).unwrap();
+            let cli = Cli::try_parse_from(["chess-egt", action, "3", "4"]).unwrap();
             assert_eq!(cli.path, PathBuf::from("./ggegt"));
             let selectors = match action {
                 "--generate" => cli.generate,
                 "--verify" => cli.verify,
                 "--stats" => cli.stats,
+                "--cache-stats" => cli.cache_stats,
                 "--list" => cli.list,
                 _ => unreachable!(),
             };
-            assert_eq!(selectors, ["3", "KQ_K"]);
+            assert_eq!(selectors, ["3", "4"]);
         }
     }
 
@@ -319,6 +339,35 @@ mod tests {
             let error = Cli::try_parse_from(["chess-egt", &argument]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
+    }
+
+    #[test]
+    fn statistics_actions_reject_input_overlays() {
+        for action in ["--stats", "--cache-stats"] {
+            let error = Cli::try_parse_from(["chess-egt", action, "3", "--input-path", "other"])
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+            assert!(Cli::try_parse_from(["chess-egt", action, "3", "--noverify"]).is_err());
+        }
+    }
+
+    #[test]
+    fn generation_summary_uses_complete_statistics() {
+        let total = AggregateStats {
+            selected_tables: 2,
+            available_tables: 2,
+            bytes: Some(1024 * 1024),
+            unique_positions: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        assert_eq!(
+            generation_summary(
+                &total,
+                std::time::Duration::from_secs(65),
+                Some(("KQ_K", 3.0))
+            ),
+            "Generated 2 tables: 4194304 unique positions, 1.00 MiB in 00h01m05s.\nAverage compression: 2.00 bits/pos. Lowest compression (KQ_K): 3.00 bits/pos."
+        );
     }
 
     #[test]

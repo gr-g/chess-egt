@@ -21,25 +21,31 @@ cargo run --release -- --path ./ggegt --input-path s3://ggegt/ --generate KQ_KR 
 cargo run --release -- --verify KQ_KR KR_KQ
 
 # Enumerate theoretical tables.
-cargo run --release -- --list KP_K 4/2v2/op1
+cargo run --release -- --list 3/ 4/2v2/op1
+
+# Report statistics, including theoretical sizes of missing tables.
+cargo run --release -- --stats 4/
+
+# Store summary statistics for groups of tables for faster retrieval.
+cargo run --release -- --cache-stats 4/
 
 # Probe a table.
-cargo run --release -- --path ./ggegt '8/8/8/8/8/2K5/4Q3/7k w - - 0 1'
+cargo run --release -- --path ./ggegt '8/8/8/8/8/2K5/4Q3/7k w - -'
 ```
 
-`--generate`, `--verify`, `--stats`, and `--list` each accept multiple `SELECTOR`s:
+`--generate`, `--verify`, `--stats`, `--cache-stats`, and `--list` each accept multiple `SELECTOR`s of a single kind:
 
 - **Exact name**, e.g. `KPa_K`: one canonical table, with STM on the left.
 - **Oriented material**, e.g. `KP_K`: all tables for that material balance (`K_KP` is not included).
-- **Hierarchy prefix**, e.g. `3/`, `4/2v2/op1`, or `4/2v2/op1/2pawns`. A material or exact name may follow a prefix to intersect the selections.
+- **Hierarchy prefix**, e.g. `3/`, `4/2v2/op1`, or `4/2v2/op1/2pawns`. The trailing slash is optional.
 
 Generating a table such as `KPa_K` will also generate the twin table `K_KPa`.
-Verification and stats do not add twins.
+Verification, statistics, and statistics caching do not consider twin tables.
 
 Cloud credentials/configuration come from environment variables supported by
 [`object_store`](https://docs.rs/object_store/latest/object_store/). HTTP roots
-are read-only. `--input-path` is searched before `--path`, falling back only for
-missing objects.
+are read-only. For generation, verification, and probing, `--input-path` is
+searched before `--path`, falling back only for missing objects.
 
 Run the test suite with:
 
@@ -154,6 +160,7 @@ JSON statistics file at the same relative path:
 <root>/format.json
 <root>/<n>/<max>v<min>/op<K>/<N>pawns/<tablename>.ggegt
 <root>/<n>/<max>v<min>/op<K>/<N>pawns/<tablename>.json
+<root>/<hierarchy-prefix>/stats.json
 ```
 
 The root descriptor is `{"format":"ggegt-v0.10"}`. Different formats are rejected.

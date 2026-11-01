@@ -586,6 +586,7 @@ impl EgtFileReader {
         self.location.ensure_format()?;
         let key = self.location.key(&self.id.relative_path("json"));
         let json = serde_json::to_vec_pretty(stats)?;
+        crate::stats_cache::invalidate(&self.location, &self.id)?;
         block_on(self.location.store.put(&key, json.into()))
             .map_err(|error| self.location.error(&key, error))?;
         Ok(())

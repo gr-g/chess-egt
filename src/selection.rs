@@ -2,10 +2,10 @@
 //!
 //! Selectors are exact names (`KPa_K`), oriented uppercase material (`KP_K`),
 //! or hierarchy prefixes (`3`, `3/2v1`, `3/2v1/op0`, `3/2v1/op0/1pawns`).
-//! A material or exact name may follow any prefix, forming an intersection,
-//! e.g. `4/2v2/op1/KP_KP`. Prefixes select **both** material orientations;
-//! material never silently exchanges STM and SNTM. A trailing slash on a prefix
-//! is accepted. Piece counts range from two through eight.
+//! Each selection is a union of one kind only: hierarchy, material, or exact.
+//! Prefix/target intersections are not supported. Prefixes select **both** material
+//! orientations; material never silently exchanges STM and SNTM. A trailing slash
+//! on a prefix is accepted. Piece counts range from two through eight.
 //!
 //! Generation adds a selected table's quiet-move twin, but does not recursively
 //! add capture/promotion dependencies. Those prerequisites must already exist
@@ -142,7 +142,7 @@ impl Material {
 
 #[derive(Clone, Debug)]
 enum Target {
-    All,
+    Hierarchy(Prefix),
     Material(Material),
     Exact(TableId),
 }
@@ -152,7 +152,6 @@ enum Target {
 #[derive(Clone, Debug)]
 pub struct TableSelector {
     source: String,
-    prefix: Prefix,
     target: Target,
 }
 
@@ -163,23 +162,25 @@ impl TableSelector {
         if text.is_empty() {
             return Err(invalid("empty selector"));
         }
-        let mut parts: Vec<_> = text.split('/').collect();
+        if text.contains('_') {
+            if selector.contains('/') {
+                return Err(invalid("material and exact selectors must be bare names"));
+            }
+            let target = if text.chars().any(|c| c.is_ascii_lowercase()) {
+                Target::Exact(TableId::parse(text)?)
+            } else {
+                Target::Material(Material::parse(text)?)
+            };
+            return Ok(Self {
+                source: selector.to_owned(),
+                target,
+            });
+        }
+        let parts: Vec<_> = text.split('/').collect();
         if parts.iter().any(|part| part.is_empty()) {
             return Err(invalid("empty selector component"));
         }
-        let target = if parts.last().is_some_and(|part| part.contains('_')) {
-            let name = parts.pop().unwrap();
-            if name.chars().any(|c| c.is_ascii_lowercase()) {
-                Target::Exact(TableId::parse(name)?)
-            } else {
-                Target::Material(Material::parse(name)?)
-            }
-        } else {
-            Target::All
-        };
-        if selector.ends_with('/') && !matches!(target, Target::All) {
-            return Err(invalid("only hierarchy prefixes may have a trailing slash"));
-        }
+
         if parts.len() > 4 {
             return Err(invalid("too many hierarchy components"));
         }
@@ -209,7 +210,7 @@ impl TableSelector {
                 .strip_prefix("op")
                 .and_then(decimal)
                 .ok_or_else(|| invalid("expected opK opposing-pair count"))?;
-            if opposing > (prefix.n.unwrap() - 2) / 2 {
+            if opposing > prefix.split.unwrap().1 - 1 {
                 return Err(invalid("too many opposing pawn pairs"));
             }
             prefix.opposing = Some(opposing);
@@ -226,19 +227,9 @@ impl TableSelector {
             }
             prefix.pawns = Some(pawns);
         }
-        match &target {
-            Target::Exact(table) if !prefix.matches(table) => {
-                return Err(invalid("table does not match hierarchy prefix"));
-            }
-            Target::Material(material) if !prefix.matches_material(material) => {
-                return Err(invalid("material does not match hierarchy prefix"));
-            }
-            _ => (),
-        }
         Ok(Self {
             source: selector.to_owned(),
-            prefix,
-            target,
+            target: Target::Hierarchy(prefix),
         })
     }
 
@@ -247,24 +238,17 @@ impl TableSelector {
     pub fn resolve(&self) -> EgtResult<Vec<TableId>> {
         let tables = match &self.target {
             Target::Exact(table) => vec![table.clone()],
-            Target::Material(material) => material.tables(&self.prefix)?,
-            Target::All => {
-                let n = self
-                    .prefix
-                    .n
-                    .ok_or_else(|| invalid_name(&self.source, "missing piece count"))?;
+            Target::Material(material) => material.tables(&Prefix::default())?,
+            Target::Hierarchy(prefix) => {
                 let mut tables = Vec::new();
-                for name in material_names(n) {
-                    tables.extend(Material::parse(&name)?.tables(&self.prefix)?);
+                for name in material_names(prefix.n.unwrap()) {
+                    tables.extend(Material::parse(&name)?.tables(prefix)?);
                 }
                 tables
             }
         };
         if tables.is_empty() {
-            return Err(invalid_name(
-                &self.source,
-                "selector intersection contains no tables",
-            ));
+            return Err(invalid_name(&self.source, "selector contains no tables"));
         }
         Ok(tables
             .into_iter()
@@ -274,14 +258,59 @@ impl TableSelector {
     }
 }
 
-/// Union of selectors, deduplicated and sorted by pieces, then pawns,
+fn parse_selectors(selectors: &[&str]) -> EgtResult<Vec<TableSelector>> {
+    let parsed = selectors
+        .iter()
+        .map(|selector| TableSelector::parse(selector))
+        .collect::<EgtResult<Vec<_>>>()?;
+    if let Some(first) = parsed.first() {
+        for selector in &parsed[1..] {
+            if std::mem::discriminant(&first.target) != std::mem::discriminant(&selector.target) {
+                return Err(invalid_name(
+                    &selector.source,
+                    "selectors must all be hierarchy prefixes, material names, or exact names",
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// Union of selectors of one kind, deduplicated and sorted by pieces, then pawns,
 /// then table name using KQRBNP piece order, grouping opposition variants.
 pub fn resolve_selectors(selectors: &[&str]) -> EgtResult<Vec<TableId>> {
     let mut tables = BTreeSet::new();
-    for selector in selectors {
-        tables.extend(TableSelector::parse(selector)?.resolve()?);
+    for selector in parse_selectors(selectors)? {
+        tables.extend(selector.resolve()?);
     }
     Ok(tables.into_iter().collect())
+}
+
+/// Validates a homogeneous selection without enumerating tables. Hierarchy
+/// prefixes are sorted, end in '/', and omit duplicates and covered descendants.
+/// Empty input returns Some(empty); material and exact selections return None.
+pub(crate) fn hierarchy_prefixes(selectors: &[&str]) -> EgtResult<Option<Vec<String>>> {
+    let parsed = parse_selectors(selectors)?;
+    if parsed
+        .first()
+        .is_some_and(|s| !matches!(s.target, Target::Hierarchy(_)))
+    {
+        return Ok(None);
+    }
+    let prefixes: BTreeSet<_> = parsed
+        .iter()
+        .map(|s| format!("{}/", s.source.trim_end_matches('/')))
+        .collect();
+    let mut disjoint: Vec<String> = Vec::new();
+    for prefix in prefixes {
+        if !disjoint
+            .last()
+            .is_some_and(|parent| prefix.starts_with(parent))
+        {
+            disjoint.push(prefix);
+        }
+    }
+    Ok(Some(disjoint))
 }
 
 /// Quiet-move pairs only; capture/promotion prerequisites are not auto-generated.
@@ -383,36 +412,36 @@ mod tests {
         assert_eq!(names(&resolve("KPa_K")), ["KPa_K"]);
         assert_eq!(names(&resolve("KQ_K")), ["KQ_K"]);
         assert_eq!(names(&resolve("K_K")), ["K_K"]);
-        assert!(resolve_selectors(&["KP_K", "KPa_K", "3/2v1/1pawns"]).is_err());
-        let union = resolve_selectors(&["KP_K", "KPa_K", "3/2v1/op0/1pawns"]).unwrap();
+        let union = resolve_selectors(&["KP_K", "K_KP", "KP_K"]).unwrap();
         assert_eq!(union.len(), 8);
         assert_eq!(union, resolve("3/2v1/op0/1pawns"));
         assert!(resolve_selectors(&[]).unwrap().is_empty());
     }
 
     #[test]
-    fn prefixes_are_intersections_not_side_reorientation() {
+    fn hierarchy_selects_both_orientations() {
         assert_eq!(resolve("3"), resolve("3/"));
         assert_eq!(resolve("3"), resolve("3/2v1"));
-        assert_eq!(resolve("3/2v1/op0/1pawns/KP_K"), resolve("KP_K"));
-        assert_eq!(resolve("3/K_KP"), resolve("K_KP"));
-        assert_eq!(resolve("3/2v1/KPa_K"), resolve("KPa_K"));
-        let opposed = resolve("4/2v2/op1/KP_KP");
+        assert_eq!(
+            resolve("3/2v1/op0/1pawns"),
+            resolve_selectors(&["KP_K", "K_KP"]).unwrap()
+        );
+        let opposed = resolve("4/2v2/op1/2pawns");
         assert_eq!(opposed.len(), 4);
         assert!(opposed.iter().all(|t| t.opposing_pairs() == 1));
-        assert_eq!(resolve("4/2v2/op0/KP_KP").len(), 32);
-        assert_eq!(resolve("4/2v2/op1/2pawns"), opposed);
+        assert_eq!(resolve("4/2v2/op0/2pawns").len(), 32);
         for table in resolve("4") {
             let path = table.relative_path("ggegt");
             let prefix = path.rsplit_once('/').unwrap().0;
             assert!(resolve(prefix).contains(&table), "{path}");
             let exact = path.strip_suffix(".ggegt").unwrap();
-            assert_eq!(resolve(exact), vec![table]);
+            assert!(TableSelector::parse(exact).is_err());
+            assert_eq!(resolve(table.tablename()), vec![table]);
         }
     }
 
     #[test]
-    fn malformed_and_mismatched_selectors_fail() {
+    fn malformed_and_intersection_selectors_fail() {
         for selector in [
             "",
             "/",
@@ -428,6 +457,12 @@ mod tests {
             "4/2v2/op1/1pawns",
             "3/2v1/1pawns",
             "3/KQ_KR",
+            "3/KQ_K",
+            "3/K_KP",
+            "3/2v1/KPa_K",
+            "3/2v1/op0/1pawns/KP_K",
+            "4/2v2/op1/KP_KP",
+            "4/3v1/op1",
             "3/2v1/op0/0pawns/KP_K",
             "4/3v1/op1/KPP_K",
             "KPh_K",
@@ -442,12 +477,62 @@ mod tests {
             let result = TableSelector::parse(selector).and_then(|s| s.resolve());
             assert!(result.is_err(), "unexpectedly accepted {selector:?}");
         }
-        // A syntactically valid prefix can still describe an empty intersection.
-        assert!(
-            TableSelector::parse("4/3v1/op1")
-                .unwrap()
-                .resolve()
-                .is_err()
+    }
+
+    #[test]
+    fn unions_require_homogeneous_kinds() {
+        for selectors in [
+            ["3", "KP_K"],
+            ["3", "KPa_K"],
+            ["KP_K", "KPa_K"],
+            ["KPa_K", "KQ_K"],
+        ] {
+            for selectors in [selectors, [selectors[1], selectors[0]]] {
+                assert!(resolve_selectors(&selectors).is_err(), "{selectors:?}");
+                assert!(hierarchy_prefixes(&selectors).is_err(), "{selectors:?}");
+            }
+        }
+        assert_eq!(
+            names(&resolve_selectors(&["KPb_K", "KPa_K", "KPb_K"]).unwrap()),
+            ["KPa_K", "KPb_K"]
+        );
+        assert_eq!(
+            names(&resolve_selectors(&["KR_K", "KQ_K", "KR_K"]).unwrap()),
+            ["KQ_K", "KR_K"]
+        );
+    }
+
+    #[test]
+    fn hierarchy_prefixes_are_canonical_and_disjoint() {
+        assert_eq!(hierarchy_prefixes(&[]).unwrap(), Some(vec![]));
+        assert_eq!(
+            hierarchy_prefixes(&[
+                "4/2v2/op1/2pawns/",
+                "3/2v1",
+                "4/2v2/op0/2pawns",
+                "3/",
+                "4/2v2/op1",
+                "3",
+                "4/2v2/op0/2pawns/",
+            ])
+            .unwrap(),
+            Some(vec![
+                "3/".into(),
+                "4/2v2/op0/2pawns/".into(),
+                "4/2v2/op1/".into(),
+            ])
+        );
+        assert_eq!(hierarchy_prefixes(&["KP_K", "KQ_K"]).unwrap(), None);
+        assert_eq!(hierarchy_prefixes(&["KPa_K", "K_KPa"]).unwrap(), None);
+        // Validate every selector, even descendants covered by a valid ancestor.
+        for invalid in ["4/3v1/op1", "4/2v2/op1/1pawns", "4/KPa_K", "KPh_K"] {
+            assert!(hierarchy_prefixes(&["4", invalid]).is_err(), "{invalid}");
+            assert!(hierarchy_prefixes(&[invalid]).is_err(), "{invalid}");
+        }
+        // Validation must not expand the very large eight-piece selection.
+        assert_eq!(
+            hierarchy_prefixes(&["8/4v4", "8"]).unwrap(),
+            Some(vec!["8/".into()])
         );
     }
 
@@ -504,7 +589,7 @@ mod tests {
 
     #[test]
     fn selections_follow_dependency_and_piece_order() {
-        let tables = resolve_selectors(&["3/", "2/", "KQ_K"]).unwrap();
+        let tables = resolve_selectors(&["3/", "2/", "3/2v1"]).unwrap();
         assert_eq!(
             names(&tables),
             [
@@ -517,7 +602,12 @@ mod tests {
 
         // Fewer pieces take priority over fewer pawns; promotions precede pawns
         // even when their names would sort later in the piece alphabet.
-        let tables = resolve_selectors(&["KQPa_K", "KPa_K", "K_KN", "KQQ_K"]).unwrap();
+        let tables = ["KQPa_K", "KPa_K", "K_KN", "KQQ_K"]
+            .into_iter()
+            .flat_map(resolve)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(names(&tables), ["K_KN", "KPa_K", "KQQ_K", "KQPa_K"]);
         assert_eq!(names(&resolve("KQPa_K")), ["KQPa_K"]);
     }
@@ -552,10 +642,12 @@ mod tests {
 
     #[test]
     fn plan_adds_twins_deduplicates_and_orders_prerequisites() {
-        let selected = resolve_selectors(&[
+        let selected: Vec<_> = [
             "KPa_K", "K_KPa", "KQ_K", "K_K", "KPd_KPe", "KQR_K", "KQPa_K",
-        ])
-        .unwrap();
+        ]
+        .into_iter()
+        .map(|name| TableId::parse(name).unwrap())
+        .collect();
         let plan = GenerationPlan::new(selected.clone()).unwrap();
         assert_eq!(plan.pairs.len(), 6);
         assert!(plan.pairs.windows(2).all(|w| w[0].0 < w[1].0));

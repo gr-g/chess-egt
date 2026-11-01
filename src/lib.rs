@@ -21,6 +21,7 @@ mod position;
 mod retrograde;
 mod selection;
 mod stats;
+mod stats_cache;
 mod storage;
 mod table_id;
 
@@ -308,44 +309,30 @@ impl EgtProber {
         Ok(())
     }
 
-    /// Reads only versioned JSON sidecars. Missing data is an error.
-    /// Overlapping selectors are deduplicated before retrieval and aggregation.
+    /// Reads metadata without modifying storage. Missing sidecars contribute their
+    /// theoretical index ranges; computed totals are null for incomplete selections.
+    /// Hierarchy selections use cached summaries when available. Input overlays
+    /// are unsupported: statistics always describe one root.
     pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
-        let tables = resolve_selectors(selectors)?;
-        let mut total = AggregateStats {
-            selected_tables: tables.len(),
-            ..Default::default()
-        };
-        // Small bounded batches overlap remote requests without retaining all
-        // sidecars or creating a worker for every selected table.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(8)
-            .build()
-            .map_err(|_| EgtError::Internal("failed to build statistics thread pool"))?;
-        for batch in tables.chunks(32) {
-            let results: Vec<_> = pool.install(|| {
-                batch
-                    .par_iter()
-                    .map(|id| {
-                        if let Some(input) = &self.input_path {
-                            match stats::read_stats(input, id) {
-                                Ok(stats) => return Ok(stats),
-                                Err(EgtError::FileNotFound(_)) => {}
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        stats::read_stats(&self.base_path, id)
-                    })
-                    .collect()
-            });
-            for result in results {
-                match result {
-                    Ok(stats) => total.add(&stats),
-                    Err(error) => return Err(error),
-                }
-            }
+        self.check_stats_root()?;
+        stats_cache::query(&self.base_path, selectors)
+    }
+
+    /// Creates missing placeholders and rebuilds selected hierarchy summaries.
+    /// Does not scan tablebase contents or replace complete per-table metadata.
+    /// Do not run concurrently with generation or another cache rebuild.
+    pub fn cache_stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
+        self.check_stats_root()?;
+        stats_cache::cache(&self.base_path, selectors)
+    }
+
+    fn check_stats_root(&self) -> EgtResult<()> {
+        if self.input_path.is_some() {
+            return Err(EgtError::InvalidStorageLocation(
+                "statistics do not support --input-path; select one root with --path".into(),
+            ));
         }
-        Ok(total)
+        Ok(())
     }
 
     /// Verifies independent blocks of one table using table-local indices.
@@ -903,7 +890,10 @@ mod tests {
                     .into_position(CastlingMode::Standard)
                     .unwrap();
                 assert!(
-                    matches!(prober.probe(&position), Err(EgtError::UnsupportedPosition(_))),
+                    matches!(
+                        prober.probe(&position),
+                        Err(EgtError::UnsupportedPosition(_))
+                    ),
                     "{fen}"
                 );
             }
@@ -1031,12 +1021,53 @@ mod tests {
     }
 
     #[test]
+    fn generation_replaces_placeholders_and_invalidates_hierarchy_summaries() {
+        let generator = unverified_generator("memory:///stats-publication");
+        let prober = EgtProber::from_location(generator.base_path.clone());
+        let missing = prober.cache_stats(&["2"]).unwrap();
+        assert_eq!(missing.selected_tables, 1);
+        assert_eq!(missing.available_tables, 0);
+        assert_eq!(missing.bytes, None);
+        assert_eq!(prober.stats(&["2"]).unwrap(), missing);
+        let tables = generator.generate("K_K").unwrap();
+        for prefix in ["2", "2/1v1", "2/1v1/op0", "2/1v1/op0/0pawns"] {
+            assert!(!object_exists(
+                &generator.base_path,
+                &format!("{prefix}/stats.json")
+            ));
+            assert_eq!(prober.stats(&[prefix]).unwrap(), aggregate(&tables));
+        }
+        assert_eq!(prober.cache_stats(&["2"]).unwrap(), aggregate(&tables));
+        assert_eq!(prober.stats(&["2"]).unwrap(), aggregate(&tables));
+        assert_eq!(prober.stats(&["K_K"]).unwrap(), aggregate(&tables));
+    }
+
+    #[test]
+    fn statistics_reject_input_overlays_without_creating_metadata() {
+        let location = Location::parse("memory:///stats-overlay").unwrap();
+        let mut prober = EgtProber::from_location(location.clone());
+        prober.with_input_path("memory:///stats-input").unwrap();
+        for result in [prober.stats(&["2"]), prober.cache_stats(&["2"])] {
+            assert!(
+                matches!(result, Err(EgtError::InvalidStorageLocation(message))
+                if message.contains("--input-path"))
+            );
+        }
+        assert!(!object_exists(&location, "format.json"));
+    }
+
+    fn object_exists(location: &Location, path: &str) -> bool {
+        use object_store::ObjectStoreExt;
+        crate::storage::block_on(location.store.head(&location.key(path))).is_ok()
+    }
+
+    #[test]
     fn selector_union_is_sorted_deduplicated_and_preserves_orientation() {
-        let tables = resolve_selectors(&["KP_K", "KPa_K", "3/2v1/op0/1pawns", "KP_K"]).unwrap();
+        let tables = resolve_selectors(&["KP_K", "K_KP", "KP_K"]).unwrap();
         assert_eq!(tables, resolve_selectors(&["KP_K", "K_KP"]).unwrap());
         assert_eq!(tables.len(), 8);
         assert!(tables.windows(2).all(|pair| pair[0] < pair[1]));
-        let exact = resolve_selectors(&["3/KQ_K", "KQ_K", "KR_K"]).unwrap();
+        let exact = resolve_selectors(&["KQ_K", "KQ_K", "KR_K"]).unwrap();
         assert_eq!(
             exact.iter().map(TableId::tablename).collect::<Vec<_>>(),
             ["KQ_K", "KR_K"]
