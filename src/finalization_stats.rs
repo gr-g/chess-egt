@@ -6,6 +6,7 @@ use shakmaty::{Color, EnPassantMode, fen::Epd};
 
 use crate::egt::Egt;
 use crate::egt_file::{EgtFileReader, MaybeDtcOutcome};
+use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
@@ -14,7 +15,7 @@ pub(crate) struct TableStats {
     win: usize,
     draw: usize,
     loss: usize,
-    invalid_or_redundant: usize,
+    redundant: usize,
     histograms: [BTreeMap<u16, usize>; 2],
     candidates: [Vec<usize>; 2],
 }
@@ -33,7 +34,7 @@ impl TableStats {
         if let Some(other_idx) = egt.diagonal_symmetric(local_idx)
             && local_idx > other_idx
         {
-            self.invalid_or_redundant += 1;
+            self.redundant += 1;
             return;
         }
         let side = if outcome.is_win() {
@@ -45,8 +46,6 @@ impl TableStats {
         } else {
             if outcome.is_draw() {
                 self.draw += 1;
-            } else if outcome.is_invalid() {
-                self.invalid_or_redundant += 1;
             }
             return;
         };
@@ -61,13 +60,15 @@ impl TableStats {
 pub(crate) struct EgtStatsBuilder {
     totals: TableStats,
     maxima: [u16; 2],
+    invalid: InvalidCounts,
 }
 
 impl EgtStatsBuilder {
-    pub(crate) fn new(maxima: [u16; 2]) -> Self {
+    pub(crate) fn new(maxima: [u16; 2], invalid: InvalidCounts) -> Self {
         Self {
             totals: TableStats::default(),
             maxima,
+            invalid,
         }
     }
 
@@ -78,7 +79,7 @@ impl EgtStatsBuilder {
             self.totals.win += part.win;
             self.totals.draw += part.draw;
             self.totals.loss += part.loss;
-            self.totals.invalid_or_redundant += part.invalid_or_redundant;
+            self.totals.redundant += part.redundant;
             for (side, (histogram, candidates)) in
                 part.histograms.into_iter().zip(part.candidates).enumerate()
             {
@@ -117,7 +118,10 @@ impl EgtStatsBuilder {
             win: self.totals.win,
             draw: self.totals.draw,
             loss: self.totals.loss,
-            invalid_or_redundant: self.totals.invalid_or_redundant,
+            invalid_opposite_check: self.invalid.opposite_check,
+            invalid_ep_structure: self.invalid.ep_structure,
+            invalid_illegal_ep_capture: self.invalid.illegal_ep_capture,
+            redundant: self.totals.redundant,
             histogram_win,
             histogram_loss,
             longest_dtc_win: materialize(win_candidates, self.maxima[0]),
@@ -156,13 +160,14 @@ mod tests {
                     MaybeDtcOutcome::new_loss(ConversionType::Checkmate, loss),
                 ),
                 (w, MaybeDtcOutcome::DRAW),
-                (l, MaybeDtcOutcome::INVALID),
+                // A synthetic invalid outcome at a legal index must not be decoded.
+                (w, MaybeDtcOutcome::INVALID),
             ] {
                 stats.record_outcome(outcome, local_idx, &egt, 5, 3);
             }
             stats
         };
-        let mut builder = EgtStatsBuilder::new([5, 3]);
+        let mut builder = EgtStatsBuilder::new([5, 3], InvalidCounts::default());
         builder.merge([
             part(idx[0], idx[1], 0, 0),
             part(idx[4], idx[3], 5, 3),
@@ -172,15 +177,7 @@ mod tests {
         assert_eq!(builder.totals.candidates[0], [idx[4], idx[2], idx[0]]);
         assert_eq!(builder.totals.candidates[1], [idx[3], idx[1], idx[5]]);
         let totals = builder.totals;
-        assert_eq!(
-            (
-                totals.win,
-                totals.draw,
-                totals.loss,
-                totals.invalid_or_redundant
-            ),
-            (5, 5, 5, 5)
-        );
+        assert_eq!((totals.win, totals.draw, totals.loss), (5, 5, 5));
         assert_eq!(
             totals.histograms[0],
             BTreeMap::from([(0, 1), (4, 1), (5, 3)])
@@ -189,6 +186,36 @@ mod tests {
             totals.histograms[1],
             BTreeMap::from([(0, 1), (2, 1), (3, 3)])
         );
+    }
+
+    #[test]
+    fn supplied_invalid_counts_survive_merges_and_build() {
+        let dir = crate::TestDir::new("finalization_stats_invalid_counts");
+        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
+        let invalid = InvalidCounts {
+            opposite_check: 7,
+            ep_structure: 11,
+            illegal_ep_capture: 13,
+        };
+        let mut builder = EgtStatsBuilder::new([0, 0], invalid);
+        for _ in 0..2 {
+            let mut part = TableStats::default();
+            part.record_outcome(MaybeDtcOutcome::INVALID, 0, &file.egt, 0, 0);
+            builder.merge([part, TableStats::default()]);
+            assert_eq!(builder.invalid, invalid);
+        }
+        assert_eq!(builder.totals.redundant, 0);
+        assert_eq!(
+            builder.totals.win + builder.totals.draw + builder.totals.loss,
+            0
+        );
+        assert!(builder.totals.histograms.iter().all(BTreeMap::is_empty));
+        assert!(builder.totals.candidates.iter().all(Vec::is_empty));
+        let stats = builder.build(&file, 0, String::new());
+        assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
+        assert_eq!(stats.invalid_ep_structure, invalid.ep_structure);
+        assert_eq!(stats.invalid_illegal_ep_capture, invalid.illegal_ep_capture);
+        assert_eq!(stats.unique_positions, 0);
     }
 
     #[test]
@@ -227,7 +254,10 @@ mod tests {
     fn diagonal_redundancy_is_excluded_from_histograms_and_candidates() {
         let egt = table("KQ_K");
         let idx = (0..egt.index_range())
-            .find(|&idx| egt.diagonal_symmetric(idx).is_some_and(|other| idx > other))
+            .find(|&idx| {
+                egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
+                    && egt.position_from_index(idx, Color::White).is_none()
+            })
             .unwrap();
         let mut stats = TableStats::default();
         stats.record_outcome(
@@ -237,7 +267,8 @@ mod tests {
             5,
             0,
         );
-        assert_eq!(stats.invalid_or_redundant, 1);
+        stats.record_outcome(MaybeDtcOutcome::INVALID, idx, &egt, 5, 0);
+        assert_eq!(stats.redundant, 2);
         assert_eq!(stats.win, 0);
         assert!(stats.histograms[0].is_empty());
         assert!(stats.candidates[0].is_empty());

@@ -30,7 +30,14 @@ pub struct EgtStats {
     pub win: usize,
     pub draw: usize,
     pub loss: usize,
-    pub invalid_or_redundant: usize,
+    /// Nonredundant indices where the side to move attacks the opposite king.
+    pub invalid_opposite_check: usize,
+    /// Remaining invalid EP states, including the absence of a capturing pawn.
+    pub invalid_ep_structure: usize,
+    /// Structurally valid EP states with capturers, but no legal EP capture.
+    pub invalid_illegal_ep_capture: usize,
+    /// Discarded diagonal-symmetric indices, counted before invalidity checks.
+    pub redundant: usize,
     pub histogram_win: BTreeMap<u16, usize>,
     pub histogram_loss: BTreeMap<u16, usize>,
     pub longest_dtc_win: Vec<LongestDtcPosition>,
@@ -51,7 +58,10 @@ pub(crate) struct PlaceholderStats {
     win: (),
     draw: (),
     loss: (),
-    invalid_or_redundant: (),
+    invalid_opposite_check: (),
+    invalid_ep_structure: (),
+    invalid_illegal_ep_capture: (),
+    redundant: (),
     histogram_win: (),
     histogram_loss: (),
     longest_dtc_win: (),
@@ -123,7 +133,13 @@ pub struct AggregateStats {
     #[serde(deserialize_with = "required_nullable")]
     pub loss: Option<usize>,
     #[serde(deserialize_with = "required_nullable")]
-    pub invalid_or_redundant: Option<usize>,
+    pub invalid_opposite_check: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub invalid_ep_structure: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub invalid_illegal_ep_capture: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub redundant: Option<usize>,
     #[serde(deserialize_with = "required_nullable")]
     pub histogram_win: Option<BTreeMap<u16, usize>>,
     #[serde(deserialize_with = "required_nullable")]
@@ -146,7 +162,10 @@ impl Default for AggregateStats {
             win: Some(0),
             draw: Some(0),
             loss: Some(0),
-            invalid_or_redundant: Some(0),
+            invalid_opposite_check: Some(0),
+            invalid_ep_structure: Some(0),
+            invalid_illegal_ep_capture: Some(0),
+            redundant: Some(0),
             histogram_win: Some(BTreeMap::new()),
             histogram_loss: Some(BTreeMap::new()),
             longest_dtc_win: Some(Vec::new()),
@@ -168,7 +187,10 @@ impl AggregateStats {
             win: Some(stats.win),
             draw: Some(stats.draw),
             loss: Some(stats.loss),
-            invalid_or_redundant: Some(stats.invalid_or_redundant),
+            invalid_opposite_check: Some(stats.invalid_opposite_check),
+            invalid_ep_structure: Some(stats.invalid_ep_structure),
+            invalid_illegal_ep_capture: Some(stats.invalid_illegal_ep_capture),
+            redundant: Some(stats.redundant),
             histogram_win: Some(stats.histogram_win.clone()),
             histogram_loss: Some(stats.histogram_loss.clone()),
             longest_dtc_win: Some(stats.longest_dtc_win.clone()),
@@ -188,7 +210,10 @@ impl AggregateStats {
                 self.win = None;
                 self.draw = None;
                 self.loss = None;
-                self.invalid_or_redundant = None;
+                self.invalid_opposite_check = None;
+                self.invalid_ep_structure = None;
+                self.invalid_illegal_ep_capture = None;
+                self.redundant = None;
                 self.histogram_win = None;
                 self.histogram_loss = None;
                 self.longest_dtc_win = None;
@@ -208,7 +233,14 @@ impl AggregateStats {
         self.win = sum(self.win, other.win);
         self.draw = sum(self.draw, other.draw);
         self.loss = sum(self.loss, other.loss);
-        self.invalid_or_redundant = sum(self.invalid_or_redundant, other.invalid_or_redundant);
+        self.invalid_opposite_check =
+            sum(self.invalid_opposite_check, other.invalid_opposite_check);
+        self.invalid_ep_structure = sum(self.invalid_ep_structure, other.invalid_ep_structure);
+        self.invalid_illegal_ep_capture = sum(
+            self.invalid_illegal_ep_capture,
+            other.invalid_illegal_ep_capture,
+        );
+        self.redundant = sum(self.redundant, other.redundant);
         merge_distribution(
             &mut self.histogram_win,
             &other.histogram_win,
@@ -232,7 +264,10 @@ impl AggregateStats {
             self.win.is_some(),
             self.draw.is_some(),
             self.loss.is_some(),
-            self.invalid_or_redundant.is_some(),
+            self.invalid_opposite_check.is_some(),
+            self.invalid_ep_structure.is_some(),
+            self.invalid_illegal_ep_capture.is_some(),
+            self.redundant.is_some(),
             self.histogram_win.is_some(),
             self.histogram_loss.is_some(),
             self.longest_dtc_win.is_some(),
@@ -267,7 +302,12 @@ impl AggregateStats {
             self.win.unwrap(),
             self.draw.unwrap(),
             self.loss.unwrap(),
-            self.invalid_or_redundant.unwrap(),
+            [
+                self.invalid_opposite_check.unwrap(),
+                self.invalid_ep_structure.unwrap(),
+                self.invalid_illegal_ep_capture.unwrap(),
+                self.redundant.unwrap(),
+            ],
         )?;
         validate_distribution(
             self.histogram_win.as_ref().unwrap(),
@@ -358,7 +398,12 @@ impl EgtStats {
             self.win,
             self.draw,
             self.loss,
-            self.invalid_or_redundant,
+            [
+                self.invalid_opposite_check,
+                self.invalid_ep_structure,
+                self.invalid_illegal_ep_capture,
+                self.redundant,
+            ],
         )?;
         validate_distribution(&self.histogram_win, self.win, &self.longest_dtc_win)?;
         validate_distribution(&self.histogram_loss, self.loss, &self.longest_dtc_loss)
@@ -375,10 +420,13 @@ fn validate_outcomes(
     win: usize,
     draw: usize,
     loss: usize,
-    invalid_or_redundant: usize,
+    invalid_and_redundant: [usize; 4],
 ) -> EgtResult<()> {
     if win.checked_add(draw).and_then(|n| n.checked_add(loss)) != Some(unique_positions)
-        || unique_positions.checked_add(invalid_or_redundant) != Some(index_range)
+        || invalid_and_redundant
+            .iter()
+            .try_fold(unique_positions, |sum, &count| sum.checked_add(count))
+            != Some(index_range)
     {
         return Err(invalid_data(
             "outcome counts do not match position and index totals",
@@ -413,19 +461,29 @@ fn validate_distribution(
 mod tests {
     use super::*;
 
+    const PARTITION_FIELDS: [&str; 4] = [
+        "invalid_opposite_check",
+        "invalid_ep_structure",
+        "invalid_illegal_ep_capture",
+        "redundant",
+    ];
+
     fn stats() -> EgtStats {
         EgtStats {
             tablename: "KQ_K".into(),
             bytes: 100,
             sha256: "ab".repeat(32),
-            index_range: 10,
+            index_range: 16,
             frame_size: DEFAULT_FRAME_SIZE,
             num_frames: 1,
             unique_positions: 6,
             win: 3,
             draw: 1,
             loss: 2,
-            invalid_or_redundant: 4,
+            invalid_opposite_check: 1,
+            invalid_ep_structure: 2,
+            invalid_illegal_ep_capture: 3,
+            redundant: 4,
             histogram_win: BTreeMap::from([(1, 1), (3, 2)]),
             histogram_loss: BTreeMap::from([(0, 1), (2, 1)]),
             longest_dtc_win: vec![example("win", 3)],
@@ -461,11 +519,40 @@ mod tests {
                 serde_json::from_value::<StatsRecord>(json.clone()).unwrap(),
                 record
             );
-            for field in ["bytes", "sha256", "histogram_win", "longest_dtc_loss"] {
+            for field in ["bytes", "sha256", "histogram_win", "longest_dtc_loss"]
+                .into_iter()
+                .chain(PARTITION_FIELDS)
+            {
                 let mut invalid = json.clone();
                 invalid.as_object_mut().unwrap().remove(field);
                 assert!(serde_json::from_value::<StatsRecord>(invalid).is_err());
             }
+        }
+        for field in PARTITION_FIELDS {
+            let mut complete = serde_json::to_value(stats()).unwrap();
+            complete[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<StatsRecord>(complete).is_err(),
+                "{field}"
+            );
+            let mut missing = serde_json::to_value(StatsRecord::missing(&id).unwrap()).unwrap();
+            missing[field] = 0.into();
+            assert!(
+                serde_json::from_value::<StatsRecord>(missing).is_err(),
+                "{field}"
+            );
+        }
+        for record in [
+            StatsRecord::Complete(stats()),
+            StatsRecord::missing(&id).unwrap(),
+        ] {
+            let mut old = serde_json::to_value(record).unwrap();
+            let fields = old.as_object_mut().unwrap();
+            for field in PARTITION_FIELDS {
+                fields.remove(field);
+            }
+            fields.insert("invalid_or_redundant".into(), serde_json::Value::Null);
+            assert!(serde_json::from_value::<StatsRecord>(old).is_err());
         }
         let mut partial = serde_json::to_value(stats()).unwrap();
         partial["bytes"] = serde_json::Value::Null;
@@ -487,9 +574,13 @@ mod tests {
                 total.available_tables,
                 total.index_range
             ),
-            (2, 2, 20)
+            (2, 2, 32)
         );
         assert_eq!((total.bytes, total.unique_positions), (Some(200), Some(12)));
+        assert_eq!(total.invalid_opposite_check, Some(2));
+        assert_eq!(total.invalid_ep_structure, Some(4));
+        assert_eq!(total.invalid_illegal_ep_capture, Some(6));
+        assert_eq!(total.redundant, Some(8));
         assert_eq!(
             total.histogram_win,
             Some(BTreeMap::from([(1, 1), (3, 2), (5, 3)]))
@@ -508,7 +599,7 @@ mod tests {
         ] {
             let total = aggregate(&records);
             assert_eq!((total.selected_tables, total.available_tables), (2, 1));
-            assert_eq!(total.index_range, 10 + missing.index_range());
+            assert_eq!(total.index_range, 16 + missing.index_range());
             for (key, value) in serde_json::to_value(total).unwrap().as_object().unwrap() {
                 if !["selected_tables", "available_tables", "index_range"].contains(&key.as_str()) {
                     assert!(value.is_null(), "{key}");
@@ -527,7 +618,10 @@ mod tests {
             "index_range",
             "win",
             "unique_positions",
-        ] {
+        ]
+        .into_iter()
+        .chain(PARTITION_FIELDS)
+        {
             let mut json = serde_json::to_value(stats()).unwrap();
             json[field] = 0.into();
             let invalid: EgtStats = serde_json::from_value(json).unwrap();
@@ -551,6 +645,73 @@ mod tests {
         total = AggregateStats::default();
         total.bytes = Some(1);
         assert!(total.validate().is_err());
+    }
+
+    #[test]
+    fn aggregate_schema_requires_all_partition_fields_and_consistent_nullability() {
+        let missing = StatsRecord::missing(&TableId::parse("K_K").unwrap()).unwrap();
+        for total in [
+            AggregateStats::default(),
+            aggregate(&[StatsRecord::Complete(stats())]),
+            aggregate(&[missing]),
+        ] {
+            let json = serde_json::to_value(&total).unwrap();
+            assert_eq!(
+                serde_json::from_value::<AggregateStats>(json.clone()).unwrap(),
+                total
+            );
+            for field in PARTITION_FIELDS {
+                assert!(json.get(field).is_some(), "{field}");
+                let mut invalid = json.clone();
+                invalid.as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<AggregateStats>(invalid).is_err(),
+                    "{field}"
+                );
+                let mut invalid = json.clone();
+                invalid[field] = if json[field].is_null() {
+                    0.into()
+                } else {
+                    serde_json::Value::Null
+                };
+                let invalid: AggregateStats = serde_json::from_value(invalid).unwrap();
+                assert!(invalid.validate().is_err(), "{field}");
+            }
+            let mut old = json;
+            let fields = old.as_object_mut().unwrap();
+            for field in PARTITION_FIELDS {
+                fields.remove(field);
+            }
+            fields.insert("invalid_or_redundant".into(), serde_json::Value::Null);
+            assert!(serde_json::from_value::<AggregateStats>(old).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_each_partition_count_and_rejects_overflow() {
+        let id = TableId::parse("KQ_K").unwrap();
+        for field in PARTITION_FIELDS {
+            for count in [0, usize::MAX] {
+                let mut json = serde_json::to_value(stats()).unwrap();
+                json[field] = count.into();
+                let invalid: EgtStats = serde_json::from_value(json).unwrap();
+                assert!(invalid.validate(&id).is_err(), "{field}: {count}");
+
+                let mut json =
+                    serde_json::to_value(aggregate(&[StatsRecord::Complete(stats())])).unwrap();
+                json[field] = count.into();
+                let invalid: AggregateStats = serde_json::from_value(json).unwrap();
+                assert!(invalid.validate().is_err(), "{field}: {count}");
+            }
+        }
+        assert!(validate_outcomes(0, 0, usize::MAX, 1, 0, [0; 4]).is_err());
+        for index in 0..4 {
+            let mut counts = [0; 4];
+            counts[index] = usize::MAX;
+            assert!(validate_outcomes(0, 1, 0, 1, 0, counts).is_err());
+        }
+        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [usize::MAX, 1, 0, 0]).is_err());
+        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [0, 0, 0, usize::MAX]).is_ok());
     }
 
     #[test]

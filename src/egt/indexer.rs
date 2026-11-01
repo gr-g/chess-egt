@@ -480,6 +480,11 @@ impl Indexer {
         Self::position_from_setup::<VALIDATE>(self.setup_from_index(index, side_to_move))
     }
 
+    /// Decode an in-range index, retaining its rejection reason for initialization.
+    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
+        crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
+    }
+
     // The caller must enforce the index range before decoding.
     fn setup_from_index(&self, index: usize, side_to_move: Color) -> Setup {
         debug_assert!(index < self.index_range);
@@ -658,19 +663,11 @@ impl Indexer {
     }
 
     fn position_from_setup<const VALIDATE: bool>(setup: Setup) -> Option<Chess> {
-        // Indexing guarantees the material, pawn ranks, nonoverlap, and no castling.
-        // Impossible checks remain accepted, matching ignore_impossible_check.
-        if VALIDATE && (crate::position::opposite_check(&setup.board, setup.turn)
-            || !crate::position::valid_ep_square(&setup))
-        {
-            return None;
+        if VALIDATE {
+            crate::position::position_from_setup(setup).ok()
+        } else {
+            Some(Chess::from_setup_unchecked(setup, CastlingMode::Standard))
         }
-        let ep_square = setup.ep_square;
-        let position = Chess::from_setup_unchecked(setup, CastlingMode::Standard);
-        if VALIDATE && position.legal_ep_square() != ep_square {
-            return None;
-        }
-        Some(position)
     }
 
     // For pawnless positions, this function applies symmetrical
@@ -896,6 +893,8 @@ mod tests {
     fn assert_decoder_matches(indexer: &Indexer, index: usize, turn: Color) -> Option<Chess> {
         let expected = checked_position_from_setup(indexer.setup_from_index(index, turn));
         assert_eq!(indexer.position_from_index(index, turn), expected, "index {index}, {turn:?}");
+        assert_eq!(indexer.position_from_index_with_reason(index, turn).is_err(), expected.is_none(),
+            "invalidity at index {index}, {turn:?}");
         if let Some(position) = &expected {
             assert_eq!(indexer.position_from_index_unchecked(index, turn), *position);
         }

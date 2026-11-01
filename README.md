@@ -104,6 +104,8 @@ let position: Chess = "8/8/8/8/8/8/P7/K6k w - -"
     .or_else(PositionError::ignore_impossible_check)?
 ```
 
+Positions with en-passant rights can also be queried: their outcomes are stored in dedicated indexes in the tablebase (different from the indexes of the same positions without en-passant rights). However this applies only for positions where the en-passant capture is a legal move. If not, the en-passant rights are ignored.
+
 #### 3.1 `Egt` and `Indexer`
 An `Egt` contains positions with fixed material, pawn files, and the exact color order of pawns on each file. An `Egt` has a name such as `KQ_KPc` (king and queen versus king and pawn on the _c_ file). The name has the side-to-move (STM) on the left and the side-not-to-move (SNTM) on the right.
 
@@ -177,6 +179,19 @@ In the path, `n` counts all pieces including kings, `max`/`min` are the two side
 counts in descending order, `K` counts mutually opposing pawn pairs (once per
 pair), and `N` counts pawns.
 
+In the JSON files, statistics include a partition of the index range into `win`, `draw`, `loss`, and four categories of excluded indexes:
+- `redundant`: the discarded member of a diagonal-symmetric index pair.
+- `invalid_opposite_check`: the side to move attacks the opposite king (including
+  adjacent kings).
+- `invalid_ep_structure`: an invalid EP state, including an occupied target or
+  double-push origin, or no side-to-move pawn geometrically able to capture EP.
+- `invalid_illegal_ep_capture`: EP structure and a capturing pawn exist, but none
+  of the EP captures is legal (for example, due to a pin or an unresolved check).
+
+`unique_positions = win + draw + loss`; adding the four excluded counts gives
+`index_range`.
+
+The on-disk format of the compressed tables (`.ggegt`) has the following characteristics.
 - Frames contain at most `256 * 1024` positions, with a short, unpadded final frame.
 - Each frame is compressed independently, allowing seekable random access. The reader constructs the frame layout from the single table's index range and validates it against the seek table.
 - Seek tables are checksum-free: `17 + 8 * num_frames` bytes. Checksum-bearing seek tables are not supported. The footer frame count is checked before parsing to bound allocation; compressed and decompressed lengths are also validated.

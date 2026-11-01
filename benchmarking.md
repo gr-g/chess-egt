@@ -28,30 +28,8 @@ in the design documents may use earlier storage layouts and are labeled as such.
 ## Bounded profiling
 
 Build with `cargo build --locked --profile profiling` to retain debug symbols.
-Start with a small endgame and fresh output paths; bound runtime with `timeout`:
-
-```sh
-timeout 120s valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
-  --callgrind-out-file=target/generation-kq-k.callgrind \
-  target/profiling/chess-egt \
-  --path target/generation-profile-tables --input-path ~/ggegt \
-  --generate KQ_K --threads 1 --noverify
-callgrind_annotate --auto=no --threshold=100 target/generation-kq-k.callgrind
-callgrind_annotate --auto=no --inclusive=yes --tree=caller --threshold=100 \
-  target/generation-kq-k.callgrind
-```
 
 ### Measured example: `KQ_KR` / `KR_KQ`
-
-Measured on 2026-10-31 at revision `4863a6f`, with Rust 1.99.1 and Valgrind
-3.27.1, on an x86-64 VM exposing four AMD Ryzen 7 5700G CPUs. The profiling
-build uses release optimization (fat LTO, one codegen unit), debug symbols,
-and no additional `RUSTFLAGS`. This is a portable build, not CPU-native codegen.
-
-`--generate KQ_KR` generates both sides of the pair: 2,467,122 unique valid
-positions, reaching depth 62, with 1.05 MiB of compressed output. It is large
-enough to exercise propagation and capture dependency probes, but comfortably
-fits a ten-minute Callgrind budget. Dependencies were read from `/home/user/ggegt`.
 
 ```sh
 cargo build --locked --profile profiling
@@ -67,11 +45,6 @@ callgrind_annotate --auto=no --inclusive=yes --tree=calling --threshold=100 \
 callgrind_annotate --auto=no --threshold=100 target/profile-kq-kr.callgrind \
   src/egt/indexer.rs src/retrograde.rs
 ```
-
-Use fresh output paths when repeating. A separate native run of the **same
-profiling binary** used `target/profile-kq-kr-native` and otherwise identical
-application arguments. These are single-run measurements, not a benchmark
-comparison against an earlier revision.
 
 | Phase | Native | Under Callgrind |
 | --- | ---: | ---: |

@@ -46,6 +46,7 @@ use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
 use crate::table_id::{PawnKey, TableId};
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
+use crate::position::InvalidCounts;
 
 
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -532,6 +533,7 @@ impl Found {
 
 #[derive(Default)]
 struct InitCounts {
+    invalid: InvalidCounts,
     checkmates: usize,
     stalemates: usize,
     /// Wins and losses at ply 1, resolved by conversions.
@@ -555,11 +557,16 @@ fn initialize_table(
         let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
             let idx = block * SUMMARY_BLOCK_SIZE + offset;
-            let position_opt = egt.position_from_index(idx, Color::White);
-
-            let Some(position) = position_opt else {
-                *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
-                continue;
+            let position = match egt.indexer.position_from_index_with_reason(idx, Color::White) {
+                Ok(position) => position,
+                Err(reason) => {
+                    *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
+                    // Finalization counts redundant indices before invalidity.
+                    if !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other) {
+                        counts.invalid.record(reason);
+                    }
+                    continue;
+                }
             };
             let legals = position.legal_moves();
 
@@ -624,6 +631,7 @@ fn initialize_table(
         }
         Ok(counts)
     }).try_reduce(InitCounts::default, |a, b| Ok(InitCounts {
+        invalid: a.invalid.merge(b.invalid),
         checkmates: a.checkmates + b.checkmates,
         stalemates: a.stalemates + b.stalemates,
         found: a.found.merge(b.found),
@@ -633,6 +641,7 @@ fn initialize_table(
 /// Per-pair output of `solve_pair`.
 struct PairResult {
     working: WorkingPair,
+    invalid: [InvalidCounts; 2],
     max_win_dtc_a: u16,
     max_loss_dtc_a: u16,
     max_win_dtc_b: u16,
@@ -673,11 +682,13 @@ fn solve_pair(
     // Checkmates count as losses at ply 0, so that phase W(1) scans them.
     let mut previous = [Found::default(); 2];
     let mut found_by_conversion = [Found::default(); 2];
+    let mut invalid = [InvalidCounts::default(); 2];
     for &(table, _, _, slot, _) in &tables {
         let counts = initialize_table(egt(table), &mut working.values[slot], &summaries[slot], reader)?;
         println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
         previous[slot].losses = counts.checkmates;
         found_by_conversion[slot] = counts.found;
+        invalid[slot] = counts.invalid;
     }
 
     let init_time = init_start.elapsed();
@@ -785,6 +796,7 @@ fn solve_pair(
 
     Ok(PairResult {
         working,
+        invalid,
         max_win_dtc_a: max_win[0],
         max_loss_dtc_a: max_loss[0],
         max_win_dtc_b: max_win[1],
@@ -828,10 +840,10 @@ pub(crate) fn generate_pair(
         [pair.max_win_dtc_b, pair.max_loss_dtc_b],
     ];
     let mut files = Vec::with_capacity(ids.len());
-    for ((id, values), maxima) in ids.iter().zip(pair.working.values).zip(maxima) {
+    for (((id, values), maxima), invalid) in ids.iter().zip(pair.working.values).zip(maxima).zip(pair.invalid) {
         println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
         let file = EgtFileReader::new_in(base, id.tablename())?;
-        let stats = crate::finalization::finalize_table(&file, values, maxima)?;
+        let stats = crate::finalization::finalize_table(&file, values, maxima, invalid)?;
         drop(file);
         let mut published = EgtFileReader::open_in(base, id.tablename())?;
         published.stats = Some(stats);
@@ -1327,21 +1339,33 @@ mod tests {
         EgtGenerator::new(&dir.0).unwrap().generate("K_K").unwrap();
         let location = Location::parse(&dir.0).unwrap();
         let reader = SharedFileCache::new(&location, None, None);
-        let egt = table("K_KQ");
-        let mut values = atomic_values(vec![MaybeDtcOutcome::INVALID; egt.index_range()]);
-        let summary = PlySummary::new(values.len());
-        let counts = initialize_table(&egt, &mut values, &summary, &reader).unwrap();
-        assert!(counts.checkmates > 0);
-        let expected: Vec<_> = values.chunks(SUMMARY_BLOCK_SIZE).enumerate()
-            .filter(|(_, chunk)| chunk.iter().any(|cell| MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
-            .map(|(block, chunk)| {
-                let start = block * SUMMARY_BLOCK_SIZE;
-                (start, start + chunk.len())
-            }).collect();
-        assert_eq!(summary.blocks_with(SummaryKind::Loss, 0), expected);
-        assert!(summary.blocks_with(SummaryKind::Loss, 1).is_empty());
-        for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
-            assert!(summary.blocks_with(SummaryKind::Win(ct), 0).is_empty());
+        for name in ["K_KQ", "KQ_K"] {
+            let egt = table(name);
+            let mut values = atomic_values(vec![MaybeDtcOutcome::INVALID; egt.index_range()]);
+            let summary = PlySummary::new(values.len());
+            let counts = initialize_table(&egt, &mut values, &summary, &reader).unwrap();
+            assert_eq!(counts.checkmates > 0, name == "K_KQ");
+            let invalid = values.iter().enumerate()
+                .filter(|(idx, cell)| {
+                    MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_invalid()
+                        && !egt.diagonal_symmetric(*idx).is_some_and(|other| *idx > other)
+                }).count();
+            assert_eq!(invalid > 0, name == "KQ_K");
+            assert_eq!(counts.invalid, InvalidCounts {
+                opposite_check: invalid,
+                ..InvalidCounts::default()
+            });
+            let expected: Vec<_> = values.chunks(SUMMARY_BLOCK_SIZE).enumerate()
+                .filter(|(_, chunk)| chunk.iter().any(|cell| MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
+                .map(|(block, chunk)| {
+                    let start = block * SUMMARY_BLOCK_SIZE;
+                    (start, start + chunk.len())
+                }).collect();
+            assert_eq!(summary.blocks_with(SummaryKind::Loss, 0), expected);
+            assert!(summary.blocks_with(SummaryKind::Loss, 1).is_empty());
+            for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
+                assert!(summary.blocks_with(SummaryKind::Win(ct), 0).is_empty());
+            }
         }
     }
 
@@ -1353,6 +1377,7 @@ mod tests {
         let location = Location::parse(&dir.0).unwrap();
         let reader = SharedFileCache::new(&location, None, None);
         let pair = solve_pair(&solver, table, table, &reader).unwrap();
+        assert_eq!(pair.invalid, [InvalidCounts::default(); 2]);
         assert_eq!(pair.working.values.len(), 1);
         assert_eq!(pair.working.values[0].len(), solver.tables[0].index_range());
         assert!(plain_values(&pair.working.values[0]).iter().all(|v| v.is_unknown() || v.is_draw()));
@@ -1647,7 +1672,9 @@ mod tests {
             let mut totals = [0usize; 5];
             for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
                 let stats = crate::stats::read_stats(&location, &id).unwrap();
-                let counts = [stats.index_range, stats.win, stats.draw, stats.loss, stats.invalid_or_redundant];
+                let excluded = stats.invalid_opposite_check + stats.invalid_ep_structure
+                                    + stats.invalid_illegal_ep_capture + stats.redundant;
+                                let counts = [stats.index_range, stats.win, stats.draw, stats.loss, excluded];
                 for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
             }
             totals

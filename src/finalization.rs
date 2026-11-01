@@ -10,6 +10,7 @@ use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFileReader, MaybeDtcOutcome}
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::finalization_stats::{EgtStatsBuilder, TableStats};
+use crate::position::InvalidCounts;
 use crate::stats::EgtStats;
 
 fn finalize_batch(
@@ -65,6 +66,7 @@ pub(crate) fn finalize_table(
     file: &EgtFileReader,
     mut values: Vec<AtomicU16>,
     maxima: [u16; 2],
+    invalid: InvalidCounts,
 ) -> EgtResult<EgtStats> {
     if values.len() != file.egt.index_range() {
         return Err(EgtError::Internal("completed table has wrong length"));
@@ -84,7 +86,7 @@ pub(crate) fn finalize_table(
     drop(values);
     let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
     let (segments, stats): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
-    let mut builder = EgtStatsBuilder::new(maxima);
+    let mut builder = EgtStatsBuilder::new(maxima, invalid);
     builder.merge(stats);
     writer.write_segments(segments)?;
     writer.finish()?;
@@ -110,22 +112,42 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
+                let mut invalid = InvalidCounts::default();
                 let values = (0..file.egt.index_range())
                     .map(|i| {
-                        let outcome = match i % 4 {
-                            0 => MaybeDtcOutcome::INVALID,
-                            1 => MaybeDtcOutcome::new_unknown(17),
-                            2 => MaybeDtcOutcome::new_win(ConversionType::Capture, 3),
-                            _ => MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
+                        let outcome = match file
+                            .egt
+                            .indexer
+                            .position_from_index_with_reason(i, shakmaty::Color::White)
+                        {
+                            Ok(_) => match i % 3 {
+                                0 => MaybeDtcOutcome::new_unknown(17),
+                                1 => MaybeDtcOutcome::new_win(ConversionType::Capture, 3),
+                                _ => MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
+                            },
+                            Err(reason) => {
+                                if !file
+                                    .egt
+                                    .diagonal_symmetric(i)
+                                    .is_some_and(|other| i > other)
+                                {
+                                    invalid.record(reason);
+                                }
+                                MaybeDtcOutcome::INVALID
+                            }
                         };
                         AtomicU16::new(outcome.to_u16())
                     })
                     .collect();
                 // Maxima above the synthetic distances avoid large EPD lists.
-                let stats = finalize_table(&file, values, [7, 9]).unwrap();
+                let stats = finalize_table(&file, values, [7, 9], invalid).unwrap();
                 assert_eq!(stats.tablename, "KQ_KR");
                 assert_eq!(
-                    stats.unique_positions + stats.invalid_or_redundant,
+                    stats.unique_positions
+                        + stats.invalid_opposite_check
+                        + stats.invalid_ep_structure
+                        + stats.invalid_illegal_ep_capture
+                        + stats.redundant,
                     file.index_range
                 );
                 let mut published = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
@@ -133,7 +155,19 @@ mod tests {
                     published.read_from_index(0).unwrap(),
                     MaybeDtcOutcome::INVALID
                 );
-                assert_eq!(published.read_from_index(1).unwrap(), MaybeDtcOutcome::DRAW);
+                let draw_idx = (0..file.egt.index_range())
+                    .find(|&i| {
+                        i % 3 == 0
+                            && file
+                                .egt
+                                .position_from_index(i, shakmaty::Color::White)
+                                .is_some()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    published.read_from_index(draw_idx).unwrap(),
+                    MaybeDtcOutcome::DRAW
+                );
                 assert_eq!(
                     crate::stats::read_stats(&file.location, &file.id).unwrap(),
                     stats
@@ -152,7 +186,7 @@ mod tests {
         let dir = crate::TestDir::new("finalization_wrong_length");
         let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
         assert!(matches!(
-            finalize_table(&file, Vec::new(), [0, 0]),
+            finalize_table(&file, Vec::new(), [0, 0], InvalidCounts::default()),
             Err(EgtError::Internal("completed table has wrong length"))
         ));
         assert!(!dir.0.join(file.id.relative_path("ggegt")).exists());
