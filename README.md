@@ -255,20 +255,25 @@ The JSON files provide the statistics that are presented when running the
 Key statistics include the number of unique positions covered by the selected
 table(s) (`unique_positions`) and its split into `win`, `draw`, `loss`. The
 number of indexes that do not represent any valid position are also available,
-with a split into four categories:
+with a split into five categories:
 - `redundant`: the index represents a position that is the diagonal-symmetric
   of another position that is represented in the table.
 - `invalid_opposite_check`: the index represents a position where the side to
   move attacks the opposite king (including the case of adjacent kings).
-- `invalid_ep_structure`: the index represents a position with en-passant
-  rights but the en-passant is invalid (the squares behind the pushed pawn are
-  occupied, or no side-to-move pawn is present that can capture en-passant).
+- `invalid_no_ep_capture`: the index represents a position with en-passant
+  rights but no side-to-move pawn geometrically attacks the target square.
+- `invalid_ep_squares_occupied`: the index represents a position with en-passant
+  rights and a geometrical capturer, but the target square or the double-push
+  origin square is occupied.
 - `invalid_illegal_ep_capture`: the index represents a position with en-passant
   rights and at least one pawn that can capture en-passant exists, but none
   of the en-passant captures are legal.
 
+These categories are exclusive: opposite check takes precedence over an
+absent capturing pawn, which takes precedence over EP structure failures.
+
 The total number of indexes of the table is stored in `index_range` and
-is equal to the number of unique positions plus the four excluded counts.
+is equal to the number of unique positions plus the five excluded counts.
 Further information is also available (size, hash, number of frames, number of wins/losses at each ply, longest wins/losses).
 
 For instance, running `--stats 4/` gives:
@@ -282,11 +287,22 @@ For instance, running `--stats 4/` gives:
   "draw": 37376378,
   "loss": 44029141,
   "invalid_opposite_check": 29591009,
-  "invalid_ep_structure": 116623,
+  "invalid_no_ep_capture": 115499,
+  "invalid_ep_squares_occupied": 1124,
   "invalid_illegal_ep_capture": 0,
   "redundant": 1258320,
   ...
 ```
+
+Note that the granular information on invalid indexes can be useful to
+reconcile position counts across tablebases that use different methodologies.
+In fact, the value of `unique_positions + invalid_ep_squares_occupied` matches
+exactly the "Number of Unique Legal Positions in chess endgames"
+[here](https://web.archive.org/web/20181125020747/http://kirill-kryukov.com/chess/nulp/results.html)
+(also used as a source for the numbers in the
+[Wikipedia page](https://en.wikipedia.org/wiki/Endgame_tablebase)). More
+precisely, `unique_positions + invalid_ep_squares_occupied` is equal to the
+number of _Positions_ minus the number of _Positions with castling rights_.
 
 ### Outcome representation
 Each position's outcome is represented by a 16-bit `DtcOutcome` value,

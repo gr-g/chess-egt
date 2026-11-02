@@ -119,7 +119,8 @@ impl EgtStatsBuilder {
             draw: self.totals.draw,
             loss: self.totals.loss,
             invalid_opposite_check: self.invalid.opposite_check,
-            invalid_ep_structure: self.invalid.ep_structure,
+            invalid_no_ep_capture: self.invalid.no_ep_capture,
+            invalid_ep_squares_occupied: self.invalid.ep_squares_occupied,
             invalid_illegal_ep_capture: self.invalid.illegal_ep_capture,
             redundant: self.totals.redundant,
             histogram_win,
@@ -194,7 +195,8 @@ mod tests {
         let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
         let invalid = InvalidCounts {
             opposite_check: 7,
-            ep_structure: 11,
+            no_ep_capture: 17,
+            ep_squares_occupied: 11,
             illegal_ep_capture: 13,
         };
         let mut builder = EgtStatsBuilder::new([0, 0], invalid);
@@ -213,7 +215,8 @@ mod tests {
         assert!(builder.totals.candidates.iter().all(Vec::is_empty));
         let stats = builder.build(&file, 0, String::new());
         assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
-        assert_eq!(stats.invalid_ep_structure, invalid.ep_structure);
+        assert_eq!(stats.invalid_no_ep_capture, invalid.no_ep_capture);
+        assert_eq!(stats.invalid_ep_squares_occupied, invalid.ep_squares_occupied);
         assert_eq!(stats.invalid_illegal_ep_capture, invalid.illegal_ep_capture);
         assert_eq!(stats.unique_positions, 0);
     }

@@ -1672,8 +1672,8 @@ mod tests {
             let mut totals = [0usize; 5];
             for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
                 let stats = crate::stats::read_stats(&location, &id).unwrap();
-                let excluded = stats.invalid_opposite_check + stats.invalid_ep_structure
-                                    + stats.invalid_illegal_ep_capture + stats.redundant;
+                let excluded = stats.invalid_opposite_check + stats.invalid_no_ep_capture
+                                    + stats.invalid_ep_squares_occupied + stats.invalid_illegal_ep_capture + stats.redundant;
                                 let counts = [stats.index_range, stats.win, stats.draw, stats.loss, excluded];
                 for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
             }

@@ -145,7 +145,8 @@ mod tests {
                 assert_eq!(
                     stats.unique_positions
                         + stats.invalid_opposite_check
-                        + stats.invalid_ep_structure
+                        + stats.invalid_no_ep_capture
+                        + stats.invalid_ep_squares_occupied
                         + stats.invalid_illegal_ep_capture
                         + stats.redundant,
                     file.index_range

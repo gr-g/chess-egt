@@ -8,7 +8,8 @@ use shakmaty::{Board, CastlingMode, Chess, Color, Position, Rank, Role, Setup, S
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidPosition {
     OppositeCheck,
-    EpStructure,
+    NoEpCapture,
+    EpSquaresOccupied,
     IllegalEpCapture,
 }
 
@@ -16,7 +17,8 @@ pub(crate) enum InvalidPosition {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InvalidCounts {
     pub(crate) opposite_check: usize,
-    pub(crate) ep_structure: usize,
+    pub(crate) no_ep_capture: usize,
+    pub(crate) ep_squares_occupied: usize,
     pub(crate) illegal_ep_capture: usize,
 }
 
@@ -24,7 +26,8 @@ impl InvalidCounts {
     pub(crate) fn record(&mut self, reason: InvalidPosition) {
         match reason {
             InvalidPosition::OppositeCheck => self.opposite_check += 1,
-            InvalidPosition::EpStructure => self.ep_structure += 1,
+            InvalidPosition::NoEpCapture => self.no_ep_capture += 1,
+            InvalidPosition::EpSquaresOccupied => self.ep_squares_occupied += 1,
             InvalidPosition::IllegalEpCapture => self.illegal_ep_capture += 1,
         }
     }
@@ -32,7 +35,8 @@ impl InvalidCounts {
     pub(crate) fn merge(self, other: Self) -> Self {
         Self {
             opposite_check: self.opposite_check + other.opposite_check,
-            ep_structure: self.ep_structure + other.ep_structure,
+            no_ep_capture: self.no_ep_capture + other.no_ep_capture,
+            ep_squares_occupied: self.ep_squares_occupied + other.ep_squares_occupied,
             illegal_ep_capture: self.illegal_ep_capture + other.illegal_ep_capture,
         }
     }
@@ -40,30 +44,26 @@ impl InvalidCounts {
 
 /// Validate a decoded setup, retaining the reason for rejected indices.
 /// Indexing guarantees material, pawn ranks, nonoverlap, and no castling.
-/// Opposite check takes precedence over EP failures; impossible checks are accepted.
+/// Opposite check precedes absent EP capturers, then EP structure and capture legality.
+/// Impossible checks are accepted.
 pub(crate) fn position_from_setup(setup: Setup) -> Result<Chess, InvalidPosition> {
     if opposite_check(&setup.board, setup.turn) {
         return Err(InvalidPosition::OppositeCheck);
     }
-    if !valid_ep_square(&setup) {
-        return Err(InvalidPosition::EpStructure);
+    if let Some(ep) = setup.ep_square {
+        let capturers = setup.board.attacks_to(ep, setup.turn, setup.board.occupied())
+            & setup.board.pawns();
+        if capturers.is_empty() {
+            return Err(InvalidPosition::NoEpCapture);
+        }
+        if !valid_ep_square(&setup) {
+            return Err(InvalidPosition::EpSquaresOccupied);
+        }
     }
     let ep_square = setup.ep_square;
     let position = Chess::from_setup_unchecked(setup, CastlingMode::Standard);
     if position.legal_ep_square() != ep_square {
-        let ep = ep_square.expect("only encoded EP states can fail legal EP validation");
-        // Only diagnose the absent capturer after legal EP validation fails.
-        // Valid positions need no additional geometric attack query.
-        let capturers =
-            position
-                .board()
-                .attacks_to(ep, position.turn(), position.board().occupied())
-                & position.board().pawns();
-        return Err(if capturers.is_empty() {
-            InvalidPosition::EpStructure
-        } else {
-            InvalidPosition::IllegalEpCapture
-        });
+        return Err(InvalidPosition::IllegalEpCapture);
     }
     Ok(position)
 }
@@ -98,15 +98,18 @@ mod tests {
 
     #[test]
     fn invalidity_distinguishes_ep_failures_and_precedence() {
-        use InvalidPosition::{EpStructure, IllegalEpCapture, OppositeCheck};
+        use InvalidPosition::{NoEpCapture, EpSquaresOccupied, IllegalEpCapture, OppositeCheck};
 
         for (fen, expected) in [
             ("7k/8/8/3Pp3/8/8/8/K7 w - e6 0 1", None),
             ("7k/8/8/3Pp3/3K4/8/8/8 w - e6 0 1", None),
-            // Occupied EP target, occupied push origin, and no adjacent capturer.
-            ("7k/8/4N3/3Pp3/8/8/8/K7 w - e6 0 1", Some(EpStructure)),
-            ("7k/4N3/8/3Pp3/8/8/8/K7 w - e6 0 1", Some(EpStructure)),
-            ("7k/8/8/4p3/3P4/8/8/K7 w - e6 0 1", Some(EpStructure)),
+            // An absent capturer takes precedence over occupied EP path squares.
+            ("7k/8/8/4p3/3P4/8/8/K7 w - e6 0 1", Some(NoEpCapture)),
+            ("7k/8/4N3/4p3/3P4/8/8/K7 w - e6 0 1", Some(NoEpCapture)),
+            ("7k/4N3/8/4p3/3P4/8/8/K7 w - e6 0 1", Some(NoEpCapture)),
+            // Occupied EP target and push origin with an adjacent capturer.
+            ("7k/8/4N3/3Pp3/8/8/8/K7 w - e6 0 1", Some(EpSquaresOccupied)),
+            ("7k/4N3/8/3Pp3/8/8/8/K7 w - e6 0 1", Some(EpSquaresOccupied)),
             // Horizontal discovery, pinned capturer, and a check EP cannot evade.
             ("7k/8/8/K2Pp2r/8/8/8/8 w - e6 0 1", Some(IllegalEpCapture)),
             ("3r3k/8/8/3Pp3/8/8/8/3K4 w - e6 0 1", Some(IllegalEpCapture)),
@@ -117,6 +120,7 @@ mod tests {
             ("8/8/8/8/8/4P3/1k6/K7 w - - 0 1", Some(OppositeCheck)),
             // Opposite check takes precedence over the occupied push origin.
             ("7k/4N3/8/3Pp3/8/8/8/K6R w - e6 0 1", Some(OppositeCheck)),
+            ("7k/4N3/8/4p3/3P4/8/8/K6R w - e6 0 1", Some(OppositeCheck)),
             // Preserve the indexer's acceptance of impossible checks.
             ("r6b/7k/8/8/8/8/2n5/K7 w - - 0 1", None),
         ] {
@@ -134,6 +138,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kpkp_invalid_counts_separate_ep_squares_occupied_from_absent_capturers() {
+        let mut invalid = InvalidCounts::default();
+        let mut valid = 0;
+        for id in crate::TableSelector::parse("KP_KP").unwrap().resolve().unwrap() {
+            let egt = crate::egt::Egt::from_elements(id.parse_elements()).unwrap();
+            let mut part = InvalidCounts::default();
+            for index in 0..egt.index_range() {
+                match egt.indexer.position_from_index_with_reason(index, Color::White) {
+                    Ok(_) => valid += 1,
+                    Err(reason) => part.record(reason),
+                }
+            }
+            invalid = invalid.merge(part);
+        }
+        assert_eq!(valid, 3_739_937);
+        assert_eq!(invalid, InvalidCounts {
+            opposite_check: 568_380,
+            no_ep_capture: 115_499,
+            ep_squares_occupied: 1_124,
+            illegal_ep_capture: 0,
+        });
     }
 
     #[test]
