@@ -11,14 +11,14 @@
 
 Current tablebase generation results (with --threads=2, --noverify):
 == All 3 pieces ==
-Generated 16 tables: 367868 unique positions, 0.04 MiB in 00h00m01s.
+Generated 16 tables: 367868 unique positions, 0.04 MiB in 00h00m00s.
 Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 == All 4 pieces ==
-Generated 176 tables: 125607012 unique positions, 13.30 MiB in 00h01m41s.
+Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m41s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 == All 5 pieces ==
-Generated 1496 tables: 26087443599 unique positions, 3590.94 MiB in 06h35m52s.
-Average compression: 1.15 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h36m07s.
+Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 
 ## TODO
 - Parallelization: see the roadmap in `scaling_and_parallelization.md`. Test on EC2 c6g instance.
