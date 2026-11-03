@@ -1,5 +1,5 @@
 //! Retrograde analysis: decremental move counters driven by per-ply table
-//! scans (see `scaling_and_parallelization.md`, Section 4.2).
+//! scans.
 //!
 //! Every unknown position stores the number of its moves not yet known to
 //! lose. Every resolved position stores its distance, so

@@ -105,7 +105,7 @@ class StatsCsvTests(unittest.TestCase):
             self.placeholder(index_range=8 * GIB),
         ])
         row = leaf_stats.leaf_row(self.root, leaf)
-        self.assertEqual(row["estimated_final_size_gib"], "1.850000")
+        self.assertEqual(row["estimated_final_size_gib"], "1.849000")
         self.assertEqual(row["table_count"], 2)
         self.assertEqual(row["available_tables"], 1)
         self.assertEqual(row["index_range"], 9 * GIB)
@@ -119,13 +119,13 @@ class StatsCsvTests(unittest.TestCase):
         ])
         row = leaf_stats.leaf_row(self.root, leaf)
         self.assertEqual(row["estimated_total_core_hours"],
-                         f"{2 * GIB * 1.334 / 3_600_000_000:.6f}")
+                         f"{2 * GIB * 1.345 / (3_600_000_000 * 0.70):.6f}")
         self.assertNotEqual(row["estimated_total_core_hours"],
-                            f"{GIB * 1.334 / 3_600_000_000:.6f}")
+                            f"{GIB * 1.345 / (3_600_000_000 * 0.70):.6f}")
 
     def test_piece_count_scales_index_compression_and_compute_model(self):
-        for pieces, bits, growth in ((5, 0.85, 1), (6, 1.05, 1.1),
-                                     (7, 1.25, 1.1**2)):
+        for pieces, bits, growth in ((5, 0.849, 1), (6, 1.05, 2),
+                                     (7, 1.25, 2**2)):
             with self.subTest(pieces=pieces):
                 leaf, _ = self.make_leaf(
                     [self.placeholder(index_range=8 * GIB)],
@@ -133,7 +133,18 @@ class StatsCsvTests(unittest.TestCase):
                 row = leaf_stats.leaf_row(self.root, leaf)
                 self.assertEqual(row["estimated_final_size_gib"], f"{bits:.6f}")
                 self.assertEqual(row["estimated_total_core_hours"],
-                                 f"{8 * GIB * 1.334 * growth / 3_600_000_000:.6f}")
+                                 f"{8 * GIB * 1.345 * growth / (3_600_000_000 * 0.70):.6f}")
+
+    def test_complete_set_projections_match_scaling_document(self):
+        for pieces, indexes, core_hours in ((6, 5_626_522_905_000, 6_000),
+                                           (7, 683_014_118_224_656, 1_460_000)):
+            with self.subTest(pieces=pieces):
+                leaf, _ = self.make_leaf(
+                    [self.placeholder(index_range=indexes)],
+                    f"{pieces}/{pieces - 2}v2/op0/0pawns")
+                row = leaf_stats.leaf_row(self.root, leaf)
+                self.assertAlmostEqual(float(row["estimated_total_core_hours"]),
+                                       core_hours, delta=core_hours * 0.002)
 
     def test_memory_rounds_up_at_32_gib_boundary(self):
         # Four bytes/index plus 2 GiB overhead is exactly 32 GiB here.

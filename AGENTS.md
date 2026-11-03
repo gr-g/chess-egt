@@ -42,7 +42,7 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ```
 
 ## TODO
-- Parallelization: see the roadmap in `scaling_and_parallelization.md`. Test on EC2 c6g instance.
+- Test on EC2 c6g instance.
 - `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
 - Internal module layout; visibility and public interface.
@@ -53,3 +53,10 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 - Explore possibility of generating tables that store together DTC and DTM for
   the same index, not only DTC.
 - General cleanup.
+- Distributed generation by worker swarm with message-passing implementation
+  of the update sink. Bounded streaming buffers. Per-phase barriers.
+  Checkpoints to object storage.
+- Further optimization ideas:
+  - Pawn-rank slicing: solve slices of pawnful `Egt`s in dependency order.
+    Inject successors in already solved slices at the matching ply.
+  - A generation-specific index layout.

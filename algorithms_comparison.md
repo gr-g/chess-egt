@@ -6,7 +6,7 @@ A comparative study of the tablebase generation algorithms and architectures use
 - **Prophet TB** by Markus (`https://github.com/markus7800/prophet_tb_gen_and_probe`)
 - **chesstb** by noobpwnftw (`https://github.com/noobpwnftw/chesstb`)
 
-Scaling to 6+ pieces (shared-memory vs. distributed parallelization) and the resulting implementation roadmap are covered in [`scaling_and_parallelization.md`](scaling_and_parallelization.md).
+Quantitative scale, measured performance, and resource/cost estimates are covered in [`scaling.md`](scaling.md). Algorithm details are described in [the README](README.md#retrograde-analysis) and [`src/retrograde.rs`](src/retrograde.rs).
 
 ---
 
@@ -38,7 +38,7 @@ This is the **single most fundamental algorithmic difference**:
    - *Challenges*:
      - **Symmetry hazards**: With diagonal reflections in pawnless tables, moves transitioning between 8-way and 4-way orbits require artificial $+2$ counter weighting, mirror decrements, and unmove deduplication. If a single unmove is duplicated or missed, the counter never reaches 0 (turning a loss into a draw) or drops too fast (false loss).
      - **Parallelism contention**: Decrementing shared counters is inherently non-idempotent. Every unmove reaching a predecessor $P$ must execute an atomic read-modify-write (`fetch_sub` or CAS loop). If multiple worker threads hit positions on the same cache line, the line is constantly invalidated and bounced across CPU cores.
-       *(Re-assessed in [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.1: scattered accesses make collisions less likely, and an uncontended atomic is cheap next to an unmove. Section 7 records historical shared-memory scaling; the sweep also needs atomic propagation writes.)*
+       *(Scattered accesses make collisions less likely, and an uncontended atomic is cheap next to an unmove. The sweep also needs atomic propagation writes.)*
      - **Scan overhead**: Unlike the former queue-based implementation, the current solver stores no frontier indices; deep, thin frontiers can still require many scans.
 
 2. **Syzygy (`tb`), Prophet, and `chesstb` (Candidate Flag + Forward Verification)**:
@@ -87,11 +87,11 @@ options.
 - **Speed:** the sweep was slower on every non-trivial endgame (propagation alone: +18% on 4-piece, +31% on the 5-piece sample). The worst case is as predicted by theory: deep tables with a thin frontier (`KNN_KP` +53%), where every ply scans the whole table. Shallow tables narrow the gap but never close it.
 - **Early exit is weaker than claimed** ("refuted on the 1st or 2nd move"): in winning endgames 20–65% of candidates are confirmed losses and each candidate checks 3–5.3 quiet moves on average (`KRP_KQ`: 637M candidates, 19% confirmed, 5.29 moves). The claim holds only in drawish tables (`KQB_KQ`, `KRB_KR`, `KR_KR`: ~1.3–1.7 moves, 1–6% confirmed). Every candidate also pays a full decode (`from_setup`) before the first move.
 - **Memory is the real advantage of the sweep**: its footprint is essentially the two tables (2 bytes/pos), while the counter version's queues (8-byte `usize` indices, with duplicates) peak at 3.5–8.4 GiB on shallow 5-piece tables, i.e. several times the tables themselves. This is prohibitive for 6-piece tables. Storing indices as `u32` would halve it, but only as chunk-relative indices: a 6-piece pawnless table has ~6.2 × 10⁹ positions per side, which is more than `u32::MAX`. The queues are not inherent to counters, though: they can be replaced by per-ply table scans (see Section 3.1).
-- **Follow-up**: counters driven by per-ply table scans instead of queues (`--algorithm scan`) are within +0.9% of the counters on the 5-piece sample, with the sweep's memory footprint. See [`scaling_and_parallelization.md`](scaling_and_parallelization.md), Section 7, Step 1.
+- **Follow-up**: counters driven by per-ply table scans instead of queues (`--algorithm scan`) are within +0.9% of the counters on the 5-piece sample, with the sweep's memory footprint.
 - **Caveats**: the sweep is a first, unoptimized version (re-decodes every candidate, two passes per ply), while the counter version has been profiled. Parallel scalability, the sweep's main theoretical advantage, is not measured yet.
 
 > **Note on BFS Queues vs. Table Sweeps**:
-> The divergence between **queue-driven BFS** (tracking explicit predecessor index lists per ply) and **table array sweeps** (flat memory chunk iterations over flags) is a fundamental architectural choice. Table sweeps eliminate BFS queue memory overhead and enable simple chunk-parallel loops in shared memory, while BFS queues only touch reachable indices. This trade-off, and the choice between shared-memory multi-threading and distributed message-passing, is analyzed in [`scaling_and_parallelization.md`](scaling_and_parallelization.md). Note that the two dimensions are independent: "counters vs. candidate flags" (how losses are resolved) and "queues vs. scans" (how the positions to propagate are found) can be combined freely.
+> The divergence between **queue-driven BFS** (tracking explicit predecessor index lists per ply) and **table array sweeps** (flat memory chunk iterations over flags) is a fundamental architectural choice. Table sweeps eliminate BFS queue memory overhead and enable simple chunk-parallel loops in shared memory, while BFS queues only touch reachable indices. Note that the two dimensions are independent: "counters vs. candidate flags" (how losses are resolved) and "queues vs. scans" (how the positions to propagate are found) can be combined freely.
 
 ---
 
@@ -159,7 +159,7 @@ In `chess-egt`'s `AGENTS.md`, the complex interaction between move counters and 
 - **Measured trade-off** (see Section 2.A): single-threaded, the sweep is 13% (4-piece) to 23% (5-piece sample) slower, up to +53% on deep thin-frontier tables. The decision therefore hinges on parallel scaling and on memory for 6-piece tables, not on single-threaded speed.
 - **Other combinations and the current choice**:
   - Candidate flags + forward verification, but with a queue (e.g. of chunk-relative `u32` indices) instead of full sweeps, which would remove the per-ply scans on deep tables while keeping idempotent marking.
-  - **Decremental counters driven by per-ply table scans instead of queues** are the current implementation ([`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2). The positions to propagate at ply `p` are exactly those stored with distance `p - 1`, so the queues can be dropped. This keeps the counters' low work per edge (no forward verification of candidates) and has the sweep's memory footprint. Its updates never read remote state, so it also carries over to separate-memory workers. A per-block "last resolved ply" summary lets scans skip untouched blocks on deep tables.
+  - **Decremental counters driven by per-ply table scans instead of queues** are the current implementation (see [the README](README.md#retrograde-analysis) and [`src/retrograde.rs`](src/retrograde.rs)). The positions to propagate at ply `p` are exactly those stored with distance `p - 1`, so the queues can be dropped. This keeps the counters' low work per edge (no forward verification of candidates) and has the sweep's memory footprint. Its updates never read remote state, so it also carries over to separate-memory workers. A per-block "last resolved ply" summary lets scans skip untouched blocks on deep tables.
 
 ### 2. Multi-Threading & Rayon Parallelization
 `chess-egt` uses Rayon for initialization, per-ply scans, and finalization, with
@@ -170,12 +170,12 @@ reused across serial jobs; cached frames have no LRU eviction yet.
   ```rust
   table.par_chunks_mut(CHUNK_SIZE).for_each(|chunk| { ... });
   ```
-  `AtomicU16` CAS loops handle scattered propagation updates. Historical scaling measurements are in [`scaling_and_parallelization.md`](scaling_and_parallelization.md), Step 4; they are not a guarantee of near-linear scaling. Deterministic output requires updates within each phase to give the same result in any order. For counters, this requires resolving the conversion type of new losses per phase (see [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 4.2).
+  `AtomicU16` CAS loops handle scattered propagation updates. Historical scaling measurements are not a guarantee of near-linear scaling. Deterministic output requires updates within each phase to give the same result in any order. For counters, this requires resolving the conversion type of new losses per phase (see [`src/retrograde.rs`](src/retrograde.rs)).
 
 ### 3. Topological Slicing for Pawnful Tables
 - **Insight**: Since pawns cannot move backward, pawn configurations form a Directed Acyclic Graph (DAG).
 - As `chesstb` demonstrates, you do not need all pawn configurations of an endgame resident in memory at the same time. You can solve slices at higher ranks (e.g., pawns on 6th/7th rank) first, write them out, and then solve lower ranks. This eliminates the memory wall when scaling from 5-piece to 6-piece endgames.
-- In `chess-egt`, pawns are the most significant digits of the index, so a pawn-rank slice of an `Egt` is a contiguous index range (apart from the en passant sub-tables). Successors in already solved slices must be injected at the matching ply, not during initialization. Slices are also the natural unit of independent jobs for distributed generation (see [`scaling_and_parallelization.md`](scaling_and_parallelization.md) Section 3).
+- In `chess-egt`, pawns are the most significant digits of the index, so a pawn-rank slice of an `Egt` is a contiguous index range (apart from the en passant sub-tables). Successors in already solved slices must be injected at the matching ply, not during initialization. Slices are also the natural unit of independent jobs for distributed generation.
 
 ### 4. Reverse Capture/Promotion Unmoves vs. Forward Probing
 In `chess-egt`'s `TODO`, there is an item: *"Experiment with approach using capture/promotion unmoves for initialization."*

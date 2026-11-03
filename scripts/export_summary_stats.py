@@ -14,19 +14,24 @@ from stats_csv import (
 )
 
 
-# Reference-core estimates, excluding verification and dependencies outside a leaf.
-# The baseline is wall time times two threads, not measured process CPU time.
+# Central reference-equivalent estimates from scaling.md, excluding verification,
+# dependency stalls and interruptions. The baseline is wall time times two
+# threads, not measured process CPU time; efficiency allows for larger machines.
 REFERENCE_PIECES = 5
-CORE_US_PER_INDEX = 1.334
-COMPUTE_GROWTH_PER_PIECE = 1.1
+CORE_US_PER_INDEX = 1.345
+COMPUTE_GROWTH_PER_PIECE = 2.0
+PARALLEL_EFFICIENCY = 0.70
 
 # Unlike the actual table CSV compression, these rates use INDEX positions.
-COMPRESSION_BITS_PER_INDEX = 0.85
-COMPRESSION_GROWTH_PER_PIECE = 0.20  # 6 pieces: 1.05; 7 pieces: 1.25.
+# Use the measured five-piece rate and the six/seven-piece range midpoints.
+COMPRESSION_BITS_PER_INDEX = 0.849
+COMPRESSION_BITS_PER_INDEX_6 = 1.05
+COMPRESSION_GROWTH_PER_PIECE = 0.20  # 7 pieces: 1.25; extrapolate beyond seven.
 
 # Bound the largest working pair by two largest-table arrays, 2 bytes/index each.
 # Overhead is a rough allowance for cache, encoders and other working memory;
 # increase it for larger cache budgets or thread counts. Jobs run serially.
+# This provisioning heuristic includes headroom, unlike scaling.md's array sizes.
 MEMORY_OVERHEAD_GIB = 2
 MEMORY_ROUNDING_GIB = 32
 
@@ -76,7 +81,8 @@ def leaf_row(root, leaf):
         row["size_gib"] = decimal(stats["bytes"] / 2**30)
     else:
         pieces = int(path.split("/")[0])
-        bits_per_index = COMPRESSION_BITS_PER_INDEX + COMPRESSION_GROWTH_PER_PIECE * max(0, pieces - REFERENCE_PIECES)
+        bits_per_index = (COMPRESSION_BITS_PER_INDEX if pieces <= REFERENCE_PIECES else
+                          COMPRESSION_BITS_PER_INDEX_6 + COMPRESSION_GROWTH_PER_PIECE * (pieces - 6))
         known_bytes = sum(record["bytes"] for record in complete)
         missing_indexes = sum(record["index_range"] for record in records if record["bytes"] is None)
         core_us = CORE_US_PER_INDEX * COMPUTE_GROWTH_PER_PIECE ** (pieces - REFERENCE_PIECES)
@@ -85,7 +91,7 @@ def leaf_row(root, leaf):
         rounding_bytes = MEMORY_ROUNDING_GIB * 2**30
         row.update({
             "estimated_final_size_gib": decimal((known_bytes + missing_indexes * bits_per_index / 8) / 2**30),
-            "estimated_total_core_hours": decimal(index_range * core_us / 3_600_000_000),
+            "estimated_total_core_hours": decimal(index_range * core_us / (3_600_000_000 * PARALLEL_EFFICIENCY)),
             "estimated_memory_gib": ((memory_bytes + rounding_bytes - 1) // rounding_bytes) * MEMORY_ROUNDING_GIB,
         })
     return row
