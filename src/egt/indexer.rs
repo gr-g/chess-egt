@@ -1,3 +1,65 @@
+//! Position indexing through symmetry reduction, compaction, and combinatorial
+//! encoding. STM denotes the side to move; SNTM denotes the side not to move.
+//!
+//! # Detailed indexing algorithm
+//!
+//! [`Indexer::position_to_index`] maps a chess position to an integer in
+//! `0..index_range`. For tables with pawns, ranks are normalized so that STM
+//! pawns move toward increasing ranks.
+//!
+//! - Only for symmetric pawn tables, a horizontal mirroring is applied if needed
+//!   to make sure the kings are in the correct order.
+//! - The indexer checks whether a legal en passant capture is available. A raw EP
+//!   square without a legal capture is equivalent to no EP.
+//! - If so, it selects the corresponding sub-table. The SNTM target pawn is the
+//!   highest pawn on its file in STM-normalized ranks, fixed on rank 5. Its
+//!   presence is implicit in the pawn group's combinatorial encoding, but it
+//!   still participates in occupied-square compaction. The remaining pawns on
+//!   that file can only occupy ranks 2–4.
+//! - The board position of each piece is converted into coordinates
+//!   `(rank, file)`.
+//! - For each file, pawns are gathered in descending rank order on that file
+//!   (irrespective of side) and form a group.
+//! - If there are no pawns, the STM king position is restricted to 10 canonical
+//!   squares (representing one octant of the board) using horizontal, vertical,
+//!   and diagonal reflections. All other pieces are reflected accordingly to
+//!   preserve relative positions.
+//! - Repeated non-pawn pieces of the same side form a group and are sorted by
+//!   descending transformed square number, after canonicalization.
+//! - Each coordinate is converted to a raw square index in `0..64`:
+//!   `rank * 8 + file`, except for symmetric pawn tables, for which square numbers
+//!   are `8 * file + rank` on files a–d and `8 * file + (7 - rank)` on e–h. In
+//!   this way, horizontal reflection sends square number `i` to `63 - i`, so that
+//!   exactly one of the reflected or non-reflected positions will have the STM and
+//!   SNTM king in the right order.
+//! - Since no two pieces can occupy the same square, the raw square indices are
+//!   compacted to remove "holes" caused by already occupied squares. For each
+//!   piece, its index is adjusted by subtracting the number of preceding pieces
+//!   that occupy a lower square index. This maps the indices sequentially to
+//!   ranges `[0..64, 0..63, 0..62, 0..61, ...]`.
+//! - Pawns are restricted to ranks 2-7 (6 possible squares on their designated
+//!   file). Their positions are converted to compact indices in `0..6` (or `0..3`
+//!   in case of en passant).
+//! - A group of `k` pawns on a file is encoded together using `C(6, k)`
+//!   indices (or `C(3, k - 1)` in case of en passant), where `C(n, k)` denotes
+//!   the binomial coefficient "n choose k".
+//! - For pawnless endgames, a precomputed lookup table (`KINGS_MAP`) maps valid
+//!   canonical king pairs (excluding adjacent or identical squares) to a single
+//!   index in `0..462`; symmetric pawn tables encode the two kings as a single
+//!   group of two identical pieces.
+//! - Groups of pieces are encoded together into a single integer using a
+//!   mixed-radix system. A group of `k` pieces contributes `C(n, k)`
+//!   combinations among `n` available squares.
+//! - The combination index for these `k` pieces with compacted indices
+//!   `c_0 > c_1 > ... > c_(k-1)` is computed using the combinatorial number
+//!   system (combinadics): `group_index = sum(C(c_j, k - j), j = 0..k)`,
+//!   where the upper bound `k` is exclusive.
+//! - These group indices are then combined using a mixed-radix base where the
+//!   multiplier for each group is the total number of combinations of the
+//!   subsequent groups.
+//! - The resulting index specific to the selected (en passant-specific) sub-table
+//!   is then mapped to a table-specific index.
+
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
@@ -125,7 +187,7 @@ pub struct IndexerElement {
     // N_CHOOSE_K[encoded_multiplicity][n_squares], except for the pawnless king lookup.
     pub combinations: usize,
 
-    // The indexes (begin, end) where information about these pieces is
+    // The indices (begin, end) where information about these pieces is
     // stored in the buffer vectors. Normally
     //   span.1 - span.0 = encoded_multiplicity,
     // unless we are encoding en passant positions and one of the pieces
@@ -138,7 +200,7 @@ pub struct IndexerElement {
 // Positions where en passant is possible are encoded separately from positions
 // where en passant is not possible. One instance of this struct represents one
 // option for the en passant status of positions, together with the range of
-// indexes associated to these positions.
+// indices associated to these positions.
 // Each option carries its own pre-adjusted `piece_set`, with the `encoded_multiplicity`,
 // `n_squares` and `combinations` of the pawn group on the en passant file
 // already reduced to reflect the constraints imposed by that option (the pawn
@@ -168,7 +230,7 @@ type CoordBuf = ArrayVec<(usize, usize), MAX_PIECES>;
 type PidxBuf = ArrayVec<usize, MAX_PIECES>;
 
 // Helper object taking care of the efficient conversion from positions to
-// compact indexes representing the positions, and viceversa.
+// compact indices representing the positions, and viceversa.
 #[derive(Clone, Debug)]
 pub struct Indexer {
     // The number of pieces in the endgame.
@@ -412,7 +474,7 @@ impl Indexer {
         let (index_offset, ep_idx) = self.adjust_ep_from_position(ep_file);
         // Now the en passant option reflects the en passant status of the position.
         // If there are pawns on the en passant file (different from the en passant
-        // pawn on the 5th rank), they will be encoded with indexes in 0..3 instead of 0..6.
+        // pawn on the 5th rank), they will be encoded with indices in 0..3 instead of 0..6.
 
         let mut buffer_coord = Self::filled_coord(self.n_pieces);
         let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
@@ -432,12 +494,12 @@ impl Indexer {
         //println!("buffer_coord: {:?}", buffer_coord);
 
         self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
-        // Now `buffer_pidx` has the position indexes, with
+        // Now `buffer_pidx` has the position indices, with
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
         //println!("buffer_pidx: {:?}", buffer_pidx);
 
         Self::compact_pidx(&mut buffer_pidx);
-        // Now `buffer_pidx` has compact positions indexes, with
+        // Now `buffer_pidx` has compact positions indices, with
         // values in [0..64, 0..63, 0..62, 0..61, ...].
         //println!("buffer_pidx: {:?}", buffer_pidx);
 
@@ -455,7 +517,7 @@ impl Indexer {
             //println!("buffer_pidx: {:?}", buffer_pidx);
         }
 
-        // Now that we have all compact position indexes in `buffer_pidx`,
+        // Now that we have all compact position indices in `buffer_pidx`,
         // we can aggregate them into a single value.
         index_offset + self.cpidx_to_index(ep_idx, &buffer_pidx)
     }
@@ -491,7 +553,7 @@ impl Indexer {
         let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
         // Now the en passant option reflects the en passant status as encoded in the index.
         // If there are pawns on the en passant file (different from the en passant
-        // pawn on the 5th rank), they will be decoded from indexes in 0..3 instead of 0..6.
+        // pawn on the 5th rank), they will be decoded from indices in 0..3 instead of 0..6.
 
         let mut buffer_coord = Self::filled_coord(self.n_pieces);
         let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
@@ -513,7 +575,7 @@ impl Indexer {
         }
 
         Self::uncompact_cpidx(&mut buffer_pidx);
-        // Now `buffer_pidx` has the positions indexes, with
+        // Now `buffer_pidx` has the positions indices, with
         // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
         //println!("buffer_pidx: {:?}", buffer_pidx);
 
@@ -718,21 +780,21 @@ impl Indexer {
         }
     }
 
-    // Converts the piece coordinates to indexes in 0..64.
+    // Converts the piece coordinates to indices in 0..64.
     fn coord_to_pidx(&self, buffer_coord: &CoordBuf, buffer_pidx: &mut PidxBuf) {
         for i in 0..self.n_pieces {
             buffer_pidx[i] = self.square_index(buffer_coord[i]);
         }
     }
 
-    // Converts indexes in 0..64 to piece coordinates for non-pawns.
+    // Converts indices in 0..64 to piece coordinates for non-pawns.
     fn nonpawn_pidx_to_coord(&self, buffer_coord: &mut CoordBuf, buffer_pidx: &PidxBuf) {
         for i in self.n_pawns..self.n_pieces {
             buffer_coord[i] = self.square_coord(buffer_pidx[i]);
         }
     }
 
-    // Compact non-overlapping indexes in ranges 0..a, 0..b, 0..c, ...
+    // Compact non-overlapping indices in ranges 0..a, 0..b, 0..c, ...
     // to (possibly overlapping) indexed in ranges 0..a, 0..b-1, 0..c-2, ....
     // Note that values for repeated pieces are sorted from highest to
     // lowest, so they remain non-overlapping.
@@ -755,7 +817,7 @@ impl Indexer {
         }
     }
 
-    // Converts pawn indexes (pidx) to compact position indexes (cpidx) in 0..6,
+    // Converts pawn indices (pidx) to compact position indices (cpidx) in 0..6,
     // where 0 indicates that the pawn is on the 2nd rank, 5 indicates that
     // the pawn is on the 7th rank.
     fn pawn_pidx_to_cpidx(&self, ep_idx: usize, buffer_coord: &CoordBuf, buffer_pidx: &mut PidxBuf) {
@@ -766,8 +828,8 @@ impl Indexer {
         }
     }
 
-    // Converts compact position indexes (cpidx) for pawns (in 0..6) to indexes
-    // in 0..64, and converts these indexes to piece coordinates.
+    // Converts compact position indices (cpidx) for pawns (in 0..6) to indices
+    // in 0..64, and converts these indices to piece coordinates.
     fn pawn_cpidx_to_pidx(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, buffer_pidx: &mut PidxBuf) {
         for p in &self.piece_set(ep_idx)[0..self.n_pawn_groups] {
             let IndexerGroup::Material(EgtElement::PawnGroup { file, .. }) = &p.group else { unreachable!() };
@@ -789,7 +851,7 @@ impl Indexer {
     }
 
     // Computes the final index representing the position, by aggregating
-    // the values of the compact position indexes (cpidx) into a single number.
+    // the values of the compact position indices (cpidx) into a single number.
     fn cpidx_to_index(&self, ep_idx: usize, buffer_pidx: &PidxBuf) -> usize {
         let groups = self.piece_set(ep_idx);
         let (mut index, groups) = if self.n_pawns == 0 {
@@ -816,7 +878,7 @@ impl Indexer {
     }
 
     // Reads the index representing the piece configuration and writes the
-    // corresponding compact position indexes (cpidx) to buffer_pidx:
+    // corresponding compact position indices (cpidx) to buffer_pidx:
     // - pawn positions encoded with an index in 0..6
     // - non-pawn positions encoded with an index representing the square to
     //   occupy among the set of non-already-occupied squares.

@@ -2,7 +2,7 @@
 //! scans (see `scaling_and_parallelization.md`, Section 4.2).
 //!
 //! Every unknown position stores the number of its moves not yet known to
-//! lose (see `README.md`, 6.2). Every resolved position stores its distance, so
+//! lose. Every resolved position stores its distance, so
 //! the positions to propagate at ply `p` are exactly the values at ply `p - 1`,
 //! found by scanning the tables. A per-block summary (`PlySummary`) lets the
 //! scans skip blocks by ply and source kind: all losses, or wins of each
@@ -38,6 +38,34 @@
 //! propagation joins, each exact table is finalized in bounded parallel frame
 //! batches and published separately. Generation uses the caller's Rayon pool
 //! and shared dependency reader; it does not generate missing prerequisites.
+//!
+//! # Move counters and diagonal symmetry
+//!
+//! The move counter is generally initialized as the number of legal moves in a
+//! position. Symmetry reduction in pawnless tables requires adjustments because
+//! different legal moves can reach positions that map to the same index, and
+//! different reverse moves can likewise map to the same predecessor index. For
+//! a discussion of symmetry and move counters, see
+//! [section 4.6 of this thesis](https://issuu.com/jespertk/docs/master_thesis).
+//!
+//! Let a position `p` have `#p=8` if it represents 8 equivalent positions and
+//! `#p=4` if it represents 4 equivalent positions. With this indexer's choice
+//! of canonicalization, `#p=4` positions have both kings on the a1–h8 diagonal.
+//!
+//! When initializing the counter for a canonical position `p`, if there is a
+//! legal move `p -> p'` with `#p=8` and `#p'=4`, there is also a diagonally
+//! reflected move from a non-canonical position (the reflection of `p`) to a
+//! canonical position (the reflection of `p'`). Backward propagation explores
+//! this reflected move too. To account for this, moves `p -> p'` with `#p=8`
+//! and `#p'=4` contribute 2 to the counter during initialization. This is
+//! implemented by [`symmetry_adjusted_move_counter`].
+//!
+//! Similarly, when backward propagation from a canonical position `p'` finds
+//! a move `p -> p'` with `#p=4` and `#p'=8`, it must decrement both the counter
+//! for `p` and the counter for its diagonal reflection. The reflected move
+//! contributed to the reflected predecessor's counter but led to a
+//! non-canonical successor. [`quiet_unmoves`] emits both predecessor indices
+//! so propagation updates both counters.
 
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
@@ -449,14 +477,8 @@ pub fn quiet_unmoves<F>(
         };
         f(pred_idx);
 
-        // Let's say a canonical position `p` has `#p=8` if it represents 8 equivalent
-        // positions and `#p=4` if it represents 4 equivalent positions (with our choice
-        // of canonicalization, `#p=4` positions are positions with both kings on the
-        // a1-h8 diagonal). When retrograde propagation from `p'` finds move `p -> p'`
-        // with `#p=4` and `#p'=8`, in addition to decrementing the counter for p, the
-        // counter for the reflection of `p` along the diagonal should also be decremented
-        // (since the symmetric move contributed to the counter for the reflection of `p`
-        // but led to a non-canonical position).
+        // Emit the diagonal predecessor too for `#p=4` -> `#p'=8` moves.
+        // See "Move counters and diagonal symmetry" in the module documentation.
         if use_diagonal_symmetry {
             let maybe_reflected_idx = twin.diagonal_symmetric(pred_idx);
             if let Some(reflected_idx) = maybe_reflected_idx {
@@ -477,16 +499,8 @@ pub fn quiet_unmoves<F>(
 fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) -> u16 {
     let kings = position.board().by_role(Role::King);
 
-    // Let's say a canonical position `p` has `#p=8` if it represents 8
-    // equivalent positions and `#p=4` if it represents 4 equivalent positions
-    // (with our choice of canonicalization, `#p=4` positions are positions
-    // with both kings on the a1-h8 diagonal). When initializing the counters,
-    // if there is a legal move `p -> p'` with `#p=8` and `#p'=4`, then there
-    // is a move (the symmetric along the diagonal) which goes from a non canonical
-    // position (the reflection of `p` along the diagonal) to a canonical position
-    // (the reflection of `p'` along the diagonal), which will be explored during
-    // backward propagation. To account for this, moves `p -> p'` with `#p=8` and
-    // `#p'=4` should increment the counter by 2 during initialization.
+    // Count both reflected moves for `#p=8` -> `#p'=4` transitions.
+    // See "Move counters and diagonal symmetry" in the module documentation.
     if kings_on_long_diagonal(kings) {
         // Already `#p=4`: no successor can require an adjustment.
         return legals.len() as u16;

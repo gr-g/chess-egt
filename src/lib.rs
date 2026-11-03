@@ -345,7 +345,7 @@ impl EgtProber {
         let tablename = egt.tablename();
         let local_range = egt.index_range();
 
-        println!("{}: verifying {} indexes...", tablename, local_range);
+        println!("{}: verifying {} indices...", tablename, local_range);
 
         let completed = AtomicUsize::new(0);
         // Blocks divide frames so copying a block never crosses a frame boundary.
@@ -365,7 +365,7 @@ impl EgtProber {
             let done = previous + end - start;
             if done / 10_000_000 != previous / 10_000_000 {
                 println!(
-                    "{}: verified {}/{} indexes...",
+                    "{}: verified {}/{} indices...",
                     tablename, done, local_range
                 );
             }

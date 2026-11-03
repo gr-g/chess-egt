@@ -50,7 +50,7 @@ This is the **single most fundamental algorithmic difference**:
        - Prophet marks: `LOSS_EGTB->TB[idx] = MAYBELOSS_IN(p+1)`.
        - chesstb marks: `add_flags(pred, DTC_FLAG_CHANGE)`.
        - *Why candidate flags avoid contention*: Marking `CHANGED` is **idempotent**. Threads use Test-and-Test-and-Set (TTAS): if the flag is already set, no write occurs, keeping the cache line in Shared (`S`) state and avoiding bus bouncing.
-     - **Step 3 (Forward Verification of Candidate Losses)**: Sweep the candidate positions across non-overlapping index chunks (e.g. `par_chunks_mut`). Each candidate is only written by the thread owning its chunk, so this step needs no atomics. Steps 1-2 still write to the twin table at arbitrary indexes and do need atomics (CAS/TTAS).
+     - **Step 3 (Forward Verification of Candidate Losses)**: Sweep the candidate positions across non-overlapping index chunks (e.g. `par_chunks_mut`). Each candidate is only written by the thread owning its chunk, so this step needs no atomics. Steps 1-2 still write to the twin table at arbitrary indices and do need atomics (CAS/TTAS).
        - Crucially, this sweep does **not** evaluate all `UNKNOWN` positions every ply: it inspects **only** positions tagged as `CHANGED` in Step 2.
        - For each marked position, generate its legal forward moves and check if *all* moves land on confirmed wins for the opponent.
        - **Early Exit**: As soon as **any single move** lands on `UNKNOWN` or a draw/win, the check aborts immediately (`break`), and the flag is reset to `UNKNOWN`.

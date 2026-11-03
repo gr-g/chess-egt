@@ -671,7 +671,7 @@ impl EgtFileReader {
             ))
     }
 
-    /// Returns the in-memory outcomes for the table-local indexes `[start, end)`,
+    /// Returns the in-memory outcomes for the table-local indices `[start, end)`,
     /// allocating or decompressing the frame if needed. The range must lie
     /// within a single frame. This gives table scans direct slice access,
     /// avoiding the per-element overhead of `read_from_index`.

@@ -11,7 +11,7 @@ pub struct Egt {
     pub elements: Vec<EgtElement>,
 
     // The helper object storing the piece set and the information required
-    // to convert positions to table indexes.
+    // to convert positions to table indices.
     pub indexer: Indexer,
 
     // The name of this table (e.g. "KQ_KPa").

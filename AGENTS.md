@@ -12,9 +12,9 @@
   still to be finalized.
 - Always run `cargo test --release` for testing, otherwise it takes too much
   time.
-- Keeping code simple, short and readable has priority over finding a way to
+- Keeping code simple, short and elegant has priority over finding a way to
   implement all desired features. If it cannot be done with simple, short and
-  readable code, then perhaps it should not be done.
+  elegant code, then perhaps it should not be done.
 - Adding one or two focused and compact tests to check functionality is ok.
   Adding hundreds and hundreds of lines of tests is not ok.
 - Update the documentation after a change if appropriate, but always leave
