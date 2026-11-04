@@ -32,12 +32,12 @@ Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 ```
 ```
 == All 4 pieces ==
-Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m41s.
+Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m40s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 ```
 ```
 == All 5 pieces ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h36m07s.
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h31m58s.
 Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ```
 
