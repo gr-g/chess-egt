@@ -19,7 +19,7 @@ use url::Url;
 use crate::{EgtError, EgtResult};
 
 const TABLEBASE_FORMAT: &str = "ggegt-v0.10";
-pub(crate) const DEFAULT_FRAME_SIZE: usize = 256 * 1024;
+pub(crate) const FRAME_SIZE: usize = 256 * 1024;
 
 /// Root metadata is immutable and independent of optional per-table statistics.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

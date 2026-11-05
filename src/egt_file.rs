@@ -15,7 +15,7 @@ use shakmaty::{Chess, Color};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use crate::storage::DEFAULT_FRAME_SIZE;
+use crate::storage::FRAME_SIZE;
 
 // Compression level used when storing data on disk.
 pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
@@ -511,7 +511,7 @@ impl EgtFileReader {
         let id = TableId::parse(tablename)?;
         let egt = Egt::from_elements(id.parse_elements())?;
         let index_range = egt.index_range();
-        let frame_size = DEFAULT_FRAME_SIZE;
+        let frame_size = FRAME_SIZE;
         let frame_layout: Vec<_> = (0..index_range)
             .step_by(frame_size)
             .map(|start| FrameDescriptor {
@@ -1416,9 +1416,9 @@ mod tests {
         assert_eq!(file.frame_layout.last().unwrap().len, 174420);
         let indexes = [
             0,
-            DEFAULT_FRAME_SIZE - 1,
-            DEFAULT_FRAME_SIZE,
-            DEFAULT_FRAME_SIZE + 1,
+            FRAME_SIZE - 1,
+            FRAME_SIZE,
+            FRAME_SIZE + 1,
             file.index_range - 1,
         ];
         for (n, &idx) in indexes.iter().enumerate() {
@@ -1429,7 +1429,7 @@ mod tests {
             .unwrap();
         }
         assert!(
-            file.frame_chunk(DEFAULT_FRAME_SIZE - 1, DEFAULT_FRAME_SIZE + 1)
+            file.frame_chunk(FRAME_SIZE - 1, FRAME_SIZE + 1)
                 .is_err()
         );
         file.save_to_file().unwrap();
@@ -1462,8 +1462,8 @@ mod tests {
             3,
             922,
             926,
-            DEFAULT_FRAME_SIZE * 2,
-            DEFAULT_FRAME_SIZE * 2 + 2,
+            FRAME_SIZE * 2,
+            FRAME_SIZE * 2 + 2,
         ] {
             let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();

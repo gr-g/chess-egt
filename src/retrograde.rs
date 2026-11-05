@@ -213,7 +213,7 @@ fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionTyp
     }
 }
 
-/// Number of positions per pair-local summary block.
+/// Number of positions per summary block.
 const SUMMARY_BLOCK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy)]

@@ -7,7 +7,7 @@ use std::ops::Add;
 use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{DEFAULT_FRAME_SIZE, Location, block_on};
+use crate::storage::{FRAME_SIZE, Location, block_on};
 use crate::table_id::TableId;
 use crate::{Egt, EgtError, EgtResult};
 
@@ -396,7 +396,7 @@ impl EgtStats {
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.bytes == 0
             || self.index_range == 0
-            || self.frame_size != DEFAULT_FRAME_SIZE
+            || self.frame_size != FRAME_SIZE
             || self.num_frames != self.index_range.div_ceil(self.frame_size)
         {
             return Err(invalid_data(
@@ -487,7 +487,7 @@ mod tests {
             bytes: 100,
             sha256: "ab".repeat(32),
             index_range: 21,
-            frame_size: DEFAULT_FRAME_SIZE,
+            frame_size: FRAME_SIZE,
             num_frames: 1,
             unique_positions: 6,
             win: 3,
