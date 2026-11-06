@@ -95,6 +95,35 @@ python3 scripts/export_table_stats.py ROOT table_stats.csv
 python3 scripts/export_summary_stats.py ROOT summary_stats.csv
 ```
 
+### API server
+
+Run an API server with a local tablebase root:
+
+```sh
+cargo run --release --bin chess-egt-server -- \
+  --path ./ggegt --cache-size 1GiB --bind localhost:44348
+
+# Get statistics on 3-piece endgames
+curl --get http://localhost:44348/stats?tables=3
+
+# Query a position
+curl --get http://localhost:44348/query?fen=8/8/8/8/8/2K5/4Q3/7k_w_-_-
+```
+
+The JSON response with the position outcome is similar to the
+[Lichess tablebase API](https://lichess.org/api#tag/tablebase):
+
+```json
+{
+  "checkmate": false,
+  "stalemate": false,
+  "insufficient_material": false,
+  "dtc": 9,
+  "conversion": "capture",
+  "category": "win"
+}
+```
+
 ## Design and implementation
 
 - [Scope](#scope)

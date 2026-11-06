@@ -2,6 +2,7 @@
 name = "chess-egt"
 version = "0.1.0"
 edition = "2024"
+default-run = "chess-egt"
 
 [dependencies]
 rayon = "1.11"
@@ -15,9 +16,13 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
 object_store = { version = "0.14.2", features = ["aws", "azure", "gcp", "http"] }
-tokio = { version = "1", features = ["rt-multi-thread", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync"] }
+axum = "0.8"
 url = "2"
 bytes = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 shakmaty = { git = "https://github.com/gr-g/shakmaty", rev = "aac0926906820065421964bb98b12c3bbe51829e" }
@@ -25,6 +30,10 @@ shakmaty = { git = "https://github.com/gr-g/shakmaty", rev = "aac092690682006542
 [[bin]]
 name = "chess-egt"
 path = "src/bin/main.rs"
+
+[[bin]]
+name = "chess-egt-server"
+path = "src/bin/server.rs"
 
 [profile.release]
 # Tablebase generation is dominated by small hot functions spread across this

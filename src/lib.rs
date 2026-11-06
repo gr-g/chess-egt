@@ -267,8 +267,8 @@ impl EgtProber {
         load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)
     }
 
-    /// Probes a position.
-    pub fn probe(&mut self, position: &Chess) -> EgtResult<DtcOutcome> {
+    /// Probes a position using the internally synchronized shared cache.
+    pub fn probe(&self, position: &Chess) -> EgtResult<DtcOutcome> {
         self.cache.probe_direct_outcome(position)
     }
 
@@ -874,7 +874,7 @@ mod tests {
         use shakmaty::{CastlingMode, fen::Fen};
 
         let dir = TestDir::new("probing_castling_rights");
-        let mut prober = EgtProber::new(&dir.0).unwrap();
+        let prober = EgtProber::new(&dir.0).unwrap();
         for (board, rights) in [
             ("4k3/8/8/8/8/8/8/4K2R", "K"),
             ("4k3/8/8/8/8/8/8/R3K3", "Q"),
