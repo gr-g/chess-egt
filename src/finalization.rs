@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use crate::egt::Egt;
-use crate::egt_file::{DEFAULT_COMPRESSION_LEVEL, EgtFileReader, MaybeDtcOutcome};
+use crate::egt_file::{COMPRESSION_LEVEL, EgtFileReader, MaybeDtcOutcome};
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::finalization_stats::{EgtStatsBuilder, TableStats};
@@ -22,7 +22,7 @@ fn finalize_batch(
 ) -> EgtResult<(CompressedSegment, TableStats)> {
     let mut data = Vec::new();
     let mut encoder = zeekstd::EncodeOptions::new()
-        .compression_level(DEFAULT_COMPRESSION_LEVEL)
+        .compression_level(COMPRESSION_LEVEL)
         .into_encoder(&mut data)?;
     let mut plain = Vec::with_capacity(frame_size.min(values.len()));
     let mut stats = TableStats::default();

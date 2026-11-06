@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
-use crate::egt_file::DEFAULT_COMPRESSION_LEVEL;
+use crate::egt_file::COMPRESSION_LEVEL;
 use crate::egt_file::{EgtFileReader, MaybeDtcOutcome, transpose_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
@@ -109,7 +109,7 @@ impl EgtFileWriter {
 
         let mut data = Vec::new();
         let mut encoder = zeekstd::EncodeOptions::new()
-            .compression_level(DEFAULT_COMPRESSION_LEVEL)
+            .compression_level(COMPRESSION_LEVEL)
             .into_encoder(&mut data)?;
         for chunk in values.chunks(self.frame_size) {
             encode_frame(&mut encoder, chunk)?;
@@ -236,7 +236,7 @@ mod tests {
         let values: Vec<_> = (0..file.index_range)
             .map(|i| [MaybeDtcOutcome::DRAW, MaybeDtcOutcome::INVALID][i % 2])
             .collect();
-        let options = || zeekstd::EncodeOptions::new().compression_level(DEFAULT_COMPRESSION_LEVEL);
+        let options = || zeekstd::EncodeOptions::new().compression_level(COMPRESSION_LEVEL);
         let mut expected = Vec::new();
         let mut serial = options().into_encoder(&mut expected).unwrap();
         for frame in values.chunks(writer.frame_size) {
@@ -325,7 +325,7 @@ mod tests {
             .collect();
         let mut expected = Vec::new();
         let mut encoder = zeekstd::EncodeOptions::new()
-            .compression_level(DEFAULT_COMPRESSION_LEVEL)
+            .compression_level(COMPRESSION_LEVEL)
             .into_encoder(&mut expected)
             .unwrap();
         for chunk in values.chunks(file.frame_size) {

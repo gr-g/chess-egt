@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use crate::storage::FRAME_SIZE;
 
 // Compression level used when storing data on disk.
-pub(crate) const DEFAULT_COMPRESSION_LEVEL: i32 = 19;
+pub(crate) const COMPRESSION_LEVEL: i32 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaybeDtcOutcome(pub u16);
@@ -633,7 +633,7 @@ impl EgtFileReader {
         self.location.ensure_format()?;
         let mut compressed = Vec::new();
         let mut encoder = EncodeOptions::new()
-            .compression_level(DEFAULT_COMPRESSION_LEVEL)
+            .compression_level(COMPRESSION_LEVEL)
             .into_encoder(&mut compressed)?;
 
         // Complete encoding before publication so disk-backed input stays readable.
