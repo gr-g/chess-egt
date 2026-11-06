@@ -9,17 +9,20 @@
 //!
 //! - Only for symmetric pawn tables, a horizontal mirroring is applied if needed
 //!   to make sure the kings are in the correct order.
-//! - The indexer checks whether a legal en passant capture is available. A raw EP
-//!   square without a legal capture is equivalent to no EP.
-//! - If so, it selects the corresponding sub-table. The SNTM target pawn is the
-//!   highest pawn on its file in STM-normalized ranks, fixed on rank 5. Its
-//!   presence is implicit in the pawn group's combinatorial encoding, but it
-//!   still participates in occupied-square compaction. The remaining pawns on
-//!   that file can only occupy ranks 2–4.
 //! - The board position of each piece is converted into coordinates
 //!   `(rank, file)`.
 //! - For each file, pawns are gathered in descending rank order on that file
-//!   (irrespective of side) and form a group.
+//!   (irrespective of side) and form a group. Their files and color order are
+//!   fixed by the table; only their ranks contribute to the pawn index.
+//! - The indexer checks whether a legal en passant capture is available. A raw EP
+//!   square without a legal capture is equivalent to no EP.
+//! - The pawn ranks and en passant file select a slice through a precomputed
+//!   mapping. All combinations of pawn ranks 2–7 are enumerated, with en passant
+//!   variants immediately following the corresponding no-EP configuration.
+//!   An EP variant requires an SNTM victim as the highest pawn on its file,
+//!   fixed on rank 5, and an adjacent STM pawn on rank 5. The remaining pawns on
+//!   the victim's file can only occupy ranks 2–4, leaving the double-push origin
+//!   and transit squares free of pawns.
 //! - If there are no pawns, the STM king position is restricted to 10 canonical
 //!   squares (representing one octant of the board) using horizontal, vertical,
 //!   and diagonal reflections. All other pieces are reflected accordingly to
@@ -36,29 +39,30 @@
 //!   compacted to remove "holes" caused by already occupied squares. For each
 //!   piece, its index is adjusted by subtracting the number of preceding pieces
 //!   that occupy a lower square index. This maps the indices sequentially to
-//!   ranges `[0..64, 0..63, 0..62, 0..61, ...]`.
-//! - Pawns are restricted to ranks 2-7 (6 possible squares on their designated
-//!   file). Their positions are converted to compact indices in `0..6` (or `0..3`
-//!   in case of en passant).
-//! - A group of `k` pawns on a file is encoded together using `C(6, k)`
-//!   indices (or `C(3, k - 1)` in case of en passant), where `C(n, k)` denotes
-//!   the binomial coefficient "n choose k".
+//!   ranges `[0..64, 0..63, 0..62, 0..61, ...]`. All pawns, including the EP
+//!   victim, participate in this compaction before the non-pawns.
 //! - For pawnless endgames, a precomputed lookup table (`KINGS_MAP`) maps valid
 //!   canonical king pairs (excluding adjacent or identical squares) to a single
 //!   index in `0..462`; symmetric pawn tables encode the two kings as a single
 //!   group of two identical pieces.
-//! - Groups of pieces are encoded together into a single integer using a
-//!   mixed-radix system. A group of `k` pieces contributes `C(n, k)`
-//!   combinations among `n` available squares.
+//! - Groups of non-pawn pieces are encoded together into a single integer using
+//!   a mixed-radix system. A group of `k` pieces contributes `C(n, k)`
+//!   combinations among `n` available squares, where `C(n, k)` denotes the
+//!   binomial coefficient "n choose k".
 //! - The combination index for these `k` pieces with compacted indices
 //!   `c_0 > c_1 > ... > c_(k-1)` is computed using the combinatorial number
 //!   system (combinadics): `group_index = sum(C(c_j, k - j), j = 0..k)`,
 //!   where the upper bound `k` is exclusive.
 //! - These group indices are then combined using a mixed-radix base where the
 //!   multiplier for each group is the total number of combinations of the
-//!   subsequent groups.
-//! - The resulting index specific to the selected (en passant-specific) sub-table
-//!   is then mapped to a table-specific index.
+//!   subsequent groups. The number of non-pawn combinations is the same for
+//!   every pawn slice, regardless of the pawn ranks or en passant status.
+//! - The resulting index specific to the selected pawn slice is then mapped to
+//!   a table-specific index: `pawn_index * nonpawn_combinations + nonpawn_index`.
+//!   For pawnless tables, the pawn index is zero.
+//!
+//! Decoding reverses these steps. Indices whose positions have opposite check,
+//! occupied EP path squares, or no legal EP capture are rejected during validation.
 
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
@@ -66,6 +70,7 @@ use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 use crate::error::EgtResult;
 use crate::table_id::PawnKey;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 
 // Precompute the values of the binomial coefficients C(n, k) and
@@ -166,62 +171,78 @@ static KINGS_MAP: std::sync::LazyLock<KingsMap> = std::sync::LazyLock::new(|| {
 });
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum IndexerGroup {
-    Material(EgtElement),
+pub enum IndexerPieceKind {
+    Pieces { role: Role, side: EgtSide },
     // Distinct colors: a pawnless lookup, or an ordered two-square combination.
     KingPair,
 }
 
-// An encoding group together with its derived indexing metadata.
+// A non-pawn group together with its derived indexing metadata.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexerElement {
-    pub group: IndexerGroup,
+pub struct IndexerPieceGroup {
+    pub kind: IndexerPieceKind,
 
-    // How many pieces in the group are encoded explicitly (excluding an EP victim).
-    pub encoded_multiplicity: usize,
-
-    // The number of squares that these pieces can occupy.
     pub n_squares: usize,
-
-    // The number of ways to put the pieces on the available squares.
-    // N_CHOOSE_K[encoded_multiplicity][n_squares], except for the pawnless king lookup.
     pub combinations: usize,
-
-    // The indices (begin, end) where information about these pieces is
-    // stored in the buffer vectors. Normally
-    //   span.1 - span.0 = encoded_multiplicity,
-    // unless we are encoding en passant positions and one of the pieces
-    // here is a pawn that can be captured en passant. In that case the
-    // encoded_multiplicity is reduced by one since the pawn that can be captured
-    // en passant is not encoded explicitly.
+    // Coordinate slots occupied by the group.
     pub span: (usize, usize),
 }
 
-// Positions where en passant is possible are encoded separately from positions
-// where en passant is not possible. One instance of this struct represents one
-// option for the en passant status of positions, together with the range of
-// indices associated to these positions.
-// Each option carries its own pre-adjusted `piece_set`, with the `encoded_multiplicity`,
-// `n_squares` and `combinations` of the pawn group on the en passant file
-// already reduced to reflect the constraints imposed by that option (the pawn
-// on the 5th rank is not encoded, and the remaining pawns on that file cannot
-// occupy the 5th, 6th or 7th rank). `span` is kept at its original value so that
-// the ep-pawn slot stays reserved in the buffers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnpassantOption {
-    // The file of the en passant pawn if en passant is possible, or None.
-    // The rank is implicit: from the side-to-move's perspective, the en
-    // passant pawn is always on the 5th rank.
-    pub file: Option<File>,
+type PawnRanks = (ArrayVec<u8, 6>, Option<u8>);
 
-    // The piece set adjusted for this en passant option.
-    pub piece_set: Vec<IndexerElement>,
+#[derive(Clone, Debug)]
+struct IndexerPawnGroup {
+    file: File,
+    order: ArrayVec<EgtSide, 6>,
+    span: (usize, usize),
+}
 
-    // The start of the range used to encode positions with this en passant status.
-    pub range_start: usize,
+#[derive(Clone, Debug)]
+struct PawnMap {
+    to_index: HashMap<PawnRanks, usize>,
+    from_index: Vec<PawnRanks>,
+}
 
-    // The end of the range used to encode positions with this en passant status.
-    pub range_end: usize,
+impl PawnMap {
+    fn new(groups: &[IndexerPawnGroup]) -> Self {
+        let mut map = Self { to_index: HashMap::new(), from_index: Vec::new() };
+        map.enumerate(groups, 0, &mut ArrayVec::new());
+        map
+    }
+
+    fn enumerate(&mut self, groups: &[IndexerPawnGroup], group: usize, ranks: &mut ArrayVec<u8, 6>) {
+        if group < groups.len() {
+            let k = groups[group].order.len();
+            for mask in 0u8..64 {
+                if mask.count_ones() as usize != k { continue; }
+                let start = ranks.len();
+                ranks.extend((1u8..=6).rev().filter(|rank| mask & (1 << (rank - 1)) != 0));
+                self.enumerate(groups, group + 1, ranks);
+                ranks.truncate(start);
+            }
+            return;
+        }
+        self.insert((ranks.clone(), None));
+        for victim in groups {
+            // The highest pawn must be the victim, leaving ranks 6 and 7 empty.
+            if ranks[victim.span.0] != 4 || victim.order.last() != Some(&EgtSide::SideNotToMove) {
+                continue;
+            }
+            let has_capturer = groups.iter().any(|neighbor| {
+                victim.file.to_usize().abs_diff(neighbor.file.to_usize()) == 1
+                    && ranks[neighbor.span.0..neighbor.span.1].iter().zip(neighbor.order.iter().rev())
+                        .any(|(&rank, &side)| rank == 4 && side == EgtSide::SideToMove)
+            });
+            if has_capturer {
+                self.insert((ranks.clone(), Some(victim.file.to_u32() as u8)));
+            }
+        }
+    }
+
+    fn insert(&mut self, configuration: PawnRanks) {
+        self.to_index.insert(configuration.clone(), self.from_index.len());
+        self.from_index.push(configuration);
+    }
 }
 
 // Stack-allocated buffers used to encode/decode positions without heap allocation.
@@ -239,9 +260,6 @@ pub struct Indexer {
     // The number of pawns in the endgame.
     pub n_pawns: usize,
 
-    // The number of occupied pawn files (one ordered group per file).
-    pub n_pawn_groups: usize,
-
     // The total number of positions indexed in this endgame table.
     pub index_range: usize,
 
@@ -254,8 +272,10 @@ pub struct Indexer {
     // Spans of repeated non-pawn coordinates.
     repeated_piece_spans: ArrayVec<(usize, usize), MAX_PIECES>,
 
-    // The following field provides information on the en passant status.
-    ep_options: Vec<EnpassantOption>,
+    pawns: Vec<IndexerPawnGroup>,
+    nonpawns: Vec<IndexerPieceGroup>,
+    pawn_map: Option<PawnMap>,
+    nonpawn_combinations: usize,
 
     // For pawnless endgames, the number of combinations of all pieces after the
     // two kings. The king pair index is the quotient of the index by this value,
@@ -268,89 +288,55 @@ impl Indexer {
     /// other role/side groups. The element multiplicities describe physical pieces.
     pub fn from_elements(elements: &[EgtElement]) -> EgtResult<Self> {
         validate_elements(elements)?;
+        let mut elements = elements.to_vec();
+        elements.sort();
         let n_pieces = elements.iter().map(EgtElement::multiplicity).sum();
         let n_pawns = elements.iter().filter_map(|element| match element {
             EgtElement::PawnGroup { order, .. } => Some(order.len()),
-            EgtElement::PieceGroup { .. } => None,
+            _ => None,
         }).sum();
-        let n_pawn_groups = elements.iter().filter(|element| matches!(element, EgtElement::PawnGroup { .. })).count();
-        let symmetric_pawns = n_pawns > 0 && PawnKey::from_elements(elements).is_symmetric();
-
-        let mut elements = elements.to_vec();
-        elements.sort();
-        let mut piece_set: Vec<_> = elements.into_iter().map(|element| IndexerElement {
-            encoded_multiplicity: element.multiplicity(),
-            group: IndexerGroup::Material(element),
-            n_squares: 0,
-            combinations: 0,
-            span: (0, 0),
-        }).collect();
-
-        if n_pawns == 0 || symmetric_pawns {
-            piece_set[n_pawn_groups].group = IndexerGroup::KingPair;
-            piece_set[n_pawn_groups].encoded_multiplicity = 2;
-            piece_set.remove(n_pawn_groups + 1);
-        }
-
-        // Compute n_squares, combinations, span.
-        Self::compute_piece_squares(&mut piece_set);
-        let repeated_piece_spans = piece_set[n_pawn_groups..].iter()
-                    .filter(|p| p.span.1 - p.span.0 > 1 && p.group != IndexerGroup::KingPair)
-                    .map(|p| (p.span.0, p.span.1))
-                    .collect();
+        let symmetric_pawns = n_pawns > 0 && PawnKey::from_elements(&elements).is_symmetric();
+        let mut pawns = Vec::new();
+        let mut nonpawns = Vec::new();
         let mut pieces_if_white_is_stm = ArrayVec::new();
-        for p in &piece_set {
-            let (role, sides): (_, ArrayVec<_, MAX_PIECES>) = match &p.group {
-                IndexerGroup::Material(EgtElement::PawnGroup { order, .. }) => (Role::Pawn, order.iter().rev().copied().collect()),
-                IndexerGroup::Material(EgtElement::PieceGroup { role, side, multiplicity }) => (*role, std::iter::repeat_n(*side, *multiplicity).collect()),
-                IndexerGroup::KingPair => (Role::King, [EgtSide::SideToMove, EgtSide::SideNotToMove].into_iter().collect()),
+        for element in elements {
+            let start = pieces_if_white_is_stm.len();
+            let (role, sides): (_, ArrayVec<_, MAX_PIECES>) = match element {
+                EgtElement::PawnGroup { file, order } => {
+                    let sides = order.iter().rev().copied().collect();
+                    pawns.push(IndexerPawnGroup { file, span: (start, start + order.len()), order });
+                    (Role::Pawn, sides)
+                }
+                EgtElement::PieceGroup { role, side, multiplicity } => {
+                    nonpawns.push(IndexerPieceGroup {
+                        kind: IndexerPieceKind::Pieces { role, side },
+                        span: (start, start + multiplicity), n_squares: 0, combinations: 0,
+                    });
+                    (role, std::iter::repeat_n(side, multiplicity).collect())
+                }
             };
             pieces_if_white_is_stm.extend(sides.into_iter().map(|side| Piece {
-                role,
-                color: if side == EgtSide::SideToMove { Color::White } else { Color::Black },
+                role, color: if side == EgtSide::SideToMove { Color::White } else { Color::Black },
             }));
         }
-
-        let combinations_without_ep = piece_set.iter().map(|p| p.combinations).product();
-
-        // Check en passant options.
-        let ep_options = Self::setup_ep_options(&piece_set, n_pawn_groups, combinations_without_ep);
-
-        //println!("pieces: {:?}", &piece_set);
-        //println!("ep_options: {:?}", &ep_options);
-
-        let index_range = ep_options.last().unwrap().range_end;
-
-        // The pawnless king-pair lookup is the leading factor of 462.
+        let pawn_map = (n_pawns > 0).then(|| PawnMap::new(&pawns));
+        if n_pawns == 0 || symmetric_pawns {
+            nonpawns[0].kind = IndexerPieceKind::KingPair;
+            nonpawns[0].span.1 = nonpawns[1].span.1;
+            nonpawns.remove(1);
+        }
+        Self::compute_piece_squares(&mut nonpawns, n_pawns);
+        let repeated_piece_spans = nonpawns.iter()
+            .filter(|p| p.span.1 - p.span.0 > 1 && p.kind != IndexerPieceKind::KingPair)
+            .map(|p| p.span).collect();
+        let nonpawn_combinations = nonpawns.iter().map(|p| p.combinations).product::<usize>();
+        let index_range = pawn_map.as_ref().map_or(1, |p| p.from_index.len()) * nonpawn_combinations;
         let nonking_combinations = if n_pawns == 0 {
-            piece_set[1..].iter().map(|p| p.combinations).product()
-        } else {
-            0
-        };
-
-        Ok(Indexer {
-            n_pieces,
-            n_pawns,
-            n_pawn_groups,
-            index_range,
-            symmetric_pawns,
-            pieces_if_white_is_stm,
-            repeated_piece_spans,
-            ep_options,
-            nonking_combinations,
-        })
-    }
-
-    // Returns the piece set adjusted for the given en passant option.
-    #[inline]
-    fn piece_set(&self, ep_idx: usize) -> &Vec<IndexerElement> {
-        &self.ep_options[ep_idx].piece_set
-    }
-
-    // Returns the en passant option at the given index.
-    #[inline]
-    fn ep_option(&self, ep_idx: usize) -> &EnpassantOption {
-        &self.ep_options[ep_idx]
+            nonpawns[1..].iter().map(|p| p.combinations).product()
+        } else { 0 };
+        Ok(Self { n_pieces, n_pawns, index_range, symmetric_pawns,
+            pieces_if_white_is_stm, repeated_piece_spans, pawns, nonpawns, pawn_map,
+            nonpawn_combinations, nonking_combinations })
     }
 
     // Builds a `CoordBuf` pre-filled with `(0, 0)` for `n` pieces.
@@ -365,76 +351,18 @@ impl Indexer {
         (0..n).map(|_| 0).collect()
     }
 
-    fn compute_piece_squares(piece_set: &mut[IndexerElement]) {
-        let mut available_squares = 64;
-        let mut pawnless = true;
-        let mut span_end = 0;
-        for p in piece_set.iter_mut() {
-            let k = p.encoded_multiplicity;
-            if matches!(&p.group, IndexerGroup::Material(EgtElement::PawnGroup { .. })) {
-                pawnless = false;
-                p.n_squares = 6;
-                debug_assert!(p.n_squares >= k);
-            } else {
-                p.n_squares = available_squares;
-            }
-            available_squares -= k;
+    fn compute_piece_squares(nonpawns: &mut [IndexerPieceGroup], n_pawns: usize) {
+        let mut available_squares = 64 - n_pawns;
+        for p in nonpawns.iter_mut() {
+            let k = p.span.1 - p.span.0;
+            p.n_squares = available_squares;
             p.combinations = N_CHOOSE_K[k][p.n_squares];
-            p.span.0 = span_end;
-            p.span.1 = p.span.0 + k;
-            span_end = p.span.1;
+            available_squares -= k;
         }
-        if pawnless {
-            debug_assert_eq!(piece_set[0].group, IndexerGroup::KingPair);
-            // This group uses the king-pair lookup rather than combinadics.
-            piece_set[0].n_squares = N_KING_PAIRS;
-            piece_set[0].combinations = N_KING_PAIRS;
+        if n_pawns == 0 {
+            nonpawns[0].n_squares = N_KING_PAIRS;
+            nonpawns[0].combinations = N_KING_PAIRS;
         }
-    }
-
-    fn setup_ep_options(base_piece_set: &[IndexerElement], n_pawn_groups: usize, combinations_without_ep: usize) -> Vec<EnpassantOption> {
-        let mut ep_options = vec![EnpassantOption {
-            file: None,
-            piece_set: base_piece_set.to_vec(),
-            range_start: 0,
-            range_end: combinations_without_ep,
-        }];
-        let mut range_start = combinations_without_ep;
-        let pawns = &base_piece_set[..n_pawn_groups];
-        for (i, pawn) in pawns.iter().enumerate() {
-            let IndexerGroup::Material(EgtElement::PawnGroup { file, order }) = &pawn.group else { unreachable!() };
-            // The double-pushed pawn is highest on its file. Its starting and
-            // transit squares must be empty, leaving ranks 2..4 for other pawns.
-            if order.last() != Some(&EgtSide::SideNotToMove) || order.len() > 4 {
-                continue;
-            }
-            let has_neighbor = pawns.iter().any(|p| {
-                let IndexerGroup::Material(EgtElement::PawnGroup { file: other_file, order }) = &p.group else { unreachable!() };
-                file.to_usize().abs_diff(other_file.to_usize()) == 1
-                    && order.contains(&EgtSide::SideToMove)
-            });
-            if !has_neighbor {
-                continue;
-            }
-
-            let mut option_piece_set = base_piece_set.to_vec();
-            let p = &mut option_piece_set[i];
-            // Keep the full order and span, reserving their first (highest) slot
-            // for the victim. Only the remaining pawns contribute to the radix.
-            p.encoded_multiplicity -= 1;
-            p.n_squares = 3;
-            p.combinations = N_CHOOSE_K[p.encoded_multiplicity][p.n_squares];
-            let combinations = combinations_without_ep / pawn.combinations * p.combinations;
-            let range_end = range_start + combinations;
-            ep_options.push(EnpassantOption {
-                file: Some(*file),
-                piece_set: option_piece_set,
-                range_start,
-                range_end,
-            });
-            range_start = range_end;
-        }
-        ep_options
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
@@ -468,58 +396,44 @@ impl Indexer {
     }
 
     fn encode_position<const REFLECTED: bool>(&self, position: &Chess) -> usize {
-        let ep_file = position.legal_ep_square().map(|sq| {
-            if REFLECTED { sq.flip_horizontal().file() } else { sq.file() }
+        let mut coord = Self::filled_coord(self.n_pieces);
+        let mut pidx = Self::filled_pidx(self.n_pieces);
+        self.position_to_coord::<REFLECTED>(&mut coord, position);
+        // Now `coord` has the coordinates (rank, file) of the pieces, with
+        // pawns first and their ranks normalized to the side to move.
+
+        let pawn_index = self.pawn_map.as_ref().map_or(0, |pawn_map| {
+            let ranks = coord[..self.n_pawns].iter().map(|&(r, _)| r as u8).collect();
+            let ep = position.legal_ep_square().map(|sq| {
+                (if REFLECTED { sq.flip_horizontal() } else { sq }).file().to_u32() as u8
+            });
+            pawn_map.to_index[&(ranks, ep)]
         });
-        let (index_offset, ep_idx) = self.adjust_ep_from_position(ep_file);
-        // Now the en passant option reflects the en passant status of the position.
-        // If there are pawns on the en passant file (different from the en passant
-        // pawn on the 5th rank), they will be encoded with indices in 0..3 instead of 0..6.
+        // Now `pawn_index` selects the slice for these pawn ranks and legal
+        // en passant status, or is zero for a pawnless table.
 
-        let mut buffer_coord = Self::filled_coord(self.n_pieces);
-        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+        if self.n_pawns == 0 { self.reduce_symmetries(&mut coord); }
+        // For pawnless tables, the STM king is now restricted to 10 squares.
 
-        self.position_to_coord::<REFLECTED>(ep_idx, &mut buffer_coord, position);
-        // Now `buffer_coord` has the coordinates (rank, file) of the pieces.
-        //println!("buffer_coord: {:?}", buffer_coord);
+        self.sort_coord_repeated_pieces(&mut coord);
+        // Now `coord` has the sorted coordinates for repeated non-pawn pieces.
 
-        if self.n_pawns == 0 {
-            self.reduce_symmetries(&mut buffer_coord);
-            // Now the first item in `buffer_coord` has coordinates restricted to 10 squares.
-            //println!("buffer_coord: {:?}", buffer_coord);
-        }
+        self.coord_to_pidx(&coord, &mut pidx);
+        // Now `pidx` has the square indices, with non-overlapping values in
+        // [0..64, 0..64, 0..64, ...].
 
-        self.sort_coord_repeated_pieces(&mut buffer_coord);
-        // Now `buffer_coord` has the sorted coordinates for repeated pieces.
-        //println!("buffer_coord: {:?}", buffer_coord);
+        Self::compact_pidx(&mut pidx);
+        // Now `pidx` has compact position indices in [0..64, 0..63, 0..62, ...].
+        // All pawns participate in compaction, but their indices are not used
+        // in the combinatorial encoding of the remaining pieces.
 
-        self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
-        // Now `buffer_pidx` has the position indices, with
-        // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
-        //println!("buffer_pidx: {:?}", buffer_pidx);
+        if self.n_pawns == 0 { Self::map_kings(&mut pidx); }
+        // For pawnless tables, the first element now has a value in 0..462
+        // and encodes the position of both kings.
 
-        Self::compact_pidx(&mut buffer_pidx);
-        // Now `buffer_pidx` has compact positions indices, with
-        // values in [0..64, 0..63, 0..62, 0..61, ...].
-        //println!("buffer_pidx: {:?}", buffer_pidx);
-
-        if self.n_pawns > 0 {
-            self.pawn_pidx_to_cpidx(ep_idx, &buffer_coord, &mut buffer_pidx);
-            // Now the first `n_pawns` elements of `buffer_pidx` have
-            // the pawn positions encoded in 0..6 (or 0..3), so the value
-            // ranges look like [0..6, 0..6, 0..62, 0..61, ...].
-            // The positions of pawns on the same file are non-overlapping.
-            //println!("buffer_pidx: {:?}", buffer_pidx);
-        } else {
-            Self::map_kings(&mut buffer_pidx);
-            // Now the first element in `buffer_pidx` has values in 0..462
-            // and encodes the position of both kings.
-            //println!("buffer_pidx: {:?}", buffer_pidx);
-        }
-
-        // Now that we have all compact position indices in `buffer_pidx`,
-        // we can aggregate them into a single value.
-        index_offset + self.cpidx_to_index(ep_idx, &buffer_pidx)
+        // Aggregate the non-pawn indices into a within-slice index, then apply
+        // the offset for the selected pawn slice to obtain the table index.
+        pawn_index * self.nonpawn_combinations + self.cpidx_to_index(&pidx)
     }
 
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
@@ -543,64 +457,52 @@ impl Indexer {
     }
 
     /// Decode an in-range index, retaining its rejection reason for initialization.
-    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
+    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
         crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
     }
 
     // The caller must enforce the index range before decoding.
     fn setup_from_index(&self, index: usize, side_to_move: Color) -> Setup {
         debug_assert!(index < self.index_range);
-        let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
-        // Now the en passant option reflects the en passant status as encoded in the index.
-        // If there are pawns on the en passant file (different from the en passant
-        // pawn on the 5th rank), they will be decoded from indices in 0..3 instead of 0..6.
+        let mut coord = Self::filled_coord(self.n_pieces);
+        let mut pidx = Self::filled_pidx(self.n_pieces);
+        self.index_to_cpidx(&mut pidx, index % self.nonpawn_combinations);
+        // Now `pidx` has the compact non-pawn indices for the selected slice.
+        // The quotient of `index` identifies the pawn configuration; the
+        // remainder above encodes only the non-pawn placement within that slice.
 
-        let mut buffer_coord = Self::filled_coord(self.n_pieces);
-        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+        let ep_file = if let Some(pawn_map) = &self.pawn_map {
+            let (ranks, ep) = &pawn_map.from_index[index / self.nonpawn_combinations];
+            for group in &self.pawns {
+                for i in group.span.0..group.span.1 {
+                    coord[i] = (ranks[i] as usize, group.file.to_usize());
+                    pidx[i] = self.square_index(coord[i]);
+                }
+            }
+            // Now the first `n_pawns` elements of `coord` are correct, and
+            // their entries in `pidx` are raw square indices in 0..64.
 
-        self.index_to_cpidx(ep_idx, &mut buffer_pidx, index - index_offset);
-
-        if self.n_pawns > 0 {
-            self.pawn_cpidx_to_pidx(ep_idx, &mut buffer_coord, &mut buffer_pidx);
-            Self::compact_pidx(&mut buffer_pidx[0..self.n_pawns]);
-            // Now the first `n_pawns` elements of buffer_coord are correct, and `buffer_pidx`
-            // has values in [0..64, 0..63, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", buffer_pidx);
+            Self::compact_pidx(&mut pidx[..self.n_pawns]);
+            // Now the pawn prefix is compacted too, so all of `pidx` has
+            // values in [0..64, 0..63, 0..62, ...].
+            ep.map(|file| File::new(file as u32))
         } else {
-            // `buffer_pidx` has values in [0..462, 0..1, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", buffer_pidx);
-            Self::unmap_kings(&mut buffer_pidx);
-            // Now `buffer_pidx` has values in [0..64, 0..63, 0..62, 0..61, ...].
-            //println!("buffer_pidx: {:?}", buffer_pidx);
-        }
+            Self::unmap_kings(&mut pidx);
+            // Now `pidx` has values in [0..64, 0..63, 0..62, ...], with the
+            // king-pair lookup index replaced by two compact square indices.
+            None
+        };
 
-        Self::uncompact_cpidx(&mut buffer_pidx);
-        // Now `buffer_pidx` has the positions indices, with
-        // non-overlapping values in [0..64, 0..64, 0..64, 0..64, ...].
-        //println!("buffer_pidx: {:?}", buffer_pidx);
+        Self::uncompact_cpidx(&mut pidx);
+        // Now `pidx` has raw square indices, with non-overlapping values in
+        // [0..64, 0..64, 0..64, ...].
 
-        self.nonpawn_pidx_to_coord(&mut buffer_coord, &buffer_pidx);
-        // Now the non-pawn part of `buffer_coord` is correct.
-        //println!("buffer_coord: {:?}", buffer_coord);
+        self.nonpawn_pidx_to_coord(&mut coord, &pidx);
+        // Now the non-pawn part of `coord` is correct too.
 
-        // All coordinates are in `buffer_coord`, we can place the pieces to create a new position.
-        self.coord_to_setup(ep_idx, &buffer_coord, side_to_move)
-    }
-
-    // Checks whether the position allows en passant and selects the corresponding
-    // en passant option. Returns the index offset to apply to the encoded value
-    // and the index of the selected en passant option.
-    fn adjust_ep_from_position(&self, ep_file: Option<File>) -> (usize, usize) {
-        let ep_idx = self.ep_options.iter().position(|opt| opt.file == ep_file).unwrap();
-        (self.ep_options[ep_idx].range_start, ep_idx)
-    }
-
-    // Checks to which en passant option this index corresponds and selects it.
-    // Returns the index offset to apply to decode the value and the index of the
-    // selected en passant option.
-    fn adjust_ep_from_index(&self, index: usize) -> (usize, usize) {
-        let ep_idx = self.ep_options.iter().position(|ep| index < ep.range_end).unwrap();
-        (self.ep_options[ep_idx].range_start, ep_idx)
+        // All coordinates are in `coord`; place the pieces and restore the
+        // en passant status to create the setup for the requested side to move.
+        self.coord_to_setup(ep_file, &coord, side_to_move)
     }
 
     // Pawnless positions are reduced to a canonical form through rotations and reflections
@@ -626,17 +528,14 @@ impl Indexer {
         // which is the leading factor of the mixed-radix encoding. Recovering it
         // with a single division rejects the common case without paying for a
         // full decode of the index.
-        debug_assert_eq!(self.ep_options.len(), 1, "a pawnless endgame has no en passant options");
         if !KINGS_MAP.on_diagonal[index / self.nonking_combinations] {
             return None;
         }
 
-        let (index_offset, ep_idx) = self.adjust_ep_from_index(index);
-
         let mut buffer_coord = Self::filled_coord(self.n_pieces);
         let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
 
-        self.index_to_cpidx(ep_idx, &mut buffer_pidx, index - index_offset);
+        self.index_to_cpidx(&mut buffer_pidx, index);
         Self::unmap_kings(&mut buffer_pidx);
         Self::uncompact_cpidx(&mut buffer_pidx);
         self.nonpawn_pidx_to_coord(&mut buffer_coord, &buffer_pidx);
@@ -650,33 +549,34 @@ impl Indexer {
             self.coord_to_pidx(&buffer_coord, &mut buffer_pidx);
             Self::compact_pidx(&mut buffer_pidx);
             Self::map_kings(&mut buffer_pidx);
-            Some(self.cpidx_to_index(ep_idx, &buffer_pidx))
+            Some(self.cpidx_to_index(&buffer_pidx))
         } else {
             None
         }
     }
 
     // Extracts the coordinates of the pieces from the position and stores them in `buffer_coord`.
-    fn position_to_coord<const REFLECTED: bool>(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, position: &Chess) {
+    fn position_to_coord<const REFLECTED: bool>(&self, buffer_coord: &mut CoordBuf, position: &Chess) {
         debug_assert_eq!(position.board().occupied().count(), self.n_pieces, "position_to_coord() called with a position that does not match the piece set");
-        for p in self.piece_set(ep_idx) {
-            match &p.group {
-                IndexerGroup::Material(EgtElement::PawnGroup { file, order }) => {
-                    // Descending normalized ranks: White descends squares, Black ascends.
-                    // Piece groups describe target files, not reflected source files.
-                    let source_file = if REFLECTED { File::new(7 - file.to_u32()) } else { *file };
-                    let mut bb = position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file);
-                    debug_assert_eq!(bb.count(), order.len(), "pawn file does not match the piece set");
-                    for (i, expected_side) in (p.span.0..p.span.1).zip(order.iter().rev()) {
-                        let square = if position.turn() == Color::Black { bb.pop_front() } else { bb.pop_back() }.unwrap();
-                        debug_assert_eq!(position.board().by_color(position.turn()).contains(square),
-                            *expected_side == EgtSide::SideToMove, "pawn color order does not match the piece set");
-                        let rank = square.rank().to_usize();
-                        let rank = if position.turn() == Color::Black { 7 - rank } else { rank };
-                        buffer_coord[i] = (rank, file.to_usize());
-                    }
-                }
-                IndexerGroup::Material(EgtElement::PieceGroup { role, side, .. }) => {
+        for group in &self.pawns {
+            let (file, order) = (&group.file, &group.order);
+            // Descending normalized ranks: White descends squares, Black ascends.
+            // Pawn groups describe target files, not reflected source files.
+            let source_file = if REFLECTED { File::new(7 - file.to_u32()) } else { *file };
+            let mut bb = position.board().by_role(Role::Pawn) & shakmaty::Bitboard::from_file(source_file);
+            debug_assert_eq!(bb.count(), order.len(), "pawn file does not match the piece set");
+            for (i, expected_side) in (group.span.0..group.span.1).zip(order.iter().rev()) {
+                let square = if position.turn() == Color::Black { bb.pop_front() } else { bb.pop_back() }.unwrap();
+                debug_assert_eq!(position.board().by_color(position.turn()).contains(square),
+                    *expected_side == EgtSide::SideToMove, "pawn color order does not match the piece set");
+                let rank = square.rank().to_usize();
+                let rank = if position.turn() == Color::Black { 7 - rank } else { rank };
+                buffer_coord[i] = (rank, file.to_usize());
+            }
+        }
+        for p in &self.nonpawns {
+            match &p.kind {
+                IndexerPieceKind::Pieces { role, side } => {
                     let color = if *side == EgtSide::SideToMove { position.turn() } else { !position.turn() };
                     let bb = position.board().by_role(*role) & position.board().by_color(color);
                     debug_assert_eq!(bb.count(), p.span.1 - p.span.0, "position_to_coord() called with a position that does not match the piece set");
@@ -687,7 +587,7 @@ impl Indexer {
                         buffer_coord[i] = (rank, square.file().to_usize());
                     }
                 }
-                IndexerGroup::KingPair => {
+                IndexerPieceKind::KingPair => {
                     for (i, color) in (p.span.0..p.span.1).zip([position.turn(), !position.turn()]) {
                         let square = position.board().king_of(color).unwrap();
                         let square = if REFLECTED { square.flip_horizontal() } else { square };
@@ -700,7 +600,7 @@ impl Indexer {
     }
 
     // Builds a setup using the coordinates stored in `buffer_coord`.
-    fn coord_to_setup(&self, ep_idx: usize, buffer_coord: &CoordBuf, side_to_move: Color) -> Setup {
+    fn coord_to_setup(&self, ep_file: Option<File>, buffer_coord: &CoordBuf, side_to_move: Color) -> Setup {
         let mut setup = Setup::empty();
         setup.turn = side_to_move;
         for (&(mut r, f), mut piece) in buffer_coord.iter().zip(self.pieces_if_white_is_stm.iter().copied()) {
@@ -712,7 +612,7 @@ impl Indexer {
             setup.board.set_piece_at(square, piece);
         }
 
-        setup.ep_square = if let Some(file) = self.ep_option(ep_idx).file {
+        setup.ep_square = if let Some(file) = ep_file {
             let target_rank = match side_to_move {
                 Color::White => Rank::Sixth,
                 Color::Black => Rank::Third,
@@ -726,7 +626,7 @@ impl Indexer {
 
     fn position_from_setup<const VALIDATE: bool>(setup: Setup) -> Option<Chess> {
         if VALIDATE {
-            crate::position::position_from_setup(setup).ok()
+            crate::position::position_from_setup(setup).expect("invalid indexing invariant").ok()
         } else {
             Some(Chess::from_setup_unchecked(setup, CastlingMode::Standard))
         }
@@ -817,29 +717,6 @@ impl Indexer {
         }
     }
 
-    // Converts pawn indices (pidx) to compact position indices (cpidx) in 0..6,
-    // where 0 indicates that the pawn is on the 2nd rank, 5 indicates that
-    // the pawn is on the 7th rank.
-    fn pawn_pidx_to_cpidx(&self, ep_idx: usize, buffer_coord: &CoordBuf, buffer_pidx: &mut PidxBuf) {
-        for p in &self.piece_set(ep_idx)[0..self.n_pawn_groups] {
-            for i in p.span.0..p.span.1 {
-                buffer_pidx[i] = buffer_coord[i].0 - 1;
-            }
-        }
-    }
-
-    // Converts compact position indices (cpidx) for pawns (in 0..6) to indices
-    // in 0..64, and converts these indices to piece coordinates.
-    fn pawn_cpidx_to_pidx(&self, ep_idx: usize, buffer_coord: &mut CoordBuf, buffer_pidx: &mut PidxBuf) {
-        for p in &self.piece_set(ep_idx)[0..self.n_pawn_groups] {
-            let IndexerGroup::Material(EgtElement::PawnGroup { file, .. }) = &p.group else { unreachable!() };
-            for i in p.span.0..p.span.1 {
-                buffer_coord[i] = (buffer_pidx[i] + 1, file.to_usize());
-                buffer_pidx[i] = self.square_index(buffer_coord[i]);
-            }
-        }
-    }
-
     fn map_kings(buffer_pidx: &mut PidxBuf) {
         buffer_pidx[0] = KINGS_MAP.to_index[buffer_pidx[0] * 64 + buffer_pidx[1]] as usize;
         debug_assert!(buffer_pidx[0] < N_KING_PAIRS, "kings on an invalid pair of squares");
@@ -850,10 +727,9 @@ impl Indexer {
         (buffer_pidx[0], buffer_pidx[1]) = KINGS_MAP.from_index[buffer_pidx[0]];
     }
 
-    // Computes the final index representing the position, by aggregating
-    // the values of the compact position indices (cpidx) into a single number.
-    fn cpidx_to_index(&self, ep_idx: usize, buffer_pidx: &PidxBuf) -> usize {
-        let groups = self.piece_set(ep_idx);
+    // Combines the compact non-pawn coordinates into the within-slice index.
+    fn cpidx_to_index(&self, buffer_pidx: &PidxBuf) -> usize {
+        let groups = &self.nonpawns;
         let (mut index, groups) = if self.n_pawns == 0 {
             // map_kings has already replaced the two coordinates with one lookup index.
             (buffer_pidx[0], &groups[1..])
@@ -863,7 +739,7 @@ impl Indexer {
         for p in groups {
             index *= p.combinations;
             let mut i = p.span.1;
-            for k in 1..=p.encoded_multiplicity {
+            for k in 1..=(p.span.1 - p.span.0) {
                 i -= 1;
                 debug_assert!(buffer_pidx[i] < p.n_squares); // valid cpidx
                 if k == 1 {
@@ -877,24 +753,17 @@ impl Indexer {
         index
     }
 
-    // Reads the index representing the piece configuration and writes the
-    // corresponding compact position indices (cpidx) to buffer_pidx:
-    // - pawn positions encoded with an index in 0..6
-    // - non-pawn positions encoded with an index representing the square to
-    //   occupy among the set of non-already-occupied squares.
-    fn index_to_cpidx(&self, ep_idx: usize, buffer_pidx: &mut PidxBuf, index: usize) {
+    // Decodes the within-slice index to non-pawn squares among the available
+    // squares. Pawnless tables additionally restore the king-pair lookup index.
+    fn index_to_cpidx(&self, buffer_pidx: &mut PidxBuf, index: usize) {
         let mut v = index;
-        let groups = self.piece_set(ep_idx);
+        let groups = &self.nonpawns;
         let groups = if self.n_pawns == 0 { &groups[1..] } else { groups.as_slice() };
         for p in groups.iter().rev() {
             let mut x = v % p.combinations;
             v /= p.combinations;
             let mut n = p.n_squares;
-            if p.span.1 - p.span.0 > p.encoded_multiplicity {
-                // There is a non-encoded en passant pawn.
-                buffer_pidx[p.span.0] = p.n_squares;
-            }
-            for k in (1..=p.encoded_multiplicity).rev() {
+            for k in (1..=(p.span.1 - p.span.0)).rev() {
                 if k == 1 {
                     buffer_pidx[p.span.1-1] = x;
                 } else {
@@ -925,8 +794,8 @@ mod tests {
     use shakmaty::PositionError;
     use EgtSide::{SideNotToMove as SNTM, SideToMove as STM};
 
-    fn coord_to_position(indexer: &Indexer, ep_idx: usize, coord: &CoordBuf, turn: Color) -> Option<Chess> {
-        Indexer::position_from_setup::<true>(indexer.coord_to_setup(ep_idx, coord, turn))
+    fn coord_to_position(indexer: &Indexer, ep_file: Option<File>, coord: &CoordBuf, turn: Color) -> Option<Chess> {
+        Indexer::position_from_setup::<true>(indexer.coord_to_setup(ep_file, coord, turn))
     }
 
     fn pawn_group(file: File, order: &[EgtSide]) -> EgtElement {
@@ -934,7 +803,7 @@ mod tests {
     }
 
     fn indexer(groups: &[EgtElement]) -> Indexer {
-        // Deliberately unsorted: the indexer must retain the old group order.
+        // Deliberately unsorted: the indexer must canonicalize the group order.
         let mut elements = vec![
             EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
             EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
@@ -943,7 +812,7 @@ mod tests {
         Indexer::from_elements(&elements).unwrap()
     }
 
-    // Independent oracle: retain Shakmaty's full validation and the old EP filter.
+    // Independent oracle: Shakmaty's full validation plus legal EP filtering.
     fn checked_position_from_setup(setup: Setup) -> Option<Chess> {
         let ep_square = setup.ep_square;
         setup.position::<Chess>(CastlingMode::Standard)
@@ -955,7 +824,7 @@ mod tests {
     fn assert_decoder_matches(indexer: &Indexer, index: usize, turn: Color) -> Option<Chess> {
         let expected = checked_position_from_setup(indexer.setup_from_index(index, turn));
         assert_eq!(indexer.position_from_index(index, turn), expected, "index {index}, {turn:?}");
-        assert_eq!(indexer.position_from_index_with_reason(index, turn).is_err(), expected.is_none(),
+        assert_eq!(indexer.position_from_index_with_reason(index, turn).unwrap().is_err(), expected.is_none(),
             "invalidity at index {index}, {turn:?}");
         if let Some(position) = &expected {
             assert_eq!(indexer.position_from_index_unchecked(index, turn), *position);
@@ -969,31 +838,32 @@ mod tests {
             let egt = crate::egt::Egt::from_tablename(name).unwrap();
             let indexer = &egt.indexer;
             assert!(indexer.symmetric_pawns, "{name}");
-            for option in &indexer.ep_options {
-                let kings = &option.piece_set[indexer.n_pawn_groups];
-                let n = 64 - indexer.n_pawns;
-                assert_eq!(kings.group, IndexerGroup::KingPair);
-                assert_eq!(kings.combinations, n * (n - 1) / 2);
-                let other_factors: usize = option.piece_set.iter()
-                    .filter(|p| p.group != IndexerGroup::KingPair)
-                    .map(|p| p.combinations).product();
-                assert_eq!(2 * (option.range_end - option.range_start), other_factors * n * (n - 1));
-                for turn in [Color::White, Color::Black] {
-                    let mut checked = 0;
-                    let stride = ((option.range_end - option.range_start) / 1024).max(1);
-                    for idx in (option.range_start..option.range_end).step_by(stride) {
-                        let Some(position) = assert_decoder_matches(indexer, idx, turn) else { continue };
-                        assert_eq!(indexer.position_to_index(&position), idx, "{name}, {idx}");
-                        let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
-                        setup.board.flip_horizontal();
-                        setup.ep_square = setup.ep_square.map(Square::flip_horizontal);
-                        let reflected = checked_position_from_setup(setup).unwrap();
-                        assert_eq!(indexer.position_to_index(&reflected), idx, "{name}, {idx}");
-                        assert_eq!(indexer.reflected_position_to_index(&position), idx);
-                        checked += 1;
-                    }
-                    assert!(checked > 0, "{name}, {:?}, {turn:?}", option.file);
+            let kings = &indexer.nonpawns[0];
+            let n = 64 - indexer.n_pawns;
+            assert_eq!(kings.kind, IndexerPieceKind::KingPair);
+            assert_eq!(kings.span, (indexer.n_pawns, indexer.n_pawns + 2));
+            assert_eq!(kings.combinations, n * (n - 1) / 2);
+            let other_factors: usize = indexer.nonpawns.iter()
+                .filter(|p| p.kind != IndexerPieceKind::KingPair)
+                .map(|p| p.combinations).product();
+            assert_eq!(2 * indexer.nonpawn_combinations, other_factors * n * (n - 1));
+            assert_eq!(indexer.index_range,
+                indexer.pawn_map.as_ref().unwrap().from_index.len() * indexer.nonpawn_combinations);
+            for turn in [Color::White, Color::Black] {
+                let mut checked = 0;
+                let stride = (indexer.index_range / 1024).max(1);
+                for idx in (0..indexer.index_range).step_by(stride) {
+                    let Some(position) = assert_decoder_matches(indexer, idx, turn) else { continue };
+                    assert_eq!(indexer.position_to_index(&position), idx, "{name}, {idx}");
+                    let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
+                    setup.board.flip_horizontal();
+                    setup.ep_square = setup.ep_square.map(Square::flip_horizontal);
+                    let reflected = checked_position_from_setup(setup).unwrap();
+                    assert_eq!(indexer.position_to_index(&reflected), idx, "{name}, {idx}");
+                    assert_eq!(indexer.reflected_position_to_index(&position), idx);
+                    checked += 1;
                 }
+                assert!(checked > 0, "{name}, {turn:?}");
             }
         }
     }
@@ -1006,19 +876,17 @@ mod tests {
             let mut accepted = 0;
             let mut rejected = 0;
             for turn in [Color::White, Color::Black] {
-                for option in &indexer.ep_options {
-                    // Exhaust the small tables, and sample each EP range in larger ones.
-                    let stride = if indexer.n_pieces <= 3 { 1 } else {
-                        ((option.range_end - option.range_start) / 4096).max(1)
-                    };
-                    for index in (option.range_start..option.range_end).step_by(stride)
-                        .chain(std::iter::once(option.range_end - 1))
-                    {
-                        if assert_decoder_matches(indexer, index, turn).is_some() {
-                            accepted += 1;
-                        } else {
-                            rejected += 1;
-                        }
+                // Exhaust the small tables, and sample larger ones.
+                let stride = if indexer.n_pieces <= 3 { 1 } else {
+                    (indexer.index_range / 4096).max(1)
+                };
+                for index in (0..indexer.index_range).step_by(stride)
+                    .chain(std::iter::once(indexer.index_range - 1))
+                {
+                    if assert_decoder_matches(indexer, index, turn).is_some() {
+                        accepted += 1;
+                    } else {
+                        rejected += 1;
                     }
                 }
                 assert_eq!(indexer.position_from_index(indexer.index_range, turn), None);
@@ -1076,12 +944,19 @@ mod tests {
                 let raw = Chess::from_setup_unchecked(setup.clone(), CastlingMode::Standard);
                 let mut coord = Indexer::filled_coord(indexer.n_pieces);
                 let mut pidx = Indexer::filled_pidx(indexer.n_pieces);
-                indexer.position_to_coord::<false>(1, &mut coord, &raw);
+                indexer.position_to_coord::<false>(&mut coord, &raw);
+                let ranks = coord[..indexer.n_pawns].iter().map(|&(r, _)| r as u8).collect();
+                let key = (ranks, Some(File::E.to_u32() as u8));
+                let pawn_map = indexer.pawn_map.as_ref().unwrap();
+                if coord[0].0 != 4 {
+                    assert!(!pawn_map.to_index.contains_key(&key), "{fen}, {turn:?}");
+                    continue;
+                }
+                let pawn_index = pawn_map.to_index[&key];
                 indexer.sort_coord_repeated_pieces(&mut coord);
                 indexer.coord_to_pidx(&coord, &mut pidx);
                 Indexer::compact_pidx(&mut pidx);
-                indexer.pawn_pidx_to_cpidx(1, &coord, &mut pidx);
-                let index = indexer.ep_option(1).range_start + indexer.cpidx_to_index(1, &pidx);
+                let index = pawn_index * indexer.nonpawn_combinations + indexer.cpidx_to_index(&pidx);
                 let decoded = indexer.setup_from_index(index, turn);
                 assert_eq!(decoded.board, setup.board, "{fen}");
                 assert_eq!(decoded.ep_square, setup.ep_square, "{fen}");
@@ -1128,39 +1003,46 @@ mod tests {
             for colors in 0usize..1 << k {
                 let order: ArrayVec<_, 6> = (0..k).map(|i| if colors & (1 << i) == 0 { STM } else { SNTM }).collect();
                 let indexer = indexer(&[pawn_group(File::E, &order)]);
-                let pawn = &indexer.piece_set(0)[0];
+                let pawn_map = indexer.pawn_map.as_ref().unwrap();
                 assert_eq!(indexer.n_pawns, k);
-                assert_eq!(indexer.n_pawn_groups, 1);
-                assert_eq!(pawn.combinations, N_CHOOSE_K[k][6]);
-                assert_eq!(pawn.span, (0, k));
-                assert_eq!(indexer.ep_options.len(), 1);
+                assert_eq!(indexer.pawns.len(), 1);
+                assert_eq!(indexer.pawns[0].file, File::E);
+                assert_eq!(indexer.pawns[0].order, order);
+                assert_eq!(indexer.pawns[0].span, (0, k));
+                assert_eq!(pawn_map.from_index.len(), N_CHOOSE_K[k][6]);
+                assert_eq!(pawn_map.to_index.len(), pawn_map.from_index.len());
                 let king_combinations = (64 - k) * (63 - k);
+                assert_eq!(indexer.nonpawn_combinations, king_combinations);
                 assert_eq!(indexer.index_range, N_CHOOSE_K[k][6] * king_combinations);
                 let mut seen = std::collections::BTreeSet::new();
                 for ranks in 1u32..64 {
                     if ranks.count_ones() as usize != k {
                         continue;
                     }
-                    let mut cpidx = Indexer::filled_pidx(k + 2);
                     let mut coord = Indexer::filled_coord(k + 2);
-                    for (i, rank) in (0..6).rev().filter(|r| ranks & (1 << r) != 0).enumerate() {
-                        cpidx[i] = rank;
-                        coord[i] = (rank + 1, File::E.to_usize());
+                    let normalized_ranks: ArrayVec<u8, 6> = (1u8..=6).rev()
+                        .filter(|r| ranks & (1 << (r - 1)) != 0).collect();
+                    for (i, &rank) in normalized_ranks.iter().enumerate() {
+                        coord[i] = (rank as usize, File::E.to_usize());
                     }
-                    let index = indexer.cpidx_to_index(0, &cpidx);
-                    assert!(seen.insert(index));
-                    let mut decoded = Indexer::filled_pidx(k + 2);
-                    indexer.index_to_cpidx(0, &mut decoded, index);
-                    assert_eq!(decoded, cpidx);
+                    let key = (normalized_ranks, None);
+                    let pawn_index = pawn_map.to_index[&key];
+                    assert!(seen.insert(pawn_index));
+                    assert_eq!(pawn_map.from_index[pawn_index], key);
 
                     coord[k] = (0, 0);
                     coord[k + 1] = (7, 7);
                     for turn in [Color::White, Color::Black] {
-                        if let Some(position) = coord_to_position(&indexer, 0, &coord, turn) {
+                        if let Some(position) = coord_to_position(&indexer, None, &coord, turn) {
                             let mut gathered = Indexer::filled_coord(k + 2);
-                            indexer.position_to_coord::<false>(0, &mut gathered, &position);
+                            indexer.position_to_coord::<false>(&mut gathered, &position);
                             assert_eq!(gathered, coord);
                             let index = indexer.position_to_index(&position);
+                            assert_eq!(index / indexer.nonpawn_combinations, pawn_index);
+                            let mut cpidx = Indexer::filled_pidx(k + 2);
+                            let nonpawn_index = index % indexer.nonpawn_combinations;
+                            indexer.index_to_cpidx(&mut cpidx, nonpawn_index);
+                            assert_eq!(indexer.cpidx_to_index(&cpidx), nonpawn_index);
                             let reflected = crate::egt_file::mirror_horizontally(&position).unwrap();
                             assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                             assert_eq!(indexer.position_from_index(index, turn), Some(position));
@@ -1175,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_en_passant_groups_reserve_highest_slot_and_round_trip() {
+    fn combined_en_passant_groups_interleave_and_round_trip() {
         use crate::egt_file::mirror_horizontally;
 
         for k in 1usize..=4 {
@@ -1184,18 +1066,11 @@ mod tests {
                 order.push(SNTM);
                 let groups = [pawn_group(File::D, &[STM]), pawn_group(File::E, &order)];
                 let indexer = indexer(&groups);
-                assert_eq!(indexer.ep_options.len(), 2);
-                let option = indexer.ep_option(1);
-                assert_eq!(option.file, Some(File::E));
-                let pawn = &option.piece_set[1];
-                assert_eq!(pawn.group, IndexerGroup::Material(groups[1].clone()));
-                assert_eq!(pawn.span, (1, k + 1));
-                assert_eq!(pawn.encoded_multiplicity, k - 1);
-                let IndexerGroup::Material(element) = &pawn.group else { panic!("expected pawn group") };
-                assert_eq!(element.multiplicity(), k);
-                assert_eq!(pawn.n_squares, 3);
-                assert_eq!(pawn.combinations, N_CHOOSE_K[k - 1][3]);
-                assert_eq!(option.range_end - option.range_start, 6 * N_CHOOSE_K[k - 1][3] * (63 - k) * (62 - k));
+                let pawn_map = indexer.pawn_map.as_ref().unwrap();
+                assert_eq!(indexer.pawns[1].span, (1, k + 1));
+                assert_eq!(pawn_map.from_index.iter().filter(|(_, ep)| ep.is_some()).count(), N_CHOOSE_K[k - 1][3]);
+                assert_eq!(pawn_map.from_index.len(), 6 * N_CHOOSE_K[k][6] + N_CHOOSE_K[k - 1][3]);
+                assert_eq!(indexer.nonpawn_combinations, (63 - k) * (62 - k));
 
                 for ranks in 0u32..8 {
                     if ranks.count_ones() as usize != k - 1 {
@@ -1209,29 +1084,34 @@ mod tests {
                     }
                     coord[k + 1] = (0, 0);
                     coord[k + 2] = (7, 7);
+                    let ranks: ArrayVec<u8, 6> = coord[..k + 1].iter().map(|&(r, _)| r as u8).collect();
+                    let no_ep = pawn_map.to_index[&(ranks.clone(), None)];
+                    let pawn_index = pawn_map.to_index[&(ranks.clone(), Some(File::E.to_u32() as u8))];
+                    assert_eq!(pawn_index, no_ep + 1);
+                    assert_eq!(pawn_map.from_index[pawn_index], (ranks, Some(File::E.to_u32() as u8)));
                     for turn in [Color::White, Color::Black] {
-                        let position = coord_to_position(&indexer, 1, &coord, turn).unwrap();
+                        let position = coord_to_position(&indexer, Some(File::E), &coord, turn).unwrap();
                         assert!(position.legal_ep_square().is_some());
                         let index = indexer.position_to_index(&position);
-                        assert!((option.range_start..option.range_end).contains(&index));
-                        assert_eq!(indexer.position_from_index(index, turn), Some(position.clone()));
-                        let mut cpidx = Indexer::filled_pidx(k + 3);
-                        indexer.index_to_cpidx(1, &mut cpidx, index - option.range_start);
-                        assert_eq!(cpidx[1], 3); // +1 maps the reserved slot to rank 5.
+                        assert_eq!(index / indexer.nonpawn_combinations, pawn_index);
+                        assert_eq!(assert_decoder_matches(&indexer, index, turn), Some(position.clone()));
+                        let without_ep = coord_to_position(&indexer, None, &coord, turn).unwrap();
+                        assert_eq!(index, indexer.position_to_index(&without_ep) + indexer.nonpawn_combinations);
                         let reflected = mirror_horizontally(&position).unwrap();
                         assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                     }
 
-                    // A neighbor elsewhere on the file does not make EP legal.
+                    // A neighbor elsewhere on the file has no EP map entry.
                     coord[0].0 = 3;
-                    assert!(coord_to_position(&indexer, 1, &coord, Color::White).is_none());
+                    let ranks = coord[..k + 1].iter().map(|&(r, _)| r as u8).collect();
+                    assert!(!pawn_map.to_index.contains_key(&(ranks, Some(File::E.to_u32() as u8))));
                 }
             }
         }
     }
 
     #[test]
-    fn en_passant_requires_highest_sntm_pawn_space_and_stm_neighbor() {
+    fn pawn_map_en_passant_geometry_and_multiple_files() {
         for groups in [
             vec![pawn_group(File::D, &[STM]), pawn_group(File::E, &[SNTM, STM])],
             vec![pawn_group(File::D, &[STM]), pawn_group(File::E, &[SNTM; 5])],
@@ -1239,7 +1119,42 @@ mod tests {
             vec![pawn_group(File::D, &[SNTM]), pawn_group(File::E, &[SNTM])],
             vec![pawn_group(File::C, &[STM]), pawn_group(File::E, &[SNTM])],
         ] {
-            assert_eq!(indexer(&groups).ep_options.len(), 1, "{groups:?}");
+            let indexer = indexer(&groups);
+            let pawn_map = indexer.pawn_map.as_ref().unwrap();
+            assert!(pawn_map.from_index.iter().all(|(_, ep)| ep.is_none()), "{groups:?}");
+        }
+
+        // One capturer with two candidate victims, or two capturers of one victim.
+        for (sides, ep_files) in [
+            ([SNTM, STM, SNTM], vec![File::C, File::E]),
+            ([STM, SNTM, STM], vec![File::D]),
+        ] {
+            let groups: Vec<_> = [File::C, File::D, File::E].into_iter().zip(sides)
+                .map(|(file, side)| pawn_group(file, &[side])).collect();
+            let indexer = indexer(&groups);
+            let pawn_map = indexer.pawn_map.as_ref().unwrap();
+            let ranks: ArrayVec<u8, 6> = [4; 3].into_iter().collect();
+            let no_ep = pawn_map.to_index[&(ranks.clone(), None)];
+            assert_eq!(pawn_map.to_index.len(), pawn_map.from_index.len());
+            assert_eq!(pawn_map.from_index.iter().filter(|(r, _)| r == &ranks).count(), 1 + ep_files.len());
+            let coord: CoordBuf = [(4, 2), (4, 3), (4, 4), (0, 0), (7, 7)].into_iter().collect();
+            for (offset, file) in ep_files.into_iter().enumerate() {
+                let key = (ranks.clone(), Some(file.to_u32() as u8));
+                let pawn_index = no_ep + offset + 1;
+                assert_eq!(pawn_map.to_index[&key], pawn_index);
+                assert_eq!(pawn_map.from_index[pawn_index], key);
+                for turn in [Color::White, Color::Black] {
+                    let without_ep = coord_to_position(&indexer, None, &coord, turn).unwrap();
+                    let position = coord_to_position(&indexer, Some(file), &coord, turn).unwrap();
+                    let index = indexer.position_to_index(&position);
+                    assert_eq!(index / indexer.nonpawn_combinations, pawn_index);
+                    assert_eq!(index, indexer.position_to_index(&without_ep)
+                        + (offset + 1) * indexer.nonpawn_combinations);
+                    assert_eq!(assert_decoder_matches(&indexer, index, turn), Some(position.clone()));
+                    let reflected = crate::egt_file::mirror_horizontally(&position).unwrap();
+                    assert_eq!(indexer.reflected_position_to_index(&reflected), index);
+                }
+            }
         }
     }
 
@@ -1273,10 +1188,12 @@ mod tests {
             EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
         ];
         let indexer = Indexer::from_elements(&elements).unwrap();
+        assert!(indexer.pawns.is_empty());
+        assert!(indexer.pawn_map.is_none());
         assert_eq!(indexer.index_range, 462 * 62);
-        let groups = indexer.piece_set(0);
+        let groups = &indexer.nonpawns;
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].group, IndexerGroup::KingPair);
+        assert_eq!(groups[0].kind, IndexerPieceKind::KingPair);
         assert_eq!(groups[0].span, (0, 2));
         assert_eq!(groups[0].combinations, N_KING_PAIRS);
         for fen in ["8/8/8/8/8/8/1R6/K1k5 w - - 0 1", "8/8/8/8/8/8/1r6/k1K5 b - - 0 1"] {

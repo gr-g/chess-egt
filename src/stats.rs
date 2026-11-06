@@ -32,8 +32,6 @@ pub struct EgtStats {
     pub loss: usize,
     /// Nonredundant indices where the side to move attacks the opposite king.
     pub invalid_opposite_check: usize,
-    /// EP states with no geometrically capturing side-to-move pawn, counted before structure checks.
-    pub invalid_no_ep_capture: usize,
     /// EP states with a capturer but an occupied target or double-push origin square.
     pub invalid_ep_squares_occupied: usize,
     /// Structurally valid EP states with capturers, but no legal EP capture.
@@ -61,7 +59,6 @@ pub(crate) struct PlaceholderStats {
     draw: (),
     loss: (),
     invalid_opposite_check: (),
-    invalid_no_ep_capture: (),
     invalid_ep_squares_occupied: (),
     invalid_illegal_ep_capture: (),
     redundant: (),
@@ -138,8 +135,6 @@ pub struct AggregateStats {
     #[serde(deserialize_with = "required_nullable")]
     pub invalid_opposite_check: Option<usize>,
     #[serde(deserialize_with = "required_nullable")]
-    pub invalid_no_ep_capture: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
     pub invalid_ep_squares_occupied: Option<usize>,
     #[serde(deserialize_with = "required_nullable")]
     pub invalid_illegal_ep_capture: Option<usize>,
@@ -168,7 +163,6 @@ impl Default for AggregateStats {
             draw: Some(0),
             loss: Some(0),
             invalid_opposite_check: Some(0),
-            invalid_no_ep_capture: Some(0),
             invalid_ep_squares_occupied: Some(0),
             invalid_illegal_ep_capture: Some(0),
             redundant: Some(0),
@@ -194,7 +188,6 @@ impl AggregateStats {
             draw: Some(stats.draw),
             loss: Some(stats.loss),
             invalid_opposite_check: Some(stats.invalid_opposite_check),
-            invalid_no_ep_capture: Some(stats.invalid_no_ep_capture),
             invalid_ep_squares_occupied: Some(stats.invalid_ep_squares_occupied),
             invalid_illegal_ep_capture: Some(stats.invalid_illegal_ep_capture),
             redundant: Some(stats.redundant),
@@ -218,7 +211,6 @@ impl AggregateStats {
                 self.draw = None;
                 self.loss = None;
                 self.invalid_opposite_check = None;
-                self.invalid_no_ep_capture = None;
                 self.invalid_ep_squares_occupied = None;
                 self.invalid_illegal_ep_capture = None;
                 self.redundant = None;
@@ -243,8 +235,10 @@ impl AggregateStats {
         self.loss = sum(self.loss, other.loss);
         self.invalid_opposite_check =
             sum(self.invalid_opposite_check, other.invalid_opposite_check);
-        self.invalid_no_ep_capture = sum(self.invalid_no_ep_capture, other.invalid_no_ep_capture);
-        self.invalid_ep_squares_occupied = sum(self.invalid_ep_squares_occupied, other.invalid_ep_squares_occupied);
+        self.invalid_ep_squares_occupied = sum(
+            self.invalid_ep_squares_occupied,
+            other.invalid_ep_squares_occupied,
+        );
         self.invalid_illegal_ep_capture = sum(
             self.invalid_illegal_ep_capture,
             other.invalid_illegal_ep_capture,
@@ -274,7 +268,6 @@ impl AggregateStats {
             self.draw.is_some(),
             self.loss.is_some(),
             self.invalid_opposite_check.is_some(),
-            self.invalid_no_ep_capture.is_some(),
             self.invalid_ep_squares_occupied.is_some(),
             self.invalid_illegal_ep_capture.is_some(),
             self.redundant.is_some(),
@@ -314,7 +307,6 @@ impl AggregateStats {
             self.loss.unwrap(),
             [
                 self.invalid_opposite_check.unwrap(),
-                self.invalid_no_ep_capture.unwrap(),
                 self.invalid_ep_squares_occupied.unwrap(),
                 self.invalid_illegal_ep_capture.unwrap(),
                 self.redundant.unwrap(),
@@ -411,7 +403,6 @@ impl EgtStats {
             self.loss,
             [
                 self.invalid_opposite_check,
-                self.invalid_no_ep_capture,
                 self.invalid_ep_squares_occupied,
                 self.invalid_illegal_ep_capture,
                 self.redundant,
@@ -432,7 +423,7 @@ fn validate_outcomes(
     win: usize,
     draw: usize,
     loss: usize,
-    invalid_and_redundant: [usize; 5],
+    invalid_and_redundant: [usize; 4],
 ) -> EgtResult<()> {
     if win.checked_add(draw).and_then(|n| n.checked_add(loss)) != Some(unique_positions)
         || invalid_and_redundant
@@ -473,9 +464,8 @@ fn validate_distribution(
 mod tests {
     use super::*;
 
-    const PARTITION_FIELDS: [&str; 5] = [
+    const PARTITION_FIELDS: [&str; 4] = [
         "invalid_opposite_check",
-        "invalid_no_ep_capture",
         "invalid_ep_squares_occupied",
         "invalid_illegal_ep_capture",
         "redundant",
@@ -486,7 +476,7 @@ mod tests {
             tablename: "KQ_K".into(),
             bytes: 100,
             sha256: "ab".repeat(32),
-            index_range: 21,
+            index_range: 16,
             frame_size: FRAME_SIZE,
             num_frames: 1,
             unique_positions: 6,
@@ -494,7 +484,6 @@ mod tests {
             draw: 1,
             loss: 2,
             invalid_opposite_check: 1,
-            invalid_no_ep_capture: 5,
             invalid_ep_squares_occupied: 2,
             invalid_illegal_ep_capture: 3,
             redundant: 4,
@@ -588,11 +577,10 @@ mod tests {
                 total.available_tables,
                 total.index_range
             ),
-            (2, 2, 42)
+            (2, 2, 32)
         );
         assert_eq!((total.bytes, total.unique_positions), (Some(200), Some(12)));
         assert_eq!(total.invalid_opposite_check, Some(2));
-        assert_eq!(total.invalid_no_ep_capture, Some(10));
         assert_eq!(total.invalid_ep_squares_occupied, Some(4));
         assert_eq!(total.invalid_illegal_ep_capture, Some(6));
         assert_eq!(total.redundant, Some(8));
@@ -614,7 +602,7 @@ mod tests {
         ] {
             let total = aggregate(&records);
             assert_eq!((total.selected_tables, total.available_tables), (2, 1));
-            assert_eq!(total.index_range, 21 + missing.index_range());
+            assert_eq!(total.index_range, stats().index_range + missing.index_range());
             for (key, value) in serde_json::to_value(total).unwrap().as_object().unwrap() {
                 if !["selected_tables", "available_tables", "index_range"].contains(&key.as_str()) {
                     assert!(value.is_null(), "{key}");
@@ -719,14 +707,14 @@ mod tests {
                 assert!(invalid.validate().is_err(), "{field}: {count}");
             }
         }
-        assert!(validate_outcomes(0, 0, usize::MAX, 1, 0, [0; 5]).is_err());
-        for index in 0..5 {
-            let mut counts = [0; 5];
+        assert!(validate_outcomes(0, 0, usize::MAX, 1, 0, [0; 4]).is_err());
+        for index in 0..4 {
+            let mut counts = [0; 4];
             counts[index] = usize::MAX;
             assert!(validate_outcomes(0, 1, 0, 1, 0, counts).is_err());
         }
-        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [usize::MAX, 1, 0, 0, 0]).is_err());
-        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [0, 0, 0, 0, usize::MAX]).is_ok());
+        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [usize::MAX, 1, 0, 0]).is_err());
+        assert!(validate_outcomes(usize::MAX, 0, 0, 0, 0, [0, 0, 0, usize::MAX]).is_ok());
     }
 
     #[test]

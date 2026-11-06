@@ -261,7 +261,7 @@ side piece counts in descending order, `K` counts mutually opposing pawn pairs
 ```
 
 A simple JSON file named `format.json` at the root contains a format
-descriptor. Currently this is: `{"format":"ggegt-v0.10"}`.
+descriptor. Currently this is: `{"format":"ggegt-v0.11"}`.
 
 The hierarchical layout described above is designed to expose useful facts
 about the dependencies between groups of tables and facilitate grouping tables
@@ -304,14 +304,12 @@ The `--stats` command reports statistics for individual tables
 Key statistics include the number of unique positions covered by the selected
 tables (`unique_positions`) and the breakdown into `win`, `draw`, and `loss`.
 Indices excluded from `unique_positions` are also counted, with a split into
-redundant representations and four categories of invalid positions:
+redundant representations and three categories of invalid positions:
 - `redundant`: the index represents the diagonal reflection of a position
   represented by another index in the table. The position may itself be valid
   or invalid.
 - `invalid_opposite_check`: the index represents a position where the side to
   move attacks the opposite king (including the case of adjacent kings).
-- `invalid_no_ep_capture`: the index represents a position with en passant
-  rights but no side-to-move pawn geometrically attacks the target square.
 - `invalid_ep_squares_occupied`: the index represents a position with en passant
   rights and a geometrical capturer, but the target square or the double-push
   origin square is occupied.
@@ -320,31 +318,14 @@ redundant representations and four categories of invalid positions:
   no en passant capture is legal.
 
 These categories are exclusive: redundancy takes precedence over opposite
-check, followed by an absent capturing pawn, occupied EP squares, and
-illegality of all EP captures.
+check, followed by occupied EP squares and illegality of all EP captures.
+EP states without a geometrical capturing pawn are excluded from the index
+range entirely.
 
 The total number of indices in the table is stored in `index_range` and
-is equal to the number of unique positions plus the five excluded counts.
+is equal to the number of unique positions plus the four excluded counts.
 Further information is also available (size, hash, number of frames, number of
 wins/losses at each ply, longest wins/losses).
-
-For instance, running `--stats 4/` gives:
-```text
-  ...
-  "index_range": 156098268,
-  "bytes": 13931509,
-  "num_frames": 688,
-  "unique_positions": 125132316,
-  "win": 43726797,
-  "draw": 37376378,
-  "loss": 44029141,
-  "invalid_opposite_check": 29591009,
-  "invalid_no_ep_capture": 115499,
-  "invalid_ep_squares_occupied": 1124,
-  "invalid_illegal_ep_capture": 0,
-  "redundant": 1258320,
-  ...
-```
 
 Note that the granular information on invalid indices can be useful to
 reconcile position counts across tablebases that use different methodologies.
@@ -412,9 +393,11 @@ representations through careful index partitioning, as in the [syzygy](https://g
 or [op1](https://github.com/lichess-org/op1/blob/main/mbeval-sys/mbeval/src/mbeval.c)
 tablebases, are more efficient, but also more cumbersome.
 
-En passant positions are encoded separately in different ranges of indices
-(sub-tables) managed internally by the `Indexer`. The `Indexer` exposes a
-single unified index range for the entire table.
+The positions of the pawns on the ranks and the en passant rights are encoded
+together into a combined pawn index. For each combined pawn index, the
+positions of the other pieces are combinatorially encoded without overlaps
+into a fixed-size range. The `Indexer` exposes one contiguous index range for
+the entire table, combining the pawn and non-pawn indices.
 
 For the detailed indexing algorithm, see the module documentation in
 [`src/egt/indexer.rs`](src/egt/indexer.rs).

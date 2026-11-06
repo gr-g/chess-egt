@@ -26,7 +26,7 @@ class StatsCsvTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.root = self.base / "tables"
         self.root.mkdir()
-        self.put_json(self.root / "format.json", {"format": "ggegt-v0.10"})
+        self.put_json(self.root / "format.json", {"format": "ggegt-v0.11"})
 
     def put_json(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,8 +221,8 @@ class StatsCsvTests(unittest.TestCase):
 
     def test_format_validation_requires_exact_supported_object(self):
         self.assertEqual(stats_csv.validate_root(self.root), self.root.resolve())
-        for value in ({"format": "ggegt-v0.9"}, {}, {"format": None},
-                      {"format": "ggegt-v0.10", "extra": True}, [], "ggegt-v0.10"):
+        for value in ({"format": "ggegt-v0.10"}, {}, {"format": None},
+                      {"format": "ggegt-v0.11", "extra": True}, [], "ggegt-v0.11"):
             with self.subTest(value=value):
                 self.put_json(self.root / "format.json", value)
                 with self.assertRaises(ValueError):

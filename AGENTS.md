@@ -57,6 +57,14 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
   of the update sink. Bounded streaming buffers. Per-phase barriers.
   Checkpoints to object storage.
 - Further optimization ideas:
+  - Align frame size to permutation blocks?
+    (frame_size = (64-n+1) * (64-n+2) * (64-n+3), or twice that)
+    Small experiment between two close sizes (60 * 61 * 62)=226920 vs 229376
+    shows 226920 is a bit better (~1%) even if smaller.
+  - Align summary block size to permutation blocks
+    (block_size = (64-n+1) * (64-n+2)) and fast-forward initialization
+    if after placing n-2 pieces of the first position there is an
+    unblockable check.
   - Pawn-rank slicing: solve slices of pawnful `Egt`s in dependency order.
     Inject successors in already solved slices at the matching ply.
   - A generation-specific index layout.

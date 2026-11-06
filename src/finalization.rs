@@ -119,6 +119,7 @@ mod tests {
                             .egt
                             .indexer
                             .position_from_index_with_reason(i, shakmaty::Color::White)
+                            .unwrap()
                         {
                             Ok(_) => match i % 3 {
                                 0 => MaybeDtcOutcome::new_unknown(17),
@@ -145,7 +146,6 @@ mod tests {
                 assert_eq!(
                     stats.unique_positions
                         + stats.invalid_opposite_check
-                        + stats.invalid_no_ep_capture
                         + stats.invalid_ep_squares_occupied
                         + stats.invalid_illegal_ep_capture
                         + stats.redundant,

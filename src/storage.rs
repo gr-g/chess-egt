@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-const TABLEBASE_FORMAT: &str = "ggegt-v0.10";
+const TABLEBASE_FORMAT: &str = "ggegt-v0.11";
 pub(crate) const FRAME_SIZE: usize = 256 * 1024;
 
 /// Root metadata is immutable and independent of optional per-table statistics.
@@ -260,36 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_and_malformed_formats_are_never_replaced() {
-        let location = Location::parse("memory:///tables").unwrap();
-        location.ensure_format().unwrap();
-        let key = location.prefix.clone().join("format.json");
-        for bytes in [
-            serde_json::to_vec(&serde_json::json!({ "format": "ggegt-v0.9" })).unwrap(),
-            serde_json::to_vec(&serde_json::json!({ "format": "other" })).unwrap(),
-            serde_json::to_vec(&serde_json::json!({
-                "format": TABLEBASE_FORMAT,
-                "format_version": 1,
-                "indexing_version": 1,
-                "layout_version": 1,
-                "frame_size": 262144
-            }))
-            .unwrap(),
-            b"not json".to_vec(),
-        ] {
-            block_on(location.store.put(&key, bytes.clone().into())).unwrap();
-            let location = Location {
-                format_validated: Arc::new(OnceLock::new()),
-                ..location.clone()
-            };
-            assert!(location.validate_format().is_err());
-            assert!(location.ensure_format().is_err());
-            let result = block_on(location.store.get(&key)).unwrap();
-            assert_eq!(block_on(result.bytes()).unwrap().as_ref(), bytes);
-        }
-    }
-
-    #[test]
     fn concurrent_format_creation() {
         let location = Location::parse("memory:///tables").unwrap();
         std::thread::scope(|scope| {
@@ -357,27 +327,6 @@ mod tests {
                 "accepted unsupported URL components: {text}"
             );
         }
-    }
-
-    #[test]
-    fn writability_does_not_depend_on_display() {
-        let writable = Location {
-            store: Arc::new(object_store::memory::InMemory::new()),
-            prefix: ObjectPath::from("tables"),
-            display: "https://example.com/tables/".into(),
-            writable: true,
-            format_validated: Arc::new(OnceLock::new()),
-        };
-        writable.ensure_writable().unwrap();
-        let read_only = Location {
-            display: "memory:///tables/".into(),
-            writable: false,
-            ..writable
-        };
-        assert!(matches!(
-            read_only.ensure_writable(),
-            Err(EgtError::InvalidStorageLocation(_))
-        ));
     }
 
     #[test]

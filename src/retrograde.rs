@@ -571,7 +571,7 @@ fn initialize_table(
         let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
             let idx = block * SUMMARY_BLOCK_SIZE + offset;
-            let position = match egt.indexer.position_from_index_with_reason(idx, Color::White) {
+            let position = match egt.indexer.position_from_index_with_reason(idx, Color::White)? {
                 Ok(position) => position,
                 Err(reason) => {
                     *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
@@ -1686,7 +1686,7 @@ mod tests {
             let mut totals = [0usize; 5];
             for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
                 let stats = crate::stats::read_stats(&location, &id).unwrap();
-                let excluded = stats.invalid_opposite_check + stats.invalid_no_ep_capture
+                let excluded = stats.invalid_opposite_check
                                     + stats.invalid_ep_squares_occupied + stats.invalid_illegal_ep_capture + stats.redundant;
                                 let counts = [stats.index_range, stats.win, stats.draw, stats.loss, excluded];
                 for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
