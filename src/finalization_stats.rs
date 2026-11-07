@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
 use crate::egt::Egt;
-use crate::egt_file::{EgtFileReader, MaybeDtcOutcome};
+use crate::egt_file::MaybeDtcOutcome;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
+use crate::storage::FRAME_SIZE;
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
 #[derive(Default)]
@@ -91,14 +92,13 @@ impl EgtStatsBuilder {
         }
     }
 
-    pub(crate) fn build(self, file: &EgtFileReader, bytes: u64, sha256: String) -> EgtStats {
+    pub(crate) fn build(self, egt: &Egt, bytes: u64, sha256: String) -> EgtStats {
         let [win_candidates, loss_candidates] = self.totals.candidates;
         let materialize = |candidates: Vec<usize>, ply| {
             candidates
                 .into_iter()
                 .filter_map(|local_idx| {
-                    file.egt
-                        .position_from_index(local_idx, Color::White)
+                    egt.position_from_index(local_idx, Color::White)
                         .map(|pos| LongestDtcPosition {
                             epd: Epd::from_position(&pos, EnPassantMode::Legal).to_string(),
                             ply,
@@ -108,12 +108,12 @@ impl EgtStatsBuilder {
         };
         let [histogram_win, histogram_loss] = self.totals.histograms;
         EgtStats {
-            tablename: file.id.tablename().to_owned(),
+            tablename: egt.tablename().to_owned(),
             bytes,
             sha256,
-            index_range: file.index_range,
-            frame_size: file.frame_size,
-            num_frames: file.num_frames(),
+            index_range: egt.index_range(),
+            frame_size: FRAME_SIZE,
+            num_frames: egt.index_range().div_ceil(FRAME_SIZE),
             unique_positions: self.totals.win + self.totals.draw + self.totals.loss,
             win: self.totals.win,
             draw: self.totals.draw,
@@ -190,8 +190,7 @@ mod tests {
 
     #[test]
     fn supplied_invalid_counts_survive_merges_and_build() {
-        let dir = crate::TestDir::new("finalization_stats_invalid_counts");
-        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
+        let egt = table("K_K");
         let invalid = InvalidCounts {
             opposite_check: 7,
             ep_squares_occupied: 11,
@@ -200,7 +199,7 @@ mod tests {
         let mut builder = EgtStatsBuilder::new([0, 0], invalid);
         for _ in 0..2 {
             let mut part = TableStats::default();
-            part.record_outcome(MaybeDtcOutcome::INVALID, 0, &file.egt, 0, 0);
+            part.record_outcome(MaybeDtcOutcome::INVALID, 0, &egt, 0, 0);
             builder.merge([part, TableStats::default()]);
             assert_eq!(builder.invalid, invalid);
         }
@@ -211,7 +210,7 @@ mod tests {
         );
         assert!(builder.totals.histograms.iter().all(BTreeMap::is_empty));
         assert!(builder.totals.candidates.iter().all(Vec::is_empty));
-        let stats = builder.build(&file, 0, String::new());
+        let stats = builder.build(&egt, 0, String::new());
         assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
         assert_eq!(stats.invalid_ep_squares_occupied, invalid.ep_squares_occupied);
         assert_eq!(stats.invalid_illegal_ep_capture, invalid.illegal_ep_capture);

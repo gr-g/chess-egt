@@ -9,9 +9,10 @@ use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
 use crate::egt_file::COMPRESSION_LEVEL;
-use crate::egt_file::{EgtFileReader, MaybeDtcOutcome, transpose_frame};
+use crate::egt_file::{MaybeDtcOutcome, transpose_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
+use crate::table_id::TableId;
 
 /// A frame-aligned compressed batch, without a serialized seek-table footer.
 pub(crate) struct CompressedSegment {
@@ -30,16 +31,21 @@ pub(crate) struct EgtFileWriter {
 }
 
 impl EgtFileWriter {
-    pub(crate) fn new(file: &EgtFileReader) -> EgtResult<Self> {
-        if file.frame_size == 0 || file.frame_size > (u32::MAX as usize) / 2 {
+    pub(crate) fn new(
+        location: &Location,
+        id: &TableId,
+        length: usize,
+        frame_size: usize,
+    ) -> EgtResult<Self> {
+        if frame_size == 0 || frame_size > (u32::MAX as usize) / 2 {
             return Err(EgtError::Internal("invalid writer frame size"));
         }
-        file.location.ensure_format()?;
+        location.ensure_format()?;
         Ok(Self {
-            location: file.location.clone(),
-            key: file.key.clone(),
-            frame_size: file.frame_size,
-            length: file.index_range,
+            location: location.clone(),
+            key: location.key(&id.relative_path("ggegt")),
+            frame_size,
+            length,
             segments: None,
             footer: None,
             published: false,
@@ -221,19 +227,63 @@ pub(crate) fn encode_frame<W: Write>(
     Ok(())
 }
 
+/// Publishes arbitrary outcomes, including deliberately corrupt test data.
+#[cfg(test)]
+pub(crate) fn write_fixture(
+    base: &std::path::Path,
+    name: &str,
+    outcome: impl Fn(usize) -> MaybeDtcOutcome,
+) -> crate::egt_file::EgtFileReader {
+    use crate::storage::FRAME_SIZE;
+
+    let location = Location::parse(base).unwrap();
+    let id = TableId::parse(name).unwrap();
+    let length = crate::Egt::from_elements(id.parse_elements())
+        .unwrap()
+        .index_range();
+    location.ensure_format().unwrap();
+    let mut data = Vec::new();
+    let mut encoder = zeekstd::EncodeOptions::new()
+        .compression_level(COMPRESSION_LEVEL)
+        .into_encoder(&mut data)
+        .unwrap();
+    for start in (0..length).step_by(FRAME_SIZE) {
+        let values: Vec<_> = (start..length.min(start + FRAME_SIZE))
+            .map(&outcome)
+            .collect();
+        encoder.compress(&transpose_frame(&values)).unwrap();
+        if start + values.len() < length {
+            encoder.end_frame().unwrap();
+        }
+    }
+    encoder.finish().unwrap();
+    let key = location.key(&id.relative_path("ggegt"));
+    publish_buffers(&location, &key, [data.into()]).unwrap();
+    crate::egt_file::EgtFileReader::open_in(&location, name).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egt_file::EgtFileReader;
+    use crate::storage::FRAME_SIZE;
     use object_store::ObjectStoreExt;
-    use std::fs;
+    use std::{fs, path::Path};
+
+    fn writer(base: &Path, name: &str) -> EgtFileWriter {
+        let id = TableId::parse(name).unwrap();
+        let length = crate::Egt::from_elements(id.parse_elements())
+            .unwrap()
+            .index_range();
+        EgtFileWriter::new(&Location::parse(base).unwrap(), &id, length, FRAME_SIZE).unwrap()
+    }
 
     #[test]
     fn mixed_segments_match_serial_encoder_bytes() {
         let dir = crate::TestDir::new("writer_mixed_segments");
-        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
-        let mut writer = EgtFileWriter::new(&file).unwrap();
+        let mut writer = writer(&dir.0, "K_K");
         writer.frame_size = 8;
-        let values: Vec<_> = (0..file.index_range)
+        let values: Vec<_> = (0..writer.length)
             .map(|i| [MaybeDtcOutcome::DRAW, MaybeDtcOutcome::INVALID][i % 2])
             .collect();
         let options = || zeekstd::EncodeOptions::new().compression_level(COMPRESSION_LEVEL);
@@ -267,7 +317,11 @@ mod tests {
         assert_eq!(bytes, expected.len() as u64);
         assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
         assert_eq!(
-            fs::read(dir.0.join(file.id.relative_path("ggegt"))).unwrap(),
+            fs::read(
+                dir.0
+                    .join(TableId::parse("K_K").unwrap().relative_path("ggegt"))
+            )
+            .unwrap(),
             expected
         );
     }
@@ -311,10 +365,9 @@ mod tests {
     #[test]
     fn short_tail_loads_via_reader() {
         let dir = crate::TestDir::new("writer_short_tail");
-        let file = EgtFileReader::new(&dir.0, "KQ_KR").unwrap();
-        assert!(file.index_range % file.frame_size != 0);
-        let mut writer = EgtFileWriter::new(&file).unwrap();
-        let values: Vec<_> = (0..file.index_range)
+        let mut writer = writer(&dir.0, "KQ_KR");
+        assert!(writer.length % writer.frame_size != 0);
+        let values: Vec<_> = (0..writer.length)
             .map(|index| {
                 if index % 2 == 0 {
                     MaybeDtcOutcome::DRAW
@@ -328,7 +381,7 @@ mod tests {
             .compression_level(COMPRESSION_LEVEL)
             .into_encoder(&mut expected)
             .unwrap();
-        for chunk in values.chunks(file.frame_size) {
+        for chunk in values.chunks(writer.frame_size) {
             encode_frame(&mut encoder, chunk).unwrap();
         }
         encoder.flush().unwrap();
@@ -340,7 +393,9 @@ mod tests {
         writer.write_table(&values).unwrap();
         writer.finish().unwrap();
         writer.finish().unwrap();
-        let destination = dir.0.join(file.id.relative_path("ggegt"));
+        let destination = dir
+            .0
+            .join(TableId::parse("KQ_KR").unwrap().relative_path("ggegt"));
         assert!(!destination.exists());
         let (bytes, sha256) = writer.publish().unwrap();
         assert_eq!(bytes, expected.len() as u64);
@@ -353,9 +408,9 @@ mod tests {
         let mut reader = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
         for index in [
             0,
-            file.frame_size - 1,
-            file.frame_size,
-            file.index_range - 1,
+            writer.frame_size - 1,
+            writer.frame_size,
+            writer.length - 1,
         ] {
             assert_eq!(reader.read_from_index(index).unwrap(), values[index]);
         }
@@ -364,12 +419,11 @@ mod tests {
     #[test]
     fn rejects_invalid_input_and_missing_tables() {
         let dir = crate::TestDir::new("writer_rejections");
-        let file = EgtFileReader::new(&dir.0, "KPa_K").unwrap();
-        let mut writer = EgtFileWriter::new(&file).unwrap();
+        let mut writer = writer(&dir.0, "KPa_K");
         assert!(writer.finish().is_err());
         assert!(writer.publish().is_err());
         assert!(writer.write_table(&[]).is_err());
-        let mut values = vec![MaybeDtcOutcome::DRAW; file.index_range];
+        let mut values = vec![MaybeDtcOutcome::DRAW; writer.length];
         values[0] = MaybeDtcOutcome::new_unknown(1);
         assert!(writer.write_table(&values).is_err());
         values[0] = MaybeDtcOutcome::INVALID;
@@ -381,13 +435,14 @@ mod tests {
     #[test]
     fn unpublished_writer_preserves_destination_without_temporary_files() {
         let dir = crate::TestDir::new("writer_cleanup");
-        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
-        let destination = dir.0.join(file.id.relative_path("ggegt"));
+        let mut writer = writer(&dir.0, "K_K");
+        let destination = dir
+            .0
+            .join(TableId::parse("K_K").unwrap().relative_path("ggegt"));
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::write(&destination, b"existing destination").unwrap();
-        let mut writer = EgtFileWriter::new(&file).unwrap();
         writer
-            .write_table(&vec![MaybeDtcOutcome::DRAW; file.index_range])
+            .write_table(&vec![MaybeDtcOutcome::DRAW; writer.length])
             .unwrap();
         writer.finish().unwrap();
         drop(writer);

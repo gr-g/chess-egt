@@ -70,7 +70,8 @@
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
-use crate::egt_file::{MaybeDtcOutcome, EgtFileReader};
+use crate::egt_file::MaybeDtcOutcome;
+use crate::stats::EgtStats;
 use crate::table_id::{PawnKey, TableId};
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
@@ -824,13 +825,13 @@ fn solve_pair(
 ///
 /// The shared reader lazily opens existing conversion dependencies, including
 /// outputs of earlier jobs. Missing dependencies are errors, not generation
-/// requests. A self-twin is solved and published once. Readers are returned in
-/// requested-table/twin order with their per-table statistics attached.
+/// requests. A self-twin is solved and published once. Statistics are returned
+/// in requested-table/twin order without opening the published outputs.
 pub(crate) fn generate_pair(
     base: &Location,
     table: &TableId,
     reader: &SharedFileCache,
-) -> EgtResult<Vec<EgtFileReader>> {
+) -> EgtResult<Vec<EgtStats>> {
     base.ensure_writable()?;
     let (twin, _) = table.twin()?;
     let mut ids = vec![table.clone()];
@@ -844,24 +845,21 @@ pub(crate) fn generate_pair(
     };
     let solver = RetrogradeSolver::new(table_a, table_b);
     let pair = solve_pair(&solver, 0, ids.len() - 1, reader)?;
-    // Readers construct their own descriptors. Release the solver's indexers
-    // before finalizing so only this pair's descriptors and arrays are retained.
-    drop(solver);
 
     let finalize_start = std::time::Instant::now();
     let maxima = [
         [pair.max_win_dtc_a, pair.max_loss_dtc_a],
         [pair.max_win_dtc_b, pair.max_loss_dtc_b],
     ];
-    let mut files = Vec::with_capacity(ids.len());
-    for (((id, values), maxima), invalid) in ids.iter().zip(pair.working.values).zip(maxima).zip(pair.invalid) {
+    let mut stats = Vec::with_capacity(ids.len());
+    for ((((id, egt), values), maxima), invalid) in ids.iter()
+        .zip(solver.tables)
+        .zip(pair.working.values)
+        .zip(maxima)
+        .zip(pair.invalid)
+    {
         println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
-        let file = EgtFileReader::new_in(base, id.tablename())?;
-        let stats = crate::finalization::finalize_table(&file, values, maxima, invalid)?;
-        drop(file);
-        let mut published = EgtFileReader::open_in(base, id.tablename())?;
-        published.stats = Some(stats);
-        files.push(published);
+        stats.push(crate::finalization::finalize_table(base, id, &egt, values, maxima, invalid)?);
     }
     println!(
         "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
@@ -870,7 +868,7 @@ pub(crate) fn generate_pair(
         pair.propagation_time.as_secs_f64(),
         finalize_start.elapsed().as_secs_f64(),
     );
-    Ok(files)
+    Ok(stats)
 }
 
 #[cfg(test)]

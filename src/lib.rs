@@ -160,11 +160,8 @@ impl EgtGenerator {
             .num_threads(self.threads)
             .build()
             .map_err(|_| EgtError::Internal("failed to build generation thread pool"))?;
-        let reader = SharedFileCache::new(
-            &self.base_path,
-            self.input_path.as_ref(),
-            self.cache_size,
-        );
+        let reader =
+            SharedFileCache::new(&self.base_path, self.input_path.as_ref(), self.cache_size);
         let mut results = Vec::new();
         let mut previous_material = None;
         println!(
@@ -180,25 +177,20 @@ impl EgtGenerator {
                     previous_material = Some(material);
                 }
                 let start = std::time::Instant::now();
-                let files = retrograde::generate_pair(&self.base_path, &table, &reader)?;
-                let mut names = Vec::new();
-                let mut verification = Vec::new();
-                let mut pair_stats = Vec::new();
-                for mut file in files {
-                    let stats = file
-                        .stats
-                        .take()
-                        .ok_or(EgtError::Internal("stats missing after generation"))?;
-                    names.push(file.id.tablename().to_owned());
-                    pair_stats.push(stats);
+                let pair_stats = retrograde::generate_pair(&self.base_path, &table, &reader)?;
+                if self.verify {
+                    let names: Vec<_> = pair_stats
+                        .iter()
+                        .map(|stats| stats.tablename.clone())
+                        .collect();
+                    let mut verification = Vec::new();
                     // Generation and verification share dependency frames. Pin
                     // both outputs so input artifacts cannot shadow either one.
-                    if self.verify {
+                    for name in &names {
+                        let file = EgtFileReader::open_in(&self.base_path, name)?;
                         verification.push((file.egt.clone(), file.frame_size));
                         reader.insert(file)?;
                     }
-                }
-                if self.verify {
                     for (name, (egt, frame_size)) in names.iter().zip(verification) {
                         EgtProber::verify_egt(&reader, name, &egt, frame_size)?;
                     }
@@ -818,47 +810,40 @@ mod tests {
         use egt_file::MaybeDtcOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
-        unverified_generator(&dir.0).generate("K_K").unwrap();
-        let mut prober = EgtProber::new(&dir.0).unwrap();
-        let file = prober.load_existing("K_K").unwrap();
-        let index = (0..file.index_range)
-            .find(|&index| file.egt.position_from_index(index, Color::White).is_some())
+        let egt = Egt::from_tablename("K_K").unwrap();
+        let index = (0..egt.index_range())
+            .find(|&index| egt.position_from_index(index, Color::White).is_some())
             .unwrap();
-        prober.cache.insert(file).unwrap();
-
+        let mut prober = EgtProber::new(&dir.0).unwrap();
         for threads in [0, 1, 4] {
             prober.with_threads(threads);
-            prober
-                .cache
-                .file("K_K")
-                .unwrap()
-                .write()
-                .unwrap()
-                .write_to_index(index, MaybeDtcOutcome::INVALID)
-                .unwrap();
-            assert!(matches!(prober.verify_internal_consistency("K_K"),
-                Err(EgtError::ConsistencyCheckFailed { index: failed, .. }) if failed == index));
-            assert!(prober.cache.contains_key("K_K"));
-
-            prober
-                .cache
-                .file("K_K")
-                .unwrap()
-                .write()
-                .unwrap()
-                .write_to_index(index, MaybeDtcOutcome::from_u16(8))
-                .unwrap();
-            assert!(matches!(prober.verify_internal_consistency("K_K"),
-                Err(EgtError::CorruptedOutcome { index: failed, value: 8 }) if failed == index));
-            prober
-                .cache
-                .file("K_K")
-                .unwrap()
-                .write()
-                .unwrap()
-                .write_to_index(index, MaybeDtcOutcome::DRAW)
-                .unwrap();
-            prober.verify_internal_consistency("K_K").unwrap();
+            for outcome in [
+                MaybeDtcOutcome::INVALID,
+                MaybeDtcOutcome::from_u16(8),
+                MaybeDtcOutcome::DRAW,
+            ] {
+                // Drop cached readers before replacing their backing artifact.
+                prober.cache.clear().unwrap();
+                let file = egt_writer::write_fixture(&dir.0, "K_K", |i| {
+                    if i == index {
+                        outcome
+                    } else {
+                        MaybeDtcOutcome::DRAW
+                    }
+                });
+                prober.cache.insert(file).unwrap();
+                let result = prober.verify_internal_consistency("K_K");
+                if outcome.is_invalid() {
+                    assert!(matches!(result,
+                        Err(EgtError::ConsistencyCheckFailed { index: failed, .. }) if failed == index));
+                } else if outcome.is_unknown() {
+                    assert!(matches!(result,
+                        Err(EgtError::CorruptedOutcome { index: failed, value: 8 }) if failed == index));
+                } else {
+                    result.unwrap();
+                }
+                assert!(prober.cache.contains_key("K_K"));
+            }
         }
     }
 

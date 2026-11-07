@@ -355,6 +355,16 @@ fn merge_distribution(
     }
 }
 
+/// Publishes a sidecar after its binary table, invalidating hierarchy summaries first.
+pub(crate) fn write_stats(location: &Location, id: &TableId, stats: &EgtStats) -> EgtResult<()> {
+    location.ensure_format()?;
+    let key = location.key(&id.relative_path("json"));
+    let json = serde_json::to_vec_pretty(stats)?;
+    crate::stats_cache::invalidate(location, id)?;
+    block_on(location.store.put(&key, json.into())).map_err(|error| location.error(&key, error))?;
+    Ok(())
+}
+
 pub(crate) fn read_record(location: &Location, id: &TableId) -> EgtResult<StatsRecord> {
     location.validate_format()?;
     let key = location.key(&id.relative_path("json"));

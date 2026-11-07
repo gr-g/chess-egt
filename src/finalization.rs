@@ -6,12 +6,14 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use crate::egt::Egt;
-use crate::egt_file::{COMPRESSION_LEVEL, EgtFileReader, MaybeDtcOutcome};
+use crate::egt_file::{COMPRESSION_LEVEL, MaybeDtcOutcome};
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::finalization_stats::{EgtStatsBuilder, TableStats};
 use crate::position::InvalidCounts;
-use crate::stats::EgtStats;
+use crate::stats::{EgtStats, write_stats};
+use crate::storage::{FRAME_SIZE, Location};
+use crate::table_id::TableId;
 
 fn finalize_batch(
     values: &mut [AtomicU16],
@@ -63,25 +65,25 @@ fn finalize_batch(
 /// its JSON sidecar. Call only after all propagation workers have joined.
 /// Binary and sidecar publication are not an atomic multi-object transaction.
 pub(crate) fn finalize_table(
-    file: &EgtFileReader,
+    location: &Location,
+    id: &TableId,
+    egt: &Egt,
     mut values: Vec<AtomicU16>,
     maxima: [u16; 2],
     invalid: InvalidCounts,
 ) -> EgtResult<EgtStats> {
-    if values.len() != file.egt.index_range() {
+    if values.len() != egt.index_range() {
         return Err(EgtError::Internal("completed table has wrong length"));
     }
-    let mut writer = EgtFileWriter::new(file)?;
-    let frames = values.len().div_ceil(file.frame_size);
-    let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * file.frame_size;
+    let mut writer = EgtFileWriter::new(location, id, egt.index_range(), FRAME_SIZE)?;
+    let frames = values.len().div_ceil(FRAME_SIZE);
+    let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * FRAME_SIZE;
     // Contiguous batches reuse one encoder each. Indexed collection preserves
     // frame and example order, independently of worker completion order.
     let batches: Vec<_> = values
         .par_chunks_mut(batch_size)
         .enumerate()
-        .map(|(idx, batch)| {
-            finalize_batch(batch, idx * batch_size, &file.egt, file.frame_size, maxima)
-        })
+        .map(|(idx, batch)| finalize_batch(batch, idx * batch_size, egt, FRAME_SIZE, maxima))
         .collect();
     drop(values);
     let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
@@ -91,8 +93,8 @@ pub(crate) fn finalize_table(
     writer.write_segments(segments)?;
     writer.finish()?;
     let (bytes, sha256) = writer.publish()?;
-    let stats = builder.build(file, bytes, sha256);
-    file.save_stats(&stats)?;
+    let stats = builder.build(egt, bytes, sha256);
+    write_stats(location, id, &stats)?;
     Ok(stats)
 }
 
@@ -103,12 +105,21 @@ mod tests {
     #[test]
     fn wrong_length_does_not_publish() {
         let dir = crate::TestDir::new("finalization_wrong_length");
-        let file = EgtFileReader::new(&dir.0, "K_K").unwrap();
+        let location = Location::parse(&dir.0).unwrap();
+        let id = TableId::parse("K_K").unwrap();
+        let egt = Egt::from_elements(id.parse_elements()).unwrap();
         assert!(matches!(
-            finalize_table(&file, Vec::new(), [0, 0], InvalidCounts::default()),
+            finalize_table(
+                &location,
+                &id,
+                &egt,
+                Vec::new(),
+                [0, 0],
+                InvalidCounts::default()
+            ),
             Err(EgtError::Internal("completed table has wrong length"))
         ));
-        assert!(!dir.0.join(file.id.relative_path("ggegt")).exists());
-        assert!(!dir.0.join(file.id.relative_path("json")).exists());
+        assert!(!dir.0.join(id.relative_path("ggegt")).exists());
+        assert!(!dir.0.join(id.relative_path("json")).exists());
     }
 }
