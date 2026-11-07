@@ -34,7 +34,9 @@
 //! missing files. Their optional frame-cache budgets accept zero to retain no
 //! frames. Statistics describe one root, do not use the frame cache, and do not
 //! support overlays. Do not rebuild metadata concurrently with generation or
-//! another rebuild.
+//! another rebuild. Malformed stored artifacts return [`EgtError::InvalidData`]
+//! with their location and source error; backend failures return [`EgtError::Storage`].
+//! Unsupported root format versions return [`EgtError::InvalidStorageLocation`].
 //!
 //! All storage operations block the calling thread, including remote reads and
 //! writes. Async applications should use [`tokio::task::spawn_blocking`] for

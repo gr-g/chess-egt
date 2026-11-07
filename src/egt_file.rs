@@ -38,13 +38,6 @@ fn load_existing_file(
     EgtFileReader::open_in(base_path, endgame)
 }
 
-/// Logical extent of an unpadded, table-local transposed Zstd frame.
-#[derive(Debug, Clone, Copy)]
-struct FrameDescriptor {
-    start: usize,
-    len: usize,
-}
-
 /// Read-only storage and frame cache for one existing canonical table.
 #[derive(Debug)]
 pub struct EgtFileReader {
@@ -54,7 +47,6 @@ pub struct EgtFileReader {
     seek_table: zeekstd::SeekTable,
     /// `None` means the frame has not been loaded or has been evicted.
     frames: Vec<Option<Vec<PackedOutcome>>>,
-    frame_layout: Vec<FrameDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -503,57 +495,56 @@ impl EgtFileReader {
         let id = TableId::parse(tablename)?;
         let egt = Egt::from_elements(id.parse_elements())?;
         let index_range = egt.index_range();
-        let frame_layout: Vec<_> = (0..index_range)
-            .step_by(FRAME_SIZE)
-            .map(|start| FrameDescriptor {
-                start,
-                len: FRAME_SIZE.min(index_range - start),
-            })
-            .collect();
         let key = location.key(&id.relative_path("ggegt"));
         location.validate_format()?;
-        let seek_table = Self::read_seek_table(location, &key, &frame_layout)?;
-        let frames = vec![None; frame_layout.len()];
+        let seek_table = Self::read_seek_table(location, &key, index_range)?;
+        let frames = vec![None; index_range.div_ceil(FRAME_SIZE)];
         Ok(Self {
             key,
             egt,
             location: location.clone(),
             seek_table,
             frames,
-            frame_layout,
         })
     }
 
     fn read_seek_table(
         location: &Location,
         key: &ObjectPath,
-        frame_layout: &[FrameDescriptor],
+        index_range: usize,
     ) -> EgtResult<zeekstd::SeekTable> {
         // Our checksum-free seek tables have 8-byte entries and 17 bytes of framing.
-        let table_size = 17 + 8 * frame_layout.len() as u64;
+        let num_frames = index_range.div_ceil(FRAME_SIZE);
+        let table_size = 17 + 8 * num_frames as u64;
         let options = GetOptions::new().with_range(Some(GetRange::Suffix(table_size)));
         let result = block_on(location.store.get_opts(key, options))
             .map_err(|error| location.error(key, error))?;
         let table_start = result.range.start;
         let bytes = block_on(result.bytes()).map_err(|error| location.error(key, error))?;
         if bytes.len() as u64 != table_size {
-            return Err(EgtError::Internal("truncated tablebase seek table"));
+            return Err(location.invalid_data(key, "truncated tablebase seek table"));
         }
         // zeekstd allocates from the footer count before checking the source length.
         let count = u32::from_le_bytes(bytes[bytes.len() - 9..bytes.len() - 5].try_into().unwrap());
-        if count as usize != frame_layout.len() {
-            return Err(EgtError::Internal("invalid tablebase frame count"));
+        if count as usize != num_frames {
+            return Err(location.invalid_data(key, "invalid tablebase frame count"));
         }
         let mut source = zeekstd::BytesWrapper::new(&bytes);
-        let table = zeekstd::SeekTable::from_seekable(&mut source)?;
+        let table = zeekstd::SeekTable::from_seekable(&mut source)
+            .map_err(|error| location.invalid_data(key, error))?;
         if table.size_comp() != table_start {
-            return Err(EgtError::Internal("invalid tablebase compressed length"));
+            return Err(location.invalid_data(key, "invalid tablebase compressed length"));
         }
-        for (index, frame) in frame_layout.iter().enumerate() {
-            if table.frame_size_decomp(index as u32)? != (frame.len * 2) as u64
-                || table.frame_size_comp(index as u32)? == 0
-            {
-                return Err(EgtError::Internal("invalid tablebase frame length"));
+        for index in 0..num_frames {
+            let len = FRAME_SIZE.min(index_range - index * FRAME_SIZE);
+            let decompressed = table
+                .frame_size_decomp(index as u32)
+                .map_err(|error| location.invalid_data(key, error))?;
+            let compressed = table
+                .frame_size_comp(index as u32)
+                .map_err(|error| location.invalid_data(key, error))?;
+            if decompressed != (len * 2) as u64 || compressed == 0 {
+                return Err(location.invalid_data(key, format!("invalid frame {index} length")));
             }
         }
         Ok(table)
@@ -613,7 +604,7 @@ impl EgtFileReader {
             return Ok(&[]);
         }
         let (frame_idx, offset) = self.locate_frame(start);
-        if end - start > self.frame_layout[frame_idx].len - offset {
+        if end - start > self.frame_len(frame_idx) - offset {
             return Err(EgtError::Internal(
                 "frame_chunk range crosses a frame boundary",
             ));
@@ -637,7 +628,7 @@ impl EgtFileReader {
             return Ok(Some(&[]));
         }
         let (frame_idx, offset) = self.locate_frame(start);
-        if end - start > self.frame_layout[frame_idx].len - offset {
+        if end - start > self.frame_len(frame_idx) - offset {
             return Err(EgtError::Internal(
                 "frame_chunk range crosses a frame boundary",
             ));
@@ -686,15 +677,31 @@ impl EgtFileReader {
     }
 
     fn locate_frame(&self, index: usize) -> (usize, usize) {
-        let frame_idx = self
-            .frame_layout
-            .partition_point(|frame| frame.start <= index)
-            - 1;
-        (frame_idx, index - self.frame_layout[frame_idx].start)
+        (index / FRAME_SIZE, index % FRAME_SIZE)
+    }
+
+    fn frame_len(&self, frame_idx: usize) -> usize {
+        FRAME_SIZE.min(self.egt.index_range() - frame_idx * FRAME_SIZE)
     }
 
     fn frame_bytes(&self, frame_idx: usize) -> usize {
-        self.frame_layout[frame_idx].len * std::mem::size_of::<PackedOutcome>()
+        self.frame_len(frame_idx) * std::mem::size_of::<PackedOutcome>()
+    }
+
+    fn invalid_frame(
+        &self,
+        frame: usize,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> EgtError {
+        EgtError::InvalidData {
+            location: format!(
+                "{} (frame {frame}, indices {}..{})",
+                self.location.describe(&self.key),
+                frame * FRAME_SIZE,
+                frame * FRAME_SIZE + self.frame_len(frame)
+            ),
+            source: source.into(),
+        }
     }
 
     /// Reads an outcome directly by its table-local index.
@@ -743,15 +750,27 @@ impl EgtFileReader {
         } else {
             block_on(self.location.store.get_ranges(&self.key, &ranges))
         }
-        .map_err(|error| self.location.error(&self.key, error))?;
+        .map_err(|error| {
+            // A backend may reject a short range instead of returning partial bytes.
+            // Only classify it as corrupt data when truncation is confirmed.
+            if let Ok(meta) = block_on(self.location.store.head(&self.key)) {
+                if let Some(index) = ranges.iter().position(|range| range.end > meta.size) {
+                    return self.invalid_frame(missing[index], error);
+                }
+            }
+            self.location.error(&self.key, error)
+        })?;
         if compressed.len() != missing.len() {
             return Err(EgtError::Internal("invalid tablebase range count"));
         }
         for ((frame, range), bytes) in missing.into_iter().zip(ranges).zip(compressed) {
             if bytes.len() as u64 != range.end - range.start {
-                return Err(EgtError::Internal("truncated tablebase range"));
+                return Err(self.invalid_frame(frame, "truncated tablebase range"));
             }
-            self.frames[frame] = Some(decode_frame(&bytes, self.frame_layout[frame].len)?);
+            self.frames[frame] = Some(
+                decode_frame(&bytes, self.frame_len(frame))
+                    .map_err(|error| self.invalid_frame(frame, error))?,
+            );
         }
         Ok(())
     }
@@ -1274,7 +1293,7 @@ mod tests {
                 })
         });
         assert!(reader.num_frames() > 1);
-        assert_eq!(reader.frame_layout.last().unwrap().len, 174420);
+        assert_eq!(reader.frame_len(reader.num_frames() - 1), 174420);
         assert!(reader.frame_chunk(FRAME_SIZE - 1, FRAME_SIZE + 1).is_err());
         for (n, &idx) in indexes.iter().enumerate() {
             assert_eq!(
@@ -1284,8 +1303,8 @@ mod tests {
         }
         let pawnful = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
         assert_eq!(pawnful.num_frames(), 1);
-        assert_eq!(pawnful.frame_layout[0].start, 0);
-        assert_eq!(pawnful.frame_layout[0].len, pawnful.egt.index_range());
+        assert_eq!(pawnful.locate_frame(0), (0, 0));
+        assert_eq!(pawnful.frame_len(0), pawnful.egt.index_range());
         assert!(reader.read_from_index(reader.egt.index_range()).is_err());
         assert!(reader.frame_chunk(1, 0).is_err());
         assert!(reader.frame_chunk(0, reader.egt.index_range() + 1).is_err());
@@ -1321,7 +1340,8 @@ mod tests {
 
         for length in [0, 8, 9, 24] {
             std::fs::write(&path, &valid[valid.len() - length..]).unwrap();
-            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
+            assert!(matches!(EgtFileReader::new_from_file(&dir.0, "K_K"),
+                Err(EgtError::InvalidData { location, .. }) if location.ends_with("/K_K.ggegt")));
         }
         // Reject the declared count before zeekstd can allocate from it.
         let mut inflated = valid.clone();
@@ -1330,7 +1350,8 @@ mod tests {
         std::fs::write(&path, inflated).unwrap();
         assert!(matches!(
             EgtFileReader::new_from_file(&dir.0, "K_K"),
-            Err(EgtError::Internal("invalid tablebase frame count"))
+            Err(EgtError::InvalidData { location, source })
+                if location.ends_with("/K_K.ggegt") && source.to_string() == "invalid tablebase frame count"
         ));
 
         // zeekstd, rather than our loader, validates magic and reserved bits.
@@ -1338,14 +1359,18 @@ mod tests {
             let mut corrupt = valid.clone();
             corrupt[offset] ^= 0x04;
             std::fs::write(&path, corrupt).unwrap();
-            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
+            assert!(matches!(
+                EgtFileReader::new_from_file(&dir.0, "K_K"),
+                Err(EgtError::InvalidData { .. })
+            ));
         }
         let mut prefixed = vec![0];
         prefixed.extend_from_slice(&valid);
         std::fs::write(&path, prefixed).unwrap();
         assert!(matches!(
             EgtFileReader::new_from_file(&dir.0, "K_K"),
-            Err(EgtError::Internal("invalid tablebase compressed length"))
+            Err(EgtError::InvalidData { source, .. })
+                if source.to_string() == "invalid tablebase compressed length"
         ));
 
         // The reader deliberately accepts only our checksum-free seek-table format.
@@ -1362,20 +1387,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_frame_range() {
+    fn rejects_corrupt_frames_and_short_ranges() {
         let dir = crate::TestDir::new("short_frame_range");
-        let path = table_path(&dir.0, "K_K");
-        let mut reader = write_fixture(&dir.0, "K_K", |_| PackedOutcome::INVALID);
-        let frame_end = reader.seek_table.frame_end_comp(0).unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_len(frame_end - 1)
-            .unwrap();
-        assert!(matches!(
-            reader.read_from_index(0),
-            Err(EgtError::Internal("truncated tablebase range"))
-        ));
+        for name in ["K_K", "KQ_KR"] {
+            let path = table_path(&dir.0, name);
+            let mut reader = write_fixture(&dir.0, name, |_| PackedOutcome::INVALID);
+            let valid = std::fs::read(&path).unwrap();
+            let last = reader.num_frames() - 1;
+            let frame_end = reader.seek_table.frame_end_comp(last as u32).unwrap();
+            let mut corrupt = valid.clone();
+            corrupt[0] ^= 0xff;
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(matches!(reader.read_from_index(0),
+                Err(EgtError::InvalidData { location, source })
+                    if location.contains(&format!("{name}.ggegt (frame 0, indices 0.."))
+                        && source.to_string().contains("invalid compressed tablebase frame")));
+            std::fs::write(&path, valid).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(frame_end - 1)
+                .unwrap();
+            let frames: Vec<_> = (0..reader.num_frames()).collect();
+            assert!(matches!(reader.ensure_uncompressed_frames(&frames),
+                Err(EgtError::InvalidData { location, .. })
+                    if location.contains(&format!("{name}.ggegt (frame {last}, indices "))));
+        }
     }
 }

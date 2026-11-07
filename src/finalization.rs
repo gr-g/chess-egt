@@ -76,7 +76,7 @@ pub(crate) fn finalize_table(
     if values.len() != egt.index_range() {
         return Err(EgtError::Internal("completed table has wrong length"));
     }
-    let mut writer = EgtFileWriter::new(location, id, egt.index_range(), FRAME_SIZE)?;
+    let writer = EgtFileWriter::new(location, id, egt.index_range(), FRAME_SIZE)?;
     let frames = values.len().div_ceil(FRAME_SIZE);
     let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * FRAME_SIZE;
     // Contiguous batches reuse one encoder each. Indexed collection preserves
@@ -91,9 +91,7 @@ pub(crate) fn finalize_table(
     let (segments, stats): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
     let mut builder = EgtStatsBuilder::new(maxima, invalid);
     builder.merge(stats);
-    writer.write_segments(segments)?;
-    writer.finish()?;
-    let (bytes, sha256) = writer.publish()?;
+    let (bytes, sha256) = writer.publish(segments)?;
     let stats = builder.build(egt, bytes, sha256);
     write_stats(location, id, &stats)?;
     Ok(stats)

@@ -570,7 +570,8 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
   transposed, the unused tail remains zero.
 
 Frames are compressed in parallel and the results are collected. An
-`EgtFileWriter` then streams them in order and appends one seek table through
+`EgtFileWriter` validates their completeness and geometry before a consuming
+publication operation streams them in order and appends one seek table through
 the `object_store` buffered writer.
 
 #### Memory management

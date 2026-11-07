@@ -83,10 +83,7 @@ fn run() -> Result<(), EgtError> {
         configure_generator(&mut generator, &cli)?;
         let start = std::time::Instant::now();
         let tables = generator.generate_selected(&selectors)?;
-        let mut total = AggregateStats {
-            selected_tables: tables.len(),
-            ..Default::default()
-        };
+        let mut total = AggregateStats::default();
         for stats in &tables {
             total.add(stats);
         }

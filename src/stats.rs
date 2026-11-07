@@ -175,34 +175,49 @@ impl Default for AggregateStats {
 }
 
 impl AggregateStats {
-    /// Adds one available table, leaving selection counting to the caller.
+    /// Adds one selected, available table. As with `merge`, selections must be disjoint.
     pub fn add(&mut self, stats: &EgtStats) {
-        self.merge(&Self {
-            selected_tables: 0,
-            available_tables: 1,
-            index_range: stats.index_range,
-            bytes: Some(stats.bytes),
-            num_frames: Some(stats.num_frames),
-            unique_positions: Some(stats.unique_positions),
-            win: Some(stats.win),
-            draw: Some(stats.draw),
-            loss: Some(stats.loss),
-            invalid_opposite_check: Some(stats.invalid_opposite_check),
-            invalid_ep_squares_occupied: Some(stats.invalid_ep_squares_occupied),
-            invalid_illegal_ep_capture: Some(stats.invalid_illegal_ep_capture),
-            redundant: Some(stats.redundant),
-            histogram_win: Some(stats.histogram_win.clone()),
-            histogram_loss: Some(stats.histogram_loss.clone()),
-            longest_dtc_win: Some(stats.longest_dtc_win.clone()),
-            longest_dtc_loss: Some(stats.longest_dtc_loss.clone()),
-        });
+        self.selected_tables += 1;
+        self.available_tables += 1;
+        self.index_range += stats.index_range;
+        self.bytes = sum(self.bytes, Some(stats.bytes));
+        self.num_frames = sum(self.num_frames, Some(stats.num_frames));
+        self.unique_positions = sum(self.unique_positions, Some(stats.unique_positions));
+        self.win = sum(self.win, Some(stats.win));
+        self.draw = sum(self.draw, Some(stats.draw));
+        self.loss = sum(self.loss, Some(stats.loss));
+        self.invalid_opposite_check = sum(
+            self.invalid_opposite_check,
+            Some(stats.invalid_opposite_check),
+        );
+        self.invalid_ep_squares_occupied = sum(
+            self.invalid_ep_squares_occupied,
+            Some(stats.invalid_ep_squares_occupied),
+        );
+        self.invalid_illegal_ep_capture = sum(
+            self.invalid_illegal_ep_capture,
+            Some(stats.invalid_illegal_ep_capture),
+        );
+        self.redundant = sum(self.redundant, Some(stats.redundant));
+        merge_distribution(
+            &mut self.histogram_win,
+            Some(&stats.histogram_win),
+            &mut self.longest_dtc_win,
+            Some(&stats.longest_dtc_win),
+        );
+        merge_distribution(
+            &mut self.histogram_loss,
+            Some(&stats.histogram_loss),
+            &mut self.longest_dtc_loss,
+            Some(&stats.longest_dtc_loss),
+        );
     }
 
     pub(crate) fn add_record(&mut self, record: &StatsRecord) {
-        self.selected_tables += 1;
         match record {
             StatsRecord::Complete(stats) => self.add(stats),
             StatsRecord::Missing(_) => {
+                self.selected_tables += 1;
                 self.index_range += record.index_range();
                 self.bytes = None;
                 self.num_frames = None;
@@ -246,15 +261,15 @@ impl AggregateStats {
         self.redundant = sum(self.redundant, other.redundant);
         merge_distribution(
             &mut self.histogram_win,
-            &other.histogram_win,
+            other.histogram_win.as_ref(),
             &mut self.longest_dtc_win,
-            &other.longest_dtc_win,
+            other.longest_dtc_win.as_deref(),
         );
         merge_distribution(
             &mut self.histogram_loss,
-            &other.histogram_loss,
+            other.histogram_loss.as_ref(),
             &mut self.longest_dtc_loss,
-            &other.longest_dtc_loss,
+            other.longest_dtc_loss.as_deref(),
         );
     }
 
@@ -331,9 +346,9 @@ fn sum<T: Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
 
 fn merge_distribution(
     histogram: &mut Option<BTreeMap<u16, usize>>,
-    source: &Option<BTreeMap<u16, usize>>,
+    source: Option<&BTreeMap<u16, usize>>,
     examples: &mut Option<Vec<LongestDtcPosition>>,
-    source_examples: &Option<Vec<LongestDtcPosition>>,
+    source_examples: Option<&[LongestDtcPosition]>,
 ) {
     if let (Some(histogram), Some(source), Some(examples), Some(source_examples)) = (
         histogram.as_mut(),
@@ -370,11 +385,15 @@ pub(crate) fn read_record(location: &Location, id: &TableId) -> EgtResult<StatsR
     let key = location.key(&id.relative_path("json"));
     let result = block_on(location.store.get(&key)).map_err(|error| location.error(&key, error))?;
     let bytes = block_on(result.bytes()).map_err(|error| location.error(&key, error))?;
-    let record: StatsRecord = serde_json::from_slice(&bytes)?;
+    let record: StatsRecord =
+        serde_json::from_slice(&bytes).map_err(|error| location.invalid_data(&key, error))?;
     match &record {
-        StatsRecord::Complete(stats) => stats.validate(id)?,
+        StatsRecord::Complete(stats) => stats
+            .validate(id)
+            .map_err(|error| location.invalid_data(&key, error))?,
         StatsRecord::Missing(_) if record != StatsRecord::missing(id)? => {
-            return Err(invalid_data(
+            return Err(location.invalid_data(
+                &key,
                 "placeholder identity or index range does not match table",
             ));
         }
@@ -574,6 +593,11 @@ mod tests {
 
     #[test]
     fn aggregation_sums_counts_and_keeps_deterministic_global_maxima() {
+        let mut direct = AggregateStats::default();
+        direct.add(&stats());
+        direct.validate().unwrap();
+        assert_eq!((direct.selected_tables, direct.available_tables), (1, 1));
+        assert_eq!(direct, aggregate(&[StatsRecord::Complete(stats())]));
         let low = StatsRecord::Complete(stats());
         let mut high = stats();
         high.histogram_win = BTreeMap::from([(5, 3)]);

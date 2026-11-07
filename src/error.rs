@@ -50,6 +50,15 @@ pub enum EgtError {
             source: object_store::Error,
         },
 
+    /// A stored binary or JSON artifact is malformed. The source retains parse
+    /// or validation details; location may also identify a frame or index range.
+    #[error("invalid data at {location}: {source}")]
+    InvalidData {
+        location: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// Memory for a generation working array could not be allocated.
     #[error("failed to allocate {bytes} bytes for {context}: {reason}; generation working memory is separate from the cache budget")]
     WorkingMemoryAllocation {

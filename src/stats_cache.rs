@@ -167,14 +167,18 @@ fn read_summary(location: &Location, prefix: &str) -> EgtResult<Option<Aggregate
         Err(error) => return Err(location.error(&key, error)),
     };
     let bytes = block_on(result.bytes()).map_err(|error| location.error(&key, error))?;
-    let summary: Summary = serde_json::from_slice(&bytes)?;
+    let summary: Summary =
+        serde_json::from_slice(&bytes).map_err(|error| location.invalid_data(&key, error))?;
     if summary.hierarchy != prefix || summary.stats.selected_tables == 0 {
-        return Err(EgtError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(location.invalid_data(
+            &key,
             "cached summary must match the requested hierarchy and contain tables",
-        )));
+        ));
     }
-    summary.stats.validate()?;
+    summary
+        .stats
+        .validate()
+        .map_err(|error| location.invalid_data(&key, error))?;
     Ok(Some(summary.stats))
 }
 
@@ -330,8 +334,10 @@ mod tests {
         let id = TableId::parse("K_K").unwrap();
         for bytes in [b"broken".to_vec(), b"{}".to_vec()] {
             put(&location, &id.relative_path("json"), bytes);
-            assert!(query(&location, &["K_K"]).is_err());
-            assert!(cache(&location, &["2"]).is_err());
+            for result in [query(&location, &["K_K"]), cache(&location, &["2"])] {
+                assert!(matches!(result, Err(EgtError::InvalidData { location, .. })
+                    if location.ends_with("/K_K.json")));
+            }
         }
         let missing = serde_json::to_vec(&StatsRecord::missing(&id).unwrap()).unwrap();
         put(&location, &id.relative_path("json"), missing);
@@ -352,7 +358,8 @@ mod tests {
         for value in invalid {
             let bytes = serde_json::to_vec(&value).unwrap();
             put(&location, "2/stats.json", bytes);
-            assert!(query(&location, &["2"]).is_err());
+            assert!(matches!(query(&location, &["2"]),
+                Err(EgtError::InvalidData { location, .. }) if location.ends_with("/2/stats.json")));
             assert!(query(&location, &["K_K"]).is_ok());
         }
         assert!(cache(&location, &["2"]).is_ok());

@@ -119,6 +119,17 @@ impl Location {
         }
     }
 
+    pub(crate) fn invalid_data(
+        &self,
+        key: &ObjectPath,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> EgtError {
+        EgtError::InvalidData {
+            location: self.describe(key),
+            source: source.into(),
+        }
+    }
+
     /// Validates an existing root descriptor without creating or modifying objects.
     /// Success is shared across clones; errors are never cached. Roots must remain
     /// immutable while a Location is in use, including after this validation.
@@ -129,7 +140,8 @@ impl Location {
         let key = self.prefix.clone().join("format.json");
         let result = block_on(self.store.get(&key)).map_err(|error| self.error(&key, error))?;
         let bytes = block_on(result.bytes()).map_err(|error| self.error(&key, error))?;
-        let actual: FormatDescriptor = serde_json::from_slice(&bytes)?;
+        let actual: FormatDescriptor =
+            serde_json::from_slice(&bytes).map_err(|error| self.invalid_data(&key, error))?;
         if actual != FormatDescriptor::default() {
             return Err(EgtError::InvalidStorageLocation(format!(
                 "unsupported tablebase format at {}: {:?}",
@@ -238,8 +250,14 @@ mod tests {
         assert!(location.format_validated.get().is_none());
 
         block_on(location.store.put(&key, b"not json".to_vec().into())).unwrap();
-        assert!(matches!(clone.validate_format(), Err(EgtError::Json(_))));
-        assert!(matches!(clone.ensure_format(), Err(EgtError::Json(_))));
+        assert!(
+            matches!(clone.validate_format(), Err(EgtError::InvalidData { location, .. })
+            if location.ends_with("/format.json"))
+        );
+        assert!(matches!(
+            clone.ensure_format(),
+            Err(EgtError::InvalidData { .. })
+        ));
         assert!(location.format_validated.get().is_none());
 
         let bytes = serde_json::to_vec(&FormatDescriptor::default()).unwrap();
@@ -255,7 +273,10 @@ mod tests {
             format_validated: Arc::new(OnceLock::new()),
             ..location
         };
-        assert!(matches!(fresh.validate_format(), Err(EgtError::Json(_))));
+        assert!(matches!(
+            fresh.validate_format(),
+            Err(EgtError::InvalidData { .. })
+        ));
         assert!(fresh.format_validated.get().is_none());
     }
 

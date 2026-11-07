@@ -22,10 +22,7 @@ fn write_artifact(root: &Path, name: &str, extension: &str, bytes: &[u8]) {
 }
 
 fn aggregate(tables: &[EgtStats]) -> AggregateStats {
-    let mut total = AggregateStats {
-        selected_tables: tables.len(),
-        ..Default::default()
-    };
+    let mut total = AggregateStats::default();
     for stats in tables {
         total.add(stats);
     }
@@ -328,8 +325,10 @@ fn input_lookup_falls_back_only_for_missing_files() {
     };
     assert!(probe().is_ok());
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
-    let error = probe().unwrap_err();
-    assert!(!matches!(error, EgtError::FileNotFound(_)));
+    assert!(
+        matches!(probe(), Err(EgtError::InvalidData { location, .. })
+        if location.contains("input_fallback_input") && location.ends_with("/K_K.ggegt"))
+    );
     std::fs::remove_file(table_path(&input.0, "K_K", "ggegt")).unwrap();
     assert!(probe().is_ok());
 }
