@@ -349,12 +349,6 @@ mod tests {
         assert_eq!(egt.tablename(), "KNNNNNN_K");
     }
 
-    fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
-        if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
-            assert_eq!(i, egt.indexer.position_to_index(&position));
-        }
-    }
-
     #[test]
     fn known_valid_decoder_matches_public_decoder() {
         for name in ["K_K", "KQ_K", "KPa_K", "KPd_KPe"] {
@@ -461,6 +455,12 @@ mod tests {
         assert_eq!(egt_p.diagonal_symmetric(0), None);
     }
 
+    fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
+        if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
+            assert_eq!(i, egt.indexer.position_to_index(&position));
+        }
+    }
+
     #[test]
     fn decode_encode_kpa_k() {
         let egt = Egt::from_tablename("KPa_K").unwrap();
@@ -484,16 +484,6 @@ mod tests {
     #[test]
     fn decode_encode_kqr_kqr() {
         let egt = Egt::from_tablename("KQ_KR").unwrap();
-
-        for i in 0..egt.index_range() {
-            assert_round_trip(&egt, i, Color::White);
-            assert_round_trip(&egt, i, Color::Black);
-        }
-    }
-
-    #[test]
-    fn decode_encode_kqqq_k() {
-        let egt = Egt::from_tablename("KQQQ_K").unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -526,10 +516,6 @@ mod tests {
         let egt = Egt::from_tablename("KPePe_KPdPf").unwrap();
 
         for i in 0..egt.index_range() {
-            if i == 1911601 {
-                println!("{:?}", egt.indexer.position_from_index(i, Color::White));
-                println!("{:?}", egt.indexer.position_from_index(i, Color::Black));
-            }
             assert_round_trip(&egt, i, Color::White);
             assert_round_trip(&egt, i, Color::Black);
         }

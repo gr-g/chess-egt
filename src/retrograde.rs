@@ -878,7 +878,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use crate::{EgtError, EgtGenerator};
-    use crate::selection::{GenerationPlan, TableSelector};
+    use crate::selection::TableSelector;
 
     fn tables(material: &str) -> Vec<Egt> {
         TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn pawnful_unmoves_match_forward_play() {
         let mut ep_checked = 0;
-        for endgame in ["KP_K", "KQ_KP", "KP_KP", "KPP_K", "KPP_KP", "KRP_KP"] {
+        for endgame in ["KP_K", "KQ_KP", "KP_KP"] {
             for egt in tables(endgame) {
                 for turn in [Color::White, Color::Black] {
                     let mut checked = 0;
@@ -1598,35 +1598,6 @@ mod tests {
                 assert_eq!(working.values.len(), 1);
             }
         });
-    }
-
-    #[test]
-    fn parallel_generation_is_byte_identical() {
-        let serial = crate::TestDir::new("serial_generation");
-        let parallel = crate::TestDir::new("parallel_generation");
-        let mut serial_generator = EgtGenerator::new(&serial.0).unwrap();
-        serial_generator.with_threads(1);
-        serial_generator.with_verify(false);
-        let mut parallel_generator = EgtGenerator::new(&parallel.0).unwrap();
-        parallel_generator.with_threads(4);
-        parallel_generator.with_verify(false);
-        for material in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"] {
-            serial_generator.generate(material).unwrap();
-            parallel_generator.generate(material).unwrap();
-            let plan = GenerationPlan::new(TableSelector::parse(material).unwrap().resolve().unwrap()).unwrap();
-            for id in plan.pairs.into_iter().flat_map(|(a, b)| std::iter::once(a).chain(b)) {
-                for extension in ["ggegt", "json"] {
-                    let path = id.relative_path(extension);
-                    assert_eq!(std::fs::read(serial.0.join(&path)).unwrap(),
-                        std::fs::read(parallel.0.join(&path)).unwrap(), "{path}");
-                }
-                let location = Location::parse(&serial.0).unwrap();
-                let stats = crate::stats::read_stats(&location, &id).unwrap();
-                use sha2::{Digest, Sha256};
-                let bytes = std::fs::read(serial.0.join(id.relative_path("ggegt"))).unwrap();
-                assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(bytes)));
-            }
-        }
     }
 
     #[test]

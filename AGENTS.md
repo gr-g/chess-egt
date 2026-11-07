@@ -12,8 +12,6 @@
   outcomes via HTTP, similarly to the Lichess tablebase API.
 - The exact library interface to expose and the command line interface are
   still to be finalized.
-- Always run `cargo test --release` for testing, otherwise it takes too much
-  time.
 - Keeping code simple, short and elegant has priority over finding a way to
   implement all desired features. If it cannot be done with simple, short and
   elegant code, then perhaps it should not be done.

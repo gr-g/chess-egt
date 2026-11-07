@@ -24,6 +24,10 @@ The library API, command-line interface, and file format are not yet finalized.
 - Support scaling on cloud resources (compute-optimized instances and cloud
   object storage) to potentially reach 7-piece completeness and beyond.
 
+This tablebase is intended as a resource for online lookup. Is is not intended
+for use in chess engines, where the DTZ metric is most suitable and where
+there compact win/draw/loss representations are needed.
+
 ## Usage
 
 ### Quick start
@@ -85,7 +89,7 @@ side-not-to-move has the pawn).
 
 Run the test suite with:
 ```sh
-cargo test --release
+cargo test
 ```
 
 Two Python scripts are available to export statistics from a current tablebase.
@@ -98,11 +102,11 @@ python3 scripts/export_summary_stats.py ROOT summary_stats.csv
 
 ### API server
 
-Run an API server with a local tablebase root:
+Run an API server with tables read from an S3 bucket:
 
 ```sh
 cargo run --release --bin chess-egt-server -- \
-  --path ./ggegt --cache-size 1GiB --bind localhost:44348
+  --path s3://my-ggegt-bucket/ --cache-size 1GiB --bind localhost:44348
 
 # Get statistics on 3-piece endgames
 curl --get http://localhost:44348/stats?tables=3
