@@ -70,7 +70,6 @@ use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 use crate::error::EgtResult;
 use crate::table_id::PawnKey;
 use std::cmp::Reverse;
-use std::collections::HashMap;
 
 
 // Precompute the values of the binomial coefficients C(n, k) and
@@ -199,13 +198,18 @@ struct IndexerPawnGroup {
 
 #[derive(Clone, Debug)]
 struct PawnMap {
-    to_index: HashMap<PawnRanks, usize>,
+    // Unrepresented rank/EP combinations are left as usize::MAX.
+    to_index: Vec<usize>,
     from_index: Vec<PawnRanks>,
 }
 
 impl PawnMap {
     fn new(groups: &[IndexerPawnGroup]) -> Self {
-        let mut map = Self { to_index: HashMap::new(), from_index: Vec::new() };
+        let n_pawns: usize = groups.iter().map(|group| group.order.len()).sum();
+        let mut map = Self {
+            to_index: vec![usize::MAX; 9 * 6usize.pow(n_pawns as u32)],
+            from_index: Vec::new(),
+        };
         map.enumerate(groups, 0, &mut ArrayVec::new());
         map
     }
@@ -239,8 +243,21 @@ impl PawnMap {
         }
     }
 
+    // Base-six pawn ranks followed by an EP selector: none, then files a-h.
+    fn key(ranks: impl Iterator<Item = u8>, ep: Option<u8>) -> usize {
+        ranks.fold(0, |key, rank| key * 6 + rank as usize - 1) * 9
+            + ep.map_or(0, |file| file as usize + 1)
+    }
+
+    fn index(&self, ranks: impl Iterator<Item = u8>, ep: Option<u8>) -> usize {
+        let index = self.to_index[Self::key(ranks, ep)];
+        assert_ne!(index, usize::MAX, "pawn configuration does not match the piece set");
+        index
+    }
+
     fn insert(&mut self, configuration: PawnRanks) {
-        self.to_index.insert(configuration.clone(), self.from_index.len());
+        let key = Self::key(configuration.0.iter().copied(), configuration.1);
+        self.to_index[key] = self.from_index.len();
         self.from_index.push(configuration);
     }
 }
@@ -403,11 +420,11 @@ impl Indexer {
         // pawns first and their ranks normalized to the side to move.
 
         let pawn_index = self.pawn_map.as_ref().map_or(0, |pawn_map| {
-            let ranks = coord[..self.n_pawns].iter().map(|&(r, _)| r as u8).collect();
+            let ranks = coord[..self.n_pawns].iter().map(|&(r, _)| r as u8);
             let ep = position.legal_ep_square().map(|sq| {
                 (if REFLECTED { sq.flip_horizontal() } else { sq }).file().to_u32() as u8
             });
-            pawn_map.to_index[&(ranks, ep)]
+            pawn_map.index(ranks, ep)
         });
         // Now `pawn_index` selects the slice for these pawn ranks and legal
         // en passant status, or is zero for a pawnless table.
@@ -466,12 +483,10 @@ impl Indexer {
         debug_assert!(index < self.index_range);
         let mut coord = Self::filled_coord(self.n_pieces);
         let mut pidx = Self::filled_pidx(self.n_pieces);
-        self.index_to_cpidx(&mut pidx, index % self.nonpawn_combinations);
-        // Now `pidx` has the compact non-pawn indices for the selected slice.
-        // The quotient of `index` identifies the pawn configuration; the
-        // remainder above encodes only the non-pawn placement within that slice.
-
         let ep_file = if let Some(pawn_map) = &self.pawn_map {
+            // The quotient selects the pawn configuration; the remainder
+            // encodes the non-pawn placement within that slice.
+            self.index_to_cpidx(&mut pidx, index % self.nonpawn_combinations);
             let (ranks, ep) = &pawn_map.from_index[index / self.nonpawn_combinations];
             for group in &self.pawns {
                 for i in group.span.0..group.span.1 {
@@ -487,6 +502,7 @@ impl Indexer {
             // values in [0..64, 0..63, 0..62, ...].
             ep.map(|file| File::new(file as u32))
         } else {
+            self.index_to_cpidx(&mut pidx, index);
             Self::unmap_kings(&mut pidx);
             // Now `pidx` has values in [0..64, 0..63, 0..62, ...], with the
             // king-pair lookup index replaced by two compact square indices.
@@ -945,14 +961,14 @@ mod tests {
                 let mut coord = Indexer::filled_coord(indexer.n_pieces);
                 let mut pidx = Indexer::filled_pidx(indexer.n_pieces);
                 indexer.position_to_coord::<false>(&mut coord, &raw);
-                let ranks = coord[..indexer.n_pawns].iter().map(|&(r, _)| r as u8).collect();
-                let key = (ranks, Some(File::E.to_u32() as u8));
+                let ranks = coord[..indexer.n_pawns].iter().map(|&(r, _)| r as u8);
+                let ep = Some(File::E.to_u32() as u8);
                 let pawn_map = indexer.pawn_map.as_ref().unwrap();
                 if coord[0].0 != 4 {
-                    assert!(!pawn_map.to_index.contains_key(&key), "{fen}, {turn:?}");
+                    assert_eq!(pawn_map.to_index[PawnMap::key(ranks, ep)], usize::MAX, "{fen}, {turn:?}");
                     continue;
                 }
-                let pawn_index = pawn_map.to_index[&key];
+                let pawn_index = pawn_map.index(ranks, ep);
                 indexer.sort_coord_repeated_pieces(&mut coord);
                 indexer.coord_to_pidx(&coord, &mut pidx);
                 Indexer::compact_pidx(&mut pidx);
@@ -997,6 +1013,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "pawn configuration does not match the piece set")]
+    fn pawn_map_rejects_missing_configuration() {
+        let indexer = indexer(&[pawn_group(File::E, &[STM])]);
+        indexer.pawn_map.as_ref().unwrap().index(std::iter::once(4), Some(File::E.to_u32() as u8));
+    }
+
+    #[test]
     fn combined_pawn_groups_encode_every_rank_subset_and_color_order() {
         let mut legal_positions = 0;
         for k in 1..=6 {
@@ -1010,7 +1033,7 @@ mod tests {
                 assert_eq!(indexer.pawns[0].order, order);
                 assert_eq!(indexer.pawns[0].span, (0, k));
                 assert_eq!(pawn_map.from_index.len(), N_CHOOSE_K[k][6]);
-                assert_eq!(pawn_map.to_index.len(), pawn_map.from_index.len());
+                assert_eq!(pawn_map.to_index.iter().filter(|&&index| index != usize::MAX).count(), pawn_map.from_index.len());
                 let king_combinations = (64 - k) * (63 - k);
                 assert_eq!(indexer.nonpawn_combinations, king_combinations);
                 assert_eq!(indexer.index_range, N_CHOOSE_K[k][6] * king_combinations);
@@ -1026,7 +1049,7 @@ mod tests {
                         coord[i] = (rank as usize, File::E.to_usize());
                     }
                     let key = (normalized_ranks, None);
-                    let pawn_index = pawn_map.to_index[&key];
+                    let pawn_index = pawn_map.index(key.0.iter().copied(), key.1);
                     assert!(seen.insert(pawn_index));
                     assert_eq!(pawn_map.from_index[pawn_index], key);
 
@@ -1085,8 +1108,8 @@ mod tests {
                     coord[k + 1] = (0, 0);
                     coord[k + 2] = (7, 7);
                     let ranks: ArrayVec<u8, 6> = coord[..k + 1].iter().map(|&(r, _)| r as u8).collect();
-                    let no_ep = pawn_map.to_index[&(ranks.clone(), None)];
-                    let pawn_index = pawn_map.to_index[&(ranks.clone(), Some(File::E.to_u32() as u8))];
+                    let no_ep = pawn_map.index(ranks.iter().copied(), None);
+                    let pawn_index = pawn_map.index(ranks.iter().copied(), Some(File::E.to_u32() as u8));
                     assert_eq!(pawn_index, no_ep + 1);
                     assert_eq!(pawn_map.from_index[pawn_index], (ranks, Some(File::E.to_u32() as u8)));
                     for turn in [Color::White, Color::Black] {
@@ -1103,8 +1126,9 @@ mod tests {
 
                     // A neighbor elsewhere on the file has no EP map entry.
                     coord[0].0 = 3;
-                    let ranks = coord[..k + 1].iter().map(|&(r, _)| r as u8).collect();
-                    assert!(!pawn_map.to_index.contains_key(&(ranks, Some(File::E.to_u32() as u8))));
+                    let ranks = coord[..k + 1].iter().map(|&(r, _)| r as u8);
+                    let key = PawnMap::key(ranks, Some(File::E.to_u32() as u8));
+                    assert_eq!(pawn_map.to_index[key], usize::MAX);
                 }
             }
         }
@@ -1134,14 +1158,14 @@ mod tests {
             let indexer = indexer(&groups);
             let pawn_map = indexer.pawn_map.as_ref().unwrap();
             let ranks: ArrayVec<u8, 6> = [4; 3].into_iter().collect();
-            let no_ep = pawn_map.to_index[&(ranks.clone(), None)];
-            assert_eq!(pawn_map.to_index.len(), pawn_map.from_index.len());
+            let no_ep = pawn_map.index(ranks.iter().copied(), None);
+            assert_eq!(pawn_map.to_index.iter().filter(|&&index| index != usize::MAX).count(), pawn_map.from_index.len());
             assert_eq!(pawn_map.from_index.iter().filter(|(r, _)| r == &ranks).count(), 1 + ep_files.len());
             let coord: CoordBuf = [(4, 2), (4, 3), (4, 4), (0, 0), (7, 7)].into_iter().collect();
             for (offset, file) in ep_files.into_iter().enumerate() {
                 let key = (ranks.clone(), Some(file.to_u32() as u8));
                 let pawn_index = no_ep + offset + 1;
-                assert_eq!(pawn_map.to_index[&key], pawn_index);
+                assert_eq!(pawn_map.index(key.0.iter().copied(), key.1), pawn_index);
                 assert_eq!(pawn_map.from_index[pawn_index], key);
                 for turn in [Color::White, Color::Black] {
                     let without_ep = coord_to_position(&indexer, None, &coord, turn).unwrap();

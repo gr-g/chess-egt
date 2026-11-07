@@ -423,10 +423,12 @@ or [op1](https://github.com/lichess-org/op1/blob/main/mbeval-sys/mbeval/src/mbev
 tablebases, are more efficient, but also more cumbersome.
 
 The positions of the pawns on the ranks and the en passant rights are encoded
-together into a combined pawn index. For each combined pawn index, the
-positions of the other pieces are combinatorially encoded without overlaps
-into a fixed-size range. The `Indexer` exposes one contiguous index range for
-the entire table, combining the pawn and non-pawn indices.
+together into a combined pawn index. A precomputed array maps a base-six
+encoding of the pawn ranks and an en passant selector to this index.
+For each combined pawn index, the positions of the other pieces are
+combinatorially encoded without overlaps into a fixed-size range. The
+`Indexer` exposes one contiguous index range for the entire table, combining
+the pawn and non-pawn indices.
 
 For the detailed indexing algorithm, see the module documentation in
 [`src/egt/indexer.rs`](src/egt/indexer.rs).
