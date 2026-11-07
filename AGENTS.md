@@ -8,6 +8,8 @@
   retrograde analysis (`RetrogradeSolver`).
 - Tables for all 3-piece, 4-piece and 5-piece endgames were generated and
   verified successfully, they are available in `~/ggegt/`.
+- An API server is available (`bin/server.rs`) providing stats and position
+  outcomes via HTTP, similarly to the Lichess tablebase API.
 - The exact library interface to expose and the command line interface are
   still to be finalized.
 - Always run `cargo test --release` for testing, otherwise it takes too much

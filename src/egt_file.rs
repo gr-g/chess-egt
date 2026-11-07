@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
@@ -234,6 +234,71 @@ impl SharedFileCache {
         let (name, reflected) = position_table_name(position)?;
         let (index, outcome) = self.probe_routed(position, name.as_str(), reflected)?;
         outcome.to_outcome_at(index)
+    }
+
+    /// Groups direct probes by canonical table, preserving the input order.
+    pub(crate) fn probe_direct_outcomes(&self, positions: &[Chess]) -> EgtResult<Vec<DtcOutcome>> {
+        let mut groups = BTreeMap::<String, Vec<(usize, bool)>>::new();
+        for (slot, position) in positions.iter().enumerate() {
+            let (name, reflected) = position_table_name(position)?;
+            groups
+                .entry(name.to_string())
+                .or_default()
+                .push((slot, reflected));
+        }
+        let mut outcomes = vec![DtcOutcome::Draw; positions.len()];
+        for (name, requests) in groups {
+            let file = self.file(&name)?;
+            let reader = file
+                .read()
+                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+            let indices = requests
+                .iter()
+                .map(|&(slot, reflected)| {
+                    reader.map_routed_position_to_index(&positions[slot], reflected)
+                })
+                .collect::<EgtResult<Vec<_>>>()?;
+            let mut frames: Vec<_> = indices
+                .iter()
+                .map(|&index| reader.locate_frame(index).0)
+                .collect();
+            frames.sort_unstable();
+            frames.dedup();
+            let values = if let Some(values) = reader.read_indices_cached(&indices)? {
+                for &frame in &frames {
+                    self.record_access(&file, frame, reader.frame_bytes(frame))?;
+                }
+                drop(reader);
+                Ok(values)
+            } else {
+                drop(reader);
+                let mut writer = file
+                    .write()
+                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+                // Recheck residency under the write guard: another probe may have warmed it.
+                let result = writer.ensure_uncompressed_frames(&frames).and_then(|()| {
+                    writer
+                        .read_indices_cached(&indices)?
+                        .ok_or(EgtError::Internal(
+                            "expected resident frames after batch read",
+                        ))
+                });
+                // A later decode can fail after earlier frames were installed.
+                for &frame in &frames {
+                    if writer.frames[frame].is_some() {
+                        self.record_access(&file, frame, writer.frame_bytes(frame))?;
+                    }
+                }
+                drop(writer);
+                result
+            };
+            // Copy outcomes before eviction, including when the cache budget is zero.
+            self.enforce_limit()?;
+            for ((&(slot, _), index), value) in requests.iter().zip(indices).zip(values?) {
+                outcomes[slot] = value.to_outcome_at(index)?;
+            }
+        }
+        Ok(outcomes)
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
@@ -786,6 +851,49 @@ impl EgtFileReader {
 
         let data = self.get_frame_data(frame_idx)?;
         Ok(data[offset])
+    }
+
+    fn read_indices_cached(&self, indices: &[usize]) -> EgtResult<Option<Vec<MaybeDtcOutcome>>> {
+        indices
+            .iter()
+            .map(|&index| self.read_from_index_cached(index))
+            .collect()
+    }
+
+    /// Loads distinct requested frames with one multi-range call, skipping warm frames.
+    fn ensure_uncompressed_frames(&mut self, frames: &[usize]) -> EgtResult<()> {
+        let missing: Vec<_> = frames
+            .iter()
+            .copied()
+            .filter(|&frame| self.frames[frame].is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let Some(table) = &self.seek_table else {
+            for frame in missing {
+                self.ensure_uncompressed(frame)?;
+            }
+            return Ok(());
+        };
+        let ranges = missing
+            .iter()
+            .map(|&frame| {
+                Ok(table.frame_start_comp(frame as u32)?..table.frame_end_comp(frame as u32)?)
+            })
+            .collect::<EgtResult<Vec<_>>>()?;
+        let compressed = block_on(self.location.store.get_ranges(&self.key, &ranges))
+            .map_err(|error| self.location.error(&self.key, error))?;
+        if compressed.len() != missing.len() {
+            return Err(EgtError::Internal("invalid tablebase range count"));
+        }
+        for ((frame, range), bytes) in missing.into_iter().zip(ranges).zip(compressed) {
+            if bytes.len() as u64 != range.end - range.start {
+                return Err(EgtError::Internal("truncated tablebase range"));
+            }
+            self.frames[frame] = Some(decode_frame(&bytes, self.frame_layout[frame].len)?);
+        }
+        Ok(())
     }
 
     /// Writes an outcome directly by its table-local index.

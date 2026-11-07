@@ -56,6 +56,13 @@ pub enum DtcOutcome {
     Loss(ConversionType, u16),
 }
 
+/// A position's outcome and its legal moves with successor-side-to-move outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeWithMoves {
+    pub outcome: DtcOutcome,
+    pub moves: Vec<(Move, DtcOutcome)>,
+}
+
 impl Ord for DtcOutcome {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
@@ -206,6 +213,20 @@ impl EgtGenerator {
     }
 }
 
+/// Probes endgame tables using a shared frame cache.
+///
+/// [`probe`](Self::probe) returns the position's [`DtcOutcome`].
+/// [`probe_with_moves`](Self::probe_with_moves) returns a [`ProbeWithMoves`] containing:
+///
+/// - `outcome: DtcOutcome`: the root position's outcome.
+/// - `moves: Vec<(Move, DtcOutcome)>`: all legal moves in
+///   `Chess::legal_moves()` order, paired with each successor's outcome **from the
+///   successor's side to move**. Outcomes are not inverted or distance-adjusted.
+///
+/// The root and cloned, played successors are probed in one batch. Terminal
+/// positions still probe the root and return an empty move list. Lookup errors
+/// are returned directly, as with `probe`; a failed lookup fails the whole call.
+/// The API is synchronous; async callers should use `tokio::task::spawn_blocking`.
 pub struct EgtProber {
     base_path: Location,
     /// Additional path used to look up dependency files. If `None`, only
@@ -270,6 +291,31 @@ impl EgtProber {
     /// Probes a position using the internally synchronized shared cache.
     pub fn probe(&self, position: &Chess) -> EgtResult<DtcOutcome> {
         self.cache.probe_direct_outcome(position)
+    }
+
+    /// Probes the root and all legal successors in one batch.
+    ///
+    /// Moves retain `position.legal_moves()` order. Each move's outcome is from
+    /// the successor's side to move, without inversion or distance adjustment.
+    /// Terminal positions have an empty move list. Lookup errors are returned
+    /// directly, as with `probe`.
+    pub fn probe_with_moves(&self, position: &Chess) -> EgtResult<ProbeWithMoves> {
+        let moves = position.legal_moves();
+        let mut positions = Vec::with_capacity(1 + moves.len());
+        positions.push(position.clone());
+        for m in &moves {
+            let mut successor = position.clone();
+            successor.play_unchecked(*m);
+            positions.push(successor);
+        }
+        let outcomes = self.cache.probe_direct_outcomes(&positions)?;
+        Ok(ProbeWithMoves {
+            outcome: outcomes[0],
+            moves: moves
+                .into_iter()
+                .zip(outcomes.into_iter().skip(1))
+                .collect(),
+        })
     }
 
     /// Verifies exactly the tables selected, without implicitly adding twins.
@@ -867,6 +913,43 @@ mod tests {
             .find_map(|index| egt.position_from_index(index, Color::White))
             .unwrap();
         prober.probe(&position).unwrap();
+    }
+
+    #[test]
+    fn probe_with_moves_matches_scalar_probes() {
+        use shakmaty::{CastlingMode, fen::Fen};
+
+        let dir = TestDir::new("probe_with_moves");
+        unverified_generator(&dir.0)
+            .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
+            .unwrap();
+        let mut prober = EgtProber::new(&dir.0).unwrap();
+        prober.with_cache_size(0).unwrap();
+        for fen in [
+            "7k/8/8/8/8/8/P7/K7 w - - 0 1",
+            "7k/P7/2K5/8/8/8/8/8 w - - 0 1",
+            "8/8/8/8/8/1k6/P7/7K b - - 0 1",
+            "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1",
+            "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",
+        ] {
+            let position: Chess = fen
+                .parse::<Fen>()
+                .unwrap()
+                .into_position(CastlingMode::Standard)
+                .unwrap();
+            let result = prober.probe_with_moves(&position).unwrap();
+            assert_eq!(result.outcome, prober.probe(&position).unwrap(), "{fen}");
+            let expected: Vec<_> = position
+                .legal_moves()
+                .into_iter()
+                .map(|m| {
+                    let mut successor = position.clone();
+                    successor.play_unchecked(m);
+                    (m, prober.probe(&successor).unwrap())
+                })
+                .collect();
+            assert_eq!(result.moves, expected, "{fen}");
+        }
     }
 
     #[test]
