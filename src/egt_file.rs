@@ -102,6 +102,23 @@ impl MaybeDtcOutcome {
     }
 }
 
+/// Attempts to load an existing table, looking it up first in `input_path`
+/// (if set) and then in `base_path`, falling back only when a file is missing.
+fn load_existing_file(
+    base_path: &Location,
+    input_path: Option<&Location>,
+    endgame: &str,
+) -> EgtResult<EgtFileReader> {
+    if let Some(input) = input_path {
+        match EgtFileReader::open_in(input, endgame) {
+            Ok(f) => return Ok(f),
+            Err(EgtError::FileNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    EgtFileReader::open_in(base_path, endgame)
+}
+
 /// Logical extent of an unpadded, table-local transposed Zstd frame.
 #[derive(Debug, Clone, Copy)]
 struct FrameDescriptor {
@@ -203,8 +220,7 @@ impl SharedFileCache {
             // Recheck after releasing the read lock: another worker may have loaded it.
             if !files.contains_key(endgame) {
                 // Serialize loading so racing workers never allocate duplicate files.
-                let file =
-                    crate::load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)?;
+                let file = load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)?;
                 files.insert(endgame.to_string(), Arc::new(RwLock::new(file)));
             }
             Arc::clone(files.get(endgame).ok_or(EgtError::Internal(

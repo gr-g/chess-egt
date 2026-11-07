@@ -5,6 +5,7 @@
 //! a table's ancestor summaries before publishing its per-table statistics.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 use rayon::prelude::*;
@@ -15,6 +16,40 @@ use crate::stats::{AggregateStats, StatsRecord, read_record};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
 use crate::{EgtError, EgtResult};
+
+/// Metadata queries and hierarchy-cache rebuilding for one tablebase root.
+///
+/// Statistics do not read table frames and have no frame-cache budget or input
+/// overlay: each instance describes exactly one root. All operations, including
+/// construction, are synchronous; async callers should use `spawn_blocking`.
+pub struct EgtStatistics {
+    location: Location,
+}
+
+impl EgtStatistics {
+    /// Resolves a local tablebase directory or supported object-store URL once.
+    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
+        Ok(Self::from_location(Location::parse(path)?))
+    }
+
+    pub(crate) fn from_location(location: Location) -> Self {
+        Self { location }
+    }
+
+    /// Reads metadata without modifying storage. Missing sidecars contribute
+    /// theoretical index ranges; computed totals are null for incomplete selections.
+    /// Hierarchy selections use cached summaries when available.
+    pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
+        query(&self.location, selectors)
+    }
+
+    /// Creates missing placeholders and rebuilds selected hierarchy summaries.
+    /// Does not scan table contents or replace complete per-table metadata.
+    /// Do not run concurrently with generation or another cache rebuild.
+    pub fn cache_stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
+        cache(&self.location, selectors)
+    }
+}
 
 /// Binds cached totals to their canonical hierarchy prefix, including its '/'.
 #[derive(Serialize, Deserialize)]

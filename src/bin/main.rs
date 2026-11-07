@@ -1,8 +1,8 @@
 mod common;
 
 use chess_egt::{
-    AggregateStats, ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber,
-    resolve_selectors,
+    AggregateStats, ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics,
+    EgtVerifier, resolve_selectors,
 };
 use clap::Parser;
 use common::parse_byte_size;
@@ -106,17 +106,22 @@ fn run() -> Result<(), EgtError> {
         );
     } else if !cli.verify.is_empty() {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
-        let mut prober = configured_prober(&cli)?;
-        prober.verify_selected(&selectors)?;
+        let mut verifier = EgtVerifier::new(&cli.path)?;
+        verifier.with_threads(usize::from(cli.threads));
+        if let Some(cache_size) = cli.cache_size {
+            verifier.with_cache_size(cache_size)?;
+        }
+        if let Some(ref input) = cli.input_path {
+            verifier.with_input_path(input)?;
+        }
+        verifier.verify_selected(&selectors)?;
     } else if !cli.stats.is_empty() {
         let selectors: Vec<_> = cli.stats.iter().map(String::as_str).collect();
-        let prober = configured_prober(&cli)?;
-        let stats = prober.stats(&selectors)?;
+        let stats = EgtStatistics::new(&cli.path)?.stats(&selectors)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else if !cli.cache_stats.is_empty() {
         let selectors: Vec<_> = cli.cache_stats.iter().map(String::as_str).collect();
-        let prober = configured_prober(&cli)?;
-        let stats = prober.cache_stats(&selectors)?;
+        let stats = EgtStatistics::new(&cli.path)?.cache_stats(&selectors)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else if let Some(ref fen) = cli.position {
         let fen_obj: Fen = fen
@@ -225,7 +230,6 @@ fn generation_summary(
 
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
     let mut prober = EgtProber::new(&cli.path)?;
-    prober.with_threads(usize::from(cli.threads));
     if let Some(cache_size) = cli.cache_size {
         prober.with_cache_size(cache_size)?;
     }

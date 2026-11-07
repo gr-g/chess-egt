@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, EgtProber};
+use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, EgtProber, EgtStatistics};
 use clap::Parser;
 use common::parse_byte_size;
 use serde::{Deserialize, Serialize};
@@ -35,13 +35,14 @@ struct Cli {
 #[derive(Clone)]
 struct AppState {
     prober: Arc<EgtProber>,
+    statistics: Arc<EgtStatistics>,
     operations: Arc<Semaphore>,
 }
 
 impl AppState {
     async fn run<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&EgtProber) -> Result<T, ApiError> + Send + 'static,
+        operation: impl FnOnce(&Self) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         let permit = self.operations.clone().try_acquire_owned().map_err(|_| {
             ApiError::new(
@@ -50,11 +51,11 @@ impl AppState {
                 "Server is busy",
             )
         })?;
-        let prober = self.prober.clone();
+        let state = self.clone();
         tokio::task::spawn_blocking(move || {
             // Keep the permit until the work finishes, even if the client disconnects.
             let _permit = permit;
-            operation(&prober)
+            operation(&state)
         })
         .await
         .map_err(|error| {
@@ -67,17 +68,18 @@ impl AppState {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let prober = tokio::task::spawn_blocking(move || {
-        let mut prober = EgtProber::new(cli.path)?;
+    let (prober, statistics) = tokio::task::spawn_blocking(move || {
+        let mut prober = EgtProber::new(&cli.path)?;
         prober.with_cache_size(cli.cache_size)?;
         // An empty selection validates the root format without loading any tables.
-        prober.stats(&[])?;
-        Ok::<_, EgtError>(prober)
+        let statistics = EgtStatistics::new(&cli.path)?;
+        statistics.stats(&[])?;
+        Ok::<_, EgtError>((prober, statistics))
     })
     .await??;
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
     eprintln!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(prober))
+    axum::serve(listener, router(prober, statistics))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
@@ -100,7 +102,7 @@ async fn shutdown_signal() {
         .expect("failed to install interrupt handler");
 }
 
-fn router(prober: EgtProber) -> Router {
+fn router(prober: EgtProber, statistics: EgtStatistics) -> Router {
     Router::new()
         .route("/outcome", get(outcome))
         .route("/query", get(query))
@@ -116,6 +118,7 @@ fn router(prober: EgtProber) -> Router {
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
             prober: Arc::new(prober),
+            statistics: Arc::new(statistics),
             operations: Arc::new(Semaphore::new(MAX_OPERATIONS)),
         })
 }
@@ -200,9 +203,9 @@ async fn outcome(
 ) -> Result<Json<OutcomeResponse>, ApiError> {
     let Query(params) = params.map_err(ApiError::invalid_query)?;
     state
-        .run(move |prober| {
+        .run(move |state| {
             let position = parse_position(&params.fen)?;
-            let outcome = prober.probe(&position)?;
+            let outcome = state.prober.probe(&position)?;
             Ok(Json(OutcomeResponse::new(&position, outcome)))
         })
         .await
@@ -230,9 +233,9 @@ async fn query(
 ) -> Result<Json<QueryResponse>, ApiError> {
     let Query(params) = params.map_err(ApiError::invalid_query)?;
     state
-        .run(move |prober| {
+        .run(move |state| {
             let position = parse_position(&params.fen)?;
-            let mut result = prober.probe_with_moves(&position)?;
+            let mut result = state.prober.probe_with_moves(&position)?;
             // Successor losses come first. Immediate conversions reset the distance;
             // the returned outcomes still describe the successors unchanged.
             result.moves.sort_by_key(|(m, outcome)| {
@@ -283,9 +286,9 @@ async fn stats(
 ) -> Result<Json<AggregateStats>, ApiError> {
     let Query(params) = params.map_err(ApiError::invalid_query)?;
     state
-        .run(move |prober| {
+        .run(move |state| {
             let selectors: Vec<_> = params.tables.split(',').map(str::trim).collect();
-            Ok(Json(prober.stats(&selectors)?))
+            Ok(Json(state.statistics.stats(&selectors)?))
         })
         .await
 }
@@ -468,7 +471,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = router(prober);
+        let app = router(prober, EgtStatistics::new(&dir.0).unwrap());
         for (fen, expected) in [
             (
                 "8/8/8/8/8/8/3K4/k7 w - - 0 1",
@@ -608,6 +611,7 @@ mod tests {
         }
         let state = AppState {
             prober: Arc::new(EgtProber::new(&dir.0).unwrap()),
+            statistics: Arc::new(EgtStatistics::new(&dir.0).unwrap()),
             operations: Arc::new(Semaphore::new(0)),
         };
         assert_eq!(state.run(|_| Ok(())).await.unwrap_err().code, "server_busy");

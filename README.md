@@ -99,7 +99,6 @@ python3 scripts/export_table_stats.py ROOT table_stats.csv
 python3 scripts/export_summary_stats.py ROOT summary_stats.csv
 ```
 
-
 ### API server
 
 Run an API server with tables read from an S3 bucket:
@@ -458,11 +457,8 @@ terminal positions (checkmates, stalemates, and conversions) to determine the
 outcome and depth-to-conversion (DTC) for all other positions.
 
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis runs
-on both tables simultaneously. `GenerationPlan::pairs` contains `TablePair`
-values carrying the exact IDs and directional reflection flags through solving.
-Each active table has one working array and its own summary and counters;
-self-twins use a single slot, including when the twin transformation reflects
-horizontally. The indexing descriptors are reused during finalization.
+on both tables simultaneously. Both tables are initialized and propagated
+together.
 
 Dependencies are queried during the initialization phase: when positions have
 available captures (including en passant) or promotions converting to a
