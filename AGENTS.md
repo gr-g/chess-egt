@@ -5,7 +5,7 @@
   indexing (`Egt` and `Indexer`), of the file input/output including
   compression/decompression (`EgtFileReader`, `EgtFileWriter`,
   `SharedFileCache`), and of multi-threaded generation of tables through
-  retrograde analysis (`RetrogradeSolver`).
+  retrograde analysis (`solve_pair`).
 - Tables for all 3-piece, 4-piece and 5-piece endgames were generated and
   verified successfully, they are available in `~/ggegt/`.
 - An API server is available (`bin/server.rs`) providing stats and position

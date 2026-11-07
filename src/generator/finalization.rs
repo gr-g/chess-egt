@@ -10,8 +10,7 @@ use rayon::prelude::*;
 use self::stats::TableStats;
 use crate::PackedOutcome;
 use crate::egt::Egt;
-use crate::egt_file::COMPRESSION_LEVEL;
-use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
+use crate::egt_file::writer::{COMPRESSION_LEVEL, CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, write_stats};
@@ -67,7 +66,7 @@ fn finalize_batch(
 /// Resolves unknowns to draws, computes statistics, and publishes one table and
 /// its JSON sidecar. Call only after all propagation workers have joined.
 /// Binary and sidecar publication are not an atomic multi-object transaction.
-pub(crate) fn finalize_table(
+pub(super) fn finalize_table(
     location: &Location,
     id: &TableId,
     egt: &Egt,

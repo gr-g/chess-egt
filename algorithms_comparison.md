@@ -8,7 +8,7 @@ A comparison of the current generation algorithms and storage architectures in:
 
 Quantitative scale, measured performance, and resource/cost estimates are covered in
 [`scaling.md`](scaling.md). Our implementation is described in
-[the README](README.md#retrograde-analysis) and [`src/retrograde.rs`](src/retrograde.rs).
+[the README](README.md#retrograde-analysis) and [`src/generator/solver.rs`](src/generator/solver.rs).
 The comparisons below are based on source inspection, not cross-engine benchmarks.
 
 ---
@@ -115,7 +115,7 @@ supports castling tables, where those spatial reductions are disabled.
   reflected indices; both are populated, and one is counted as redundant in
   unique-position statistics. Edges crossing these symmetry cases require
   doubled counter contributions or mirrored predecessor updates, as detailed in
-  [`src/retrograde.rs`](src/retrograde.rs). With pawns, reflected asymmetric
+  [`src/generator/solver.rs`](src/generator/solver.rs). With pawns, reflected asymmetric
   file/order configurations share a canonical table; internally symmetric
   configurations choose an orientation using the king ordering.
 - **Syzygy:** pivot-mirror helpers update the reflected predecessor where the
@@ -253,10 +253,10 @@ patterns near one another without changing the answers:
 
 The relevant implementations in the compared repositories are:
 
-- **chess-egt:** [`src/retrograde.rs`](src/retrograde.rs),
+- **chess-egt:** [`src/generator/solver.rs`](src/generator/solver.rs),
   [`src/egt/indexer.rs`](src/egt/indexer.rs),
   [`src/egt_file.rs`](src/egt_file.rs),
-  [`src/finalization.rs`](src/finalization.rs).
+  [`src/generator/finalization.rs`](src/generator/finalization.rs).
 - **Syzygy:** `src/rtbgen.c`, `src/rtbgenp.c` (resolution and initialization);
   `src/tbgen.c`, `src/tbgenp.c` (allocation/output stages); `src/probe.c`
   (compact encoding); `src/permute.c`, `src/permute_tmpl.c` (ordering search);

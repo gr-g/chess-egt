@@ -270,7 +270,7 @@ mod tests {
             ] {
                 // Drop cached readers before replacing their backing artifact.
                 verifier.cache.clear().unwrap();
-                let file = crate::egt_writer::write_fixture(&dir.0, "K_K", |i| {
+                let file = crate::egt_file::writer::write_fixture(&dir.0, "K_K", |i| {
                     if i == index {
                         outcome
                     } else {

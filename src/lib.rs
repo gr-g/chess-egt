@@ -45,18 +45,14 @@
 
 mod egt;
 mod egt_file;
-mod egt_writer;
 pub mod error;
-mod finalization;
 mod generator;
 mod outcome;
 pub mod piece_set;
 mod position;
 mod prober;
-mod retrograde;
 mod selection;
 mod stats;
-mod stats_cache;
 mod storage;
 mod table_id;
 mod verification;
@@ -69,9 +65,7 @@ pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};
 pub use prober::EgtProber;
 pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
 use shakmaty::Move;
-pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
-
-pub use stats_cache::EgtStatistics;
+pub use stats::{AggregateStats, EgtStatistics, EgtStats, LongestDtcPosition};
 #[cfg(test)]
 use std::path::PathBuf;
 pub use table_id::TableId;

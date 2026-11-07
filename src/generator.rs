@@ -1,10 +1,13 @@
+mod finalization;
+mod solver;
+
 use std::path::Path;
 
 use crate::egt_file::SharedFileCache;
 use crate::storage::Location;
 use crate::{
     EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, TablePair, resolve_selectors,
-    retrograde, verification,
+    verification,
 };
 
 pub struct EgtGenerator {
@@ -99,7 +102,7 @@ impl EgtGenerator {
                     previous_material = Some(material);
                 }
                 let start = std::time::Instant::now();
-                let pair_stats = retrograde::generate_pair(&self.base_path, &pair, &reader)?;
+                let pair_stats = solver::generate_pair(&self.base_path, &pair, &reader)?;
                 if self.verify {
                     let names: Vec<_> = pair_stats
                         .iter()

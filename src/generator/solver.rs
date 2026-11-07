@@ -760,7 +760,7 @@ fn solve_pair(
 /// outputs of earlier jobs. Missing dependencies are errors, not generation
 /// requests. A self-twin is solved and published once. Statistics are returned
 /// in requested-table/twin order without opening the published outputs.
-pub(crate) fn generate_pair(
+pub(super) fn generate_pair(
     base: &Location,
     pair: &TablePair,
     reader: &SharedFileCache,
@@ -776,7 +776,7 @@ pub(crate) fn generate_pair(
     for ((id, table), values) in ids().zip(tables).zip(result.working.values) {
         drop(table.summary);
         println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
-        stats.push(crate::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
+        stats.push(super::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
     }
     println!(
         "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",

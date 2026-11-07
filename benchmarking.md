@@ -43,7 +43,7 @@ callgrind_annotate --auto=no --threshold=100 target/profile-kq-kr.callgrind
 callgrind_annotate --auto=no --inclusive=yes --tree=calling --threshold=100 \
   target/profile-kq-kr.callgrind
 callgrind_annotate --auto=no --threshold=100 target/profile-kq-kr.callgrind \
-  src/egt/indexer.rs src/retrograde.rs
+  src/egt/indexer.rs src/generator/solver.rs
 ```
 
 | Phase | Native | Under Callgrind |
@@ -67,7 +67,7 @@ relative phase timings substantially; use native runs to validate speedups.
   contributed 975,003 / 0.90%. Thus 98% of encoding instructions come from
   propagation, not dependency lookup. The pipeline extracts coordinates,
   canonicalizes symmetries, compacts squares, and aggregates the index for every
-  accepted predecessor (`src/retrograde.rs:411`, `src/egt/indexer.rs:366`).
+  accepted predecessor (`src/generator/solver.rs:411`, `src/egt/indexer.rs:366`).
 - **There is measurable generic overhead even for simple material.**
   `sort_coord_repeated_pieces` costs **3.47% of total instructions** over
   40,627,849 calls, despite neither table nor its capture dependencies having
@@ -95,7 +95,7 @@ relative phase timings substantially; use native runs to validate speedups.
   are acceptable. A different level would change compressed bytes.
 - **An avoidable pawnless scan exists, but its isolated cost is not measured.**
   Phase L scans Checkmate, Capture, and Promotion whenever the preceding ply
-  contains any wins (`src/retrograde.rs:681–690`). Promotion never occurs for
+  contains any wins (`src/generator/solver.rs:681–690`). Promotion never occurs for
   this pawnless pair, so that sub-phase scans and matches nothing. Tracking
   wins by conversion type could skip it. The block summary visits 45,566 of
   58,499 potential blocks (77.9%); this measures block pruning, not the fraction

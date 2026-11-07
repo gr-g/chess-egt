@@ -1,5 +1,8 @@
 //! Per-table metadata and deterministic summaries of selected tables.
 
+mod cache;
+pub use cache::EgtStatistics;
+
 use std::collections::BTreeMap;
 use std::io;
 use std::ops::Add;
@@ -375,7 +378,7 @@ pub(crate) fn write_stats(location: &Location, id: &TableId, stats: &EgtStats) -
     location.ensure_format()?;
     let key = location.key(&id.relative_path("json"));
     let json = serde_json::to_vec_pretty(stats)?;
-    crate::stats_cache::invalidate(location, id)?;
+    cache::invalidate(location, id)?;
     block_on(location.store.put(&key, json.into())).map_err(|error| location.error(&key, error))?;
     Ok(())
 }

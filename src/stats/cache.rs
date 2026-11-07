@@ -67,7 +67,7 @@ enum ReadMode {
 }
 
 /// Reads summaries when available, without creating placeholders or caches.
-pub(crate) fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
+fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
     let prefixes = hierarchy_prefixes(selectors)?;
     // Validate nonhierarchical selectors before touching storage, too.
     let mut tables = if prefixes.is_none() {
@@ -92,7 +92,7 @@ pub(crate) fn query(location: &Location, selectors: &[&str]) -> EgtResult<Aggreg
 }
 
 /// Rebuilds selected summaries and creates only absent per-table sidecars.
-pub(crate) fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
+fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
     let prefixes = hierarchy_prefixes(selectors)?;
     let tables = resolve_selectors(selectors)?;
     location.ensure_writable()?;
@@ -138,7 +138,7 @@ pub(crate) fn cache(location: &Location, selectors: &[&str]) -> EgtResult<Aggreg
 }
 
 /// Invalidates the four hierarchy summaries before publishing a table sidecar.
-pub(crate) fn invalidate(location: &Location, id: &TableId) -> EgtResult<()> {
+pub(super) fn invalidate(location: &Location, id: &TableId) -> EgtResult<()> {
     for prefix in ancestors(&id.relative_path("json")) {
         delete_summary(location, &prefix)?;
     }

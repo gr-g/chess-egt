@@ -7,13 +7,13 @@ use object_store::{buffered::BufWriter, path::Path as ObjectPath};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-#[cfg(test)]
-use crate::egt_file::COMPRESSION_LEVEL;
-use crate::egt_file::transpose_frame;
+use super::transpose_frame;
 use crate::PackedOutcome;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
+
+pub(crate) const COMPRESSION_LEVEL: i32 = 19;
 
 /// A frame-aligned compressed batch, without a serialized seek-table footer.
 pub(crate) struct CompressedSegment {
@@ -96,7 +96,7 @@ impl EgtFileWriter {
 const UPLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
 /// Publishes owned buffers without concatenating them into another full artifact.
-pub(crate) fn publish_buffers(
+fn publish_buffers(
     location: &Location,
     key: &ObjectPath,
     buffers: impl IntoIterator<Item = Bytes>,
