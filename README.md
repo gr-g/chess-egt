@@ -112,7 +112,7 @@ cargo run --release --bin chess-egt-server -- \
 curl --get http://localhost:44348/stats?tables=3
 
 # Query a position
-curl --get http://localhost:44348/query?fen=8/8/8/8/8/2K5/4Q3/7k_w_-_-
+curl --get http://localhost:44348/query?fen=8/8/8/8/8/2K5/6P1/7k_w_-_-
 ```
 
 The JSON response with the position outcome is similar to the
@@ -124,8 +124,22 @@ The JSON response with the position outcome is similar to the
   "stalemate": false,
   "insufficient_material": false,
   "dtc": 9,
-  "conversion": "capture",
-  "category": "win"
+  "dtc_type": "promotion",
+  "category": "win",
+  "moves": [
+    {
+      "uci": "g2g4",
+      "san": "g4",
+      "conversion": false,
+      "checkmate": false,
+      "stalemate": false,
+      "insufficient_material": false,
+      "dtc": -8,
+      "dtc_type": "promotion",
+      "category": "loss"
+    },
+    ...
+  ]
 }
 ```
 

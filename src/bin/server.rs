@@ -12,7 +12,7 @@ use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, EgtProber}
 use clap::Parser;
 use common::parse_byte_size;
 use serde::{Deserialize, Serialize};
-use shakmaty::{CastlingMode, Chess, Position, PositionError, fen::Fen};
+use shakmaty::{CastlingMode, Chess, Position, PositionError, fen::Fen, san::SanPlus};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 
@@ -102,6 +102,7 @@ async fn shutdown_signal() {
 
 fn router(prober: EgtProber) -> Router {
     Router::new()
+        .route("/outcome", get(outcome))
         .route("/query", get(query))
         .route("/stats", get(stats))
         .fallback(async || ApiError::new(StatusCode::NOT_FOUND, "not_found", "Unknown route"))
@@ -148,16 +149,16 @@ struct QueryParams {
 }
 
 #[derive(Serialize)]
-struct QueryResponse {
+struct OutcomeResponse {
     checkmate: bool,
     stalemate: bool,
     insufficient_material: bool,
     dtc: Option<i32>,
-    conversion: Option<&'static str>,
+    dtc_type: Option<&'static str>,
     category: &'static str,
 }
 
-impl QueryResponse {
+impl OutcomeResponse {
     fn new(position: &Chess, outcome: DtcOutcome) -> Self {
         let (category, dtc, conversion) = match outcome {
             DtcOutcome::Win(conversion, ply) => ("win", Some(i32::from(ply)), Some(conversion)),
@@ -169,7 +170,7 @@ impl QueryResponse {
             stalemate: position.is_stalemate(),
             insufficient_material: position.is_insufficient_material(),
             dtc,
-            conversion: conversion.map(|conversion| match conversion {
+            dtc_type: conversion.map(|conversion| match conversion {
                 ConversionType::Checkmate => "checkmate",
                 ConversionType::Capture => "capture",
                 ConversionType::Promotion => "promotion",
@@ -179,6 +180,50 @@ impl QueryResponse {
     }
 }
 
+fn parse_position(fen: &str) -> Result<Chess, ApiError> {
+    fen.parse::<Fen>()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_fen", "Invalid FEN"))?
+        .into_position(CastlingMode::Standard)
+        .or_else(PositionError::ignore_impossible_check)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_position",
+                "Invalid position",
+            )
+        })
+}
+
+async fn outcome(
+    State(state): State<AppState>,
+    params: Result<Query<QueryParams>, QueryRejection>,
+) -> Result<Json<OutcomeResponse>, ApiError> {
+    let Query(params) = params.map_err(ApiError::invalid_query)?;
+    state
+        .run(move |prober| {
+            let position = parse_position(&params.fen)?;
+            let outcome = prober.probe(&position)?;
+            Ok(Json(OutcomeResponse::new(&position, outcome)))
+        })
+        .await
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    #[serde(flatten)]
+    outcome: OutcomeResponse,
+    moves: Vec<MoveResponse>,
+}
+
+#[derive(Serialize)]
+struct MoveResponse {
+    uci: String,
+    san: String,
+    conversion: bool,
+    #[serde(flatten)]
+    outcome: OutcomeResponse,
+}
+
 async fn query(
     State(state): State<AppState>,
     params: Result<Query<QueryParams>, QueryRejection>,
@@ -186,21 +231,42 @@ async fn query(
     let Query(params) = params.map_err(ApiError::invalid_query)?;
     state
         .run(move |prober| {
-            let fen = params.fen.parse::<Fen>().map_err(|_| {
-                ApiError::new(StatusCode::BAD_REQUEST, "invalid_fen", "Invalid FEN")
-            })?;
-            let position: Chess = fen
-                .into_position(CastlingMode::Standard)
-                .or_else(PositionError::ignore_impossible_check)
-                .map_err(|_| {
-                    ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_position",
-                        "Invalid position",
-                    )
-                })?;
-            let outcome = prober.probe(&position)?;
-            Ok(Json(QueryResponse::new(&position, outcome)))
+            let position = parse_position(&params.fen)?;
+            let mut result = prober.probe_with_moves(&position)?;
+            // Successor losses come first. Immediate conversions reset the distance;
+            // the returned outcomes still describe the successors unchanged.
+            result.moves.sort_by_key(|(m, outcome)| {
+                let conversion = if m.is_capture() {
+                    ConversionType::Capture
+                } else if m.is_promotion() {
+                    ConversionType::Promotion
+                } else {
+                    return *outcome;
+                };
+                match *outcome {
+                    DtcOutcome::Win(_, _) => DtcOutcome::Win(conversion, 0),
+                    DtcOutcome::Loss(_, _) => DtcOutcome::Loss(conversion, 0),
+                    DtcOutcome::Draw => DtcOutcome::Draw,
+                }
+            });
+            let moves = result
+                .moves
+                .into_iter()
+                .map(|(m, outcome)| {
+                    let mut successor = position.clone();
+                    let san = SanPlus::from_move_and_play_unchecked(&mut successor, m).to_string();
+                    MoveResponse {
+                        uci: m.to_uci(CastlingMode::Standard).to_string(),
+                        san,
+                        conversion: m.is_capture() || m.is_promotion(),
+                        outcome: OutcomeResponse::new(&successor, outcome),
+                    }
+                })
+                .collect();
+            Ok(Json(QueryResponse {
+                outcome: OutcomeResponse::new(&position, result.outcome),
+                moves,
+            }))
         })
         .await
 }
@@ -224,6 +290,7 @@ async fn stats(
         .await
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -364,9 +431,9 @@ mod tests {
                 (DtcOutcome::Loss(conversion, 8), "-8", "loss"),
             ] {
                 assert_eq!(
-                    serde_json::to_string(&QueryResponse::new(&position, outcome)).unwrap(),
+                    serde_json::to_string(&OutcomeResponse::new(&position, outcome)).unwrap(),
                     format!(
-                        r#"{{"checkmate":false,"stalemate":false,"insufficient_material":false,"dtc":{dtc},"conversion":"{name}","category":"{category}"}}"#
+                        r#"{{"checkmate":false,"stalemate":false,"insufficient_material":false,"dtc":{dtc},"dtc_type":"{name}","category":"{category}"}}"#
                     )
                 );
             }
@@ -392,7 +459,9 @@ mod tests {
             let mut generator = EgtGenerator::new(&path).unwrap();
             generator.with_threads(2);
             generator.with_verify(false);
-            generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
+            generator
+                .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
+                .unwrap();
             let mut prober = EgtProber::new(path).unwrap();
             prober.with_cache_size(0).unwrap();
             prober
@@ -403,19 +472,71 @@ mod tests {
         for (fen, expected) in [
             (
                 "8/8/8/8/8/8/3K4/k7 w - - 0 1",
-                json!({"checkmate":false,"stalemate":false,"insufficient_material":true,"dtc":null,"conversion":null,"category":"draw"}),
+                json!({"checkmate":false,"stalemate":false,"insufficient_material":true,"dtc":null,"dtc_type":null,"category":"draw"}),
             ),
             (
                 "7k/6Q1/5K2/8/8/8/8/8 b - - 100 1",
-                json!({"checkmate":true,"stalemate":false,"insufficient_material":false,"dtc":0,"conversion":"checkmate","category":"loss"}),
+                json!({"checkmate":true,"stalemate":false,"insufficient_material":false,"dtc":0,"dtc_type":"checkmate","category":"loss"}),
             ),
             (
                 "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",
-                json!({"checkmate":false,"stalemate":true,"insufficient_material":false,"dtc":null,"conversion":null,"category":"draw"}),
+                json!({"checkmate":false,"stalemate":true,"insufficient_material":false,"dtc":null,"dtc_type":null,"category":"draw"}),
             ),
         ] {
-            let body = request(&app, &query_uri(fen), StatusCode::OK).await;
+            let uri = query_uri(fen);
+            let body = request(&app, &uri.replace("/query?", "/outcome?"), StatusCode::OK).await;
             assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), expected);
+            let body = request(&app, &uri, StatusCode::OK).await;
+            let mut actual: Value = serde_json::from_str(&body).unwrap();
+            let moves = actual.as_object_mut().unwrap().remove("moves").unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                moves.as_array().unwrap().len(),
+                parse_position(fen).unwrap().legal_moves().len()
+            );
+        }
+        for fen in [
+            "7k/8/5KQ1/8/8/8/8/8 w - - 0 1",
+            "8/7P/8/8/8/8/8/k1K5 w - - 0 1",
+            "8/8/8/8/8/8/1Q6/k2K4 b - - 0 1",
+        ] {
+            let position = parse_position(fen).unwrap();
+            let body = request(&app, &query_uri(fen), StatusCode::OK).await;
+            let response: Value = serde_json::from_str(&body).unwrap();
+            let moves = response["moves"].as_array().unwrap();
+            assert_eq!(moves.len(), position.legal_moves().len());
+            let mut keys = Vec::new();
+            for entry in moves {
+                let m = position
+                    .legal_moves()
+                    .into_iter()
+                    .find(|m| m.to_uci(CastlingMode::Standard).to_string() == entry["uci"])
+                    .unwrap();
+                assert_eq!(
+                    entry["san"],
+                    SanPlus::from_move(position.clone(), m).to_string()
+                );
+                assert_eq!(entry["conversion"], m.is_capture() || m.is_promotion());
+                let successor = position.clone().play(m).unwrap();
+                let fen =
+                    Fen::from_position(&successor, shakmaty::EnPassantMode::Legal).to_string();
+                let uri = query_uri(&fen).replace("/query?", "/outcome?");
+                let body = request(&app, &uri, StatusCode::OK).await;
+                let expected: Value = serde_json::from_str(&body).unwrap();
+                for (field, value) in expected.as_object().unwrap() {
+                    assert_eq!(&entry[field], value);
+                }
+                let rank = match entry["category"].as_str().unwrap() {
+                    "loss" => 0,
+                    "draw" => 1,
+                    "win" => 2,
+                    _ => unreachable!(),
+                };
+                let dtc = entry["dtc"].as_i64().unwrap_or(0);
+                let distance = if entry["conversion"] == true { 0 } else { -dtc };
+                keys.push((rank, distance));
+            }
+            assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         }
         let body = request(&app, "/stats?tables=KQ_K,KQ_K", StatusCode::OK).await;
         let stats: AggregateStats = serde_json::from_str(&body).unwrap();
@@ -452,7 +573,7 @@ mod tests {
                 "unsupported_position",
             ),
             (
-                query_uri("8/8/8/8/8/2K5/4R3/7k w - - 0 1"),
+                query_uri("8/8/8/8/8/2K5/3RR3/7k w - - 0 1"),
                 StatusCode::NOT_FOUND,
                 "table_unavailable",
             ),
@@ -478,10 +599,12 @@ mod tests {
             ),
             ("/unknown".to_owned(), StatusCode::NOT_FOUND, "not_found"),
         ] {
-            let body = request(&app, &uri, status).await;
-            let error: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(error["error"]["code"], code);
-            assert!(!body.contains(dir.0.to_str().unwrap()));
+            for uri in [uri.clone(), uri.replace("/query", "/outcome")] {
+                let body = request(&app, &uri, status).await;
+                let error: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(error["error"]["code"], code);
+                assert!(!body.contains(dir.0.to_str().unwrap()));
+            }
         }
         let state = AppState {
             prober: Arc::new(EgtProber::new(&dir.0).unwrap()),
