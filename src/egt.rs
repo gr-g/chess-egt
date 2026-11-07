@@ -19,22 +19,23 @@ impl Egt {
         &self.elements
     }
 
-    // The number of pawns.
+    /// The number of pawns in this table's material.
     pub fn n_pawns(&self) -> usize {
         self.indexer.n_pawns
     }
 
-    // Whether this a pawnless endgame.
+    /// Whether this table contains no pawns.
     pub fn is_pawnless(&self) -> bool {
         self.n_pawns() == 0
     }
 
-    // The total number of positions indexed in this table.
+    /// The number of indexed entries, including invalid and redundant positions.
+    /// Table-local indices lie in `0..self.index_range()`.
     pub fn index_range(&self) -> usize {
         self.indexer.index_range
     }
 
-    // The name of this table (e.g. "KQ_KPa").
+    /// The descriptor name, e.g. `KQ_KPa`, in this table's horizontal orientation.
     pub fn tablename(&self) -> &str {
         &self.tablename
     }
@@ -52,7 +53,9 @@ impl Egt {
         })
     }
 
-    /// Parses canonical names: each side has `K`, then `Q`, `R`, `B`, `N`,
+    /// Parses a descriptor with canonical token order, in either horizontal orientation.
+    /// Unlike [`crate::TableId::parse`], this accepts horizontally noncanonical names.
+    /// Each side has `K`, then `Q`, `R`, `B`, `N`,
     /// then pawns by ascending file. A pawn token is `Pa` through `Ph`, with
     /// an optional trailing `o` when the next pawn towards promotion is enemy.
     /// Within a file, STM tokens follow ascending normalized rank and SNTM
@@ -75,8 +78,10 @@ impl Egt {
         self.indexer.reflected_position_to_index(position)
     }
 
-    // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
-    // If the index represents an invalid position, returns None.
+    /// Decodes an index into a symmetry-reduced position with the requested side to move.
+    /// Returns `None` for out-of-range indices or invalid positions.
+    /// Castling rights are absent; en passant rights are retained only when legal.
+    /// Impossible checks are accepted, as in table generation.
     pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         self.indexer.position_from_index(index, side_to_move)
     }
@@ -92,20 +97,13 @@ impl Egt {
         self.indexer.position_from_index_unchecked(index, side_to_move)
     }
 
-    // Pawnless positions are reduced to a canonical form through rotations and reflections
-    // to take advantage of symmetries, so normally each index corresponds to 8 equivalent
-    // position. However, if both kings are on a long diagonal, the diagonal symmetry is not
-    // used and the correspoding index represents only 4 equivalent positions.
-    // In particular, positions with the kings on the diagonal and some other piece outside
-    // the diagonal have a symmetric that is in principle equivalent, but is assigned a
-    // separate index.
-    // `diagonal_symmetric(idx)` returns:
-    //  - `None` if the corresponding position does not have both kings on a long diagonal
-    //    (i.e. `idx` represents 8 equivalent positions)
-    //  - `Some(other_idx)` if the corresponding position has both kings on a long diagonal
-    //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
-    //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
-    //    for positions with all pieces on the diagonal.
+    /// Returns the diagonal-reflected index for a pawnless entry whose kings lie
+    /// on a long diagonal, or `None` otherwise. Both indices represent equivalent
+    /// positions but are stored separately. The returned index equals `index`
+    /// when all pieces lie on the diagonal.
+    ///
+    /// # Panics
+    /// Panics if this table is pawnless and `index` is out of range.
     pub fn diagonal_symmetric(&self, index: usize) -> Option<usize> {
         self.indexer.diagonal_symmetric(index)
     }

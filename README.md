@@ -105,7 +105,7 @@ Run an API server with tables read from an S3 bucket:
 
 ```sh
 cargo run --release --bin chess-egt-server -- \
-  --path s3://my-ggegt-bucket/ --cache-size 1GiB --bind localhost:44348
+  --path s3://my-ggegt-bucket/ --cache-size 1GiB --bind 127.0.0.1:44348
 
 # Get statistics on 3-piece endgames
 curl --get http://localhost:44348/stats?tables=3
@@ -114,7 +114,7 @@ curl --get http://localhost:44348/stats?tables=3
 curl --get http://localhost:44348/query?fen=8/8/8/8/8/2K5/6P1/7k_w_-_-
 ```
 
-The JSON response with the position outcome is similar to the
+The JSON response to a position query is similar to the
 [Lichess tablebase API](https://lichess.org/api#tag/tablebase):
 
 ```json

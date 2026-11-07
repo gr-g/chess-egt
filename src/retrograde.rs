@@ -1524,7 +1524,7 @@ mod tests {
     fn parallel_missing_dependency_returns_error_without_generating() {
         let dir = crate::TestDir::new("parallel_missing_dependency");
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
-        generator.with_threads(4);
+        generator.set_threads(4);
         let result = generator.generate("KQ_K");
         assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
             if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_))));
@@ -1538,7 +1538,7 @@ mod tests {
     fn zero_threads_uses_rayon_default() {
         let dir = crate::TestDir::new("zero_threads");
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
-        generator.with_threads(0);
+        generator.set_threads(0);
         generator.generate("K_K").unwrap();
         assert!(dir.0.join(TableId::parse("K_K").unwrap().relative_path("ggegt")).exists());
     }
@@ -1559,8 +1559,8 @@ mod tests {
         let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
         let location = Location::parse(&test_dir.0).unwrap();
         let mut generator = EgtGenerator::new(&test_dir.0).unwrap();
-        generator.with_threads(2);
-        generator.with_verify(false);
+        generator.set_threads(2);
+        generator.set_verify(false);
         if endgame != "K_K" {
             generator.generate("K_K").unwrap();
         }

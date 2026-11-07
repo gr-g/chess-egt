@@ -32,18 +32,18 @@ impl EgtVerifier {
     }
 
     /// Sets verification workers. Zero (the default) uses Rayon's default.
-    pub fn with_threads(&mut self, threads: usize) {
+    pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
-    pub fn with_cache_size(&mut self, n: usize) -> EgtResult<()> {
+    pub fn set_cache_size(&mut self, n: usize) -> EgtResult<()> {
         self.cache.set_cache_size(n)
     }
 
     /// Resolves an input location, searched first with missing-only fallback to
     /// the base location. A resolution failure leaves the previous setting intact.
-    pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
+    pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         self.cache.set_input_path(Some(Location::parse(path)?))
     }
 
@@ -262,7 +262,7 @@ mod tests {
             .unwrap();
         let mut verifier = EgtVerifier::new(&dir.0).unwrap();
         for threads in [0, 1, 4] {
-            verifier.with_threads(threads);
+            verifier.set_threads(threads);
             for outcome in [
                 PackedOutcome::INVALID,
                 PackedOutcome::from_u16(8),

@@ -104,12 +104,12 @@ fn run() -> Result<(), EgtError> {
     } else if !cli.verify.is_empty() {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
         let mut verifier = EgtVerifier::new(&cli.path)?;
-        verifier.with_threads(usize::from(cli.threads));
+        verifier.set_threads(usize::from(cli.threads));
         if let Some(cache_size) = cli.cache_size {
-            verifier.with_cache_size(cache_size)?;
+            verifier.set_cache_size(cache_size)?;
         }
         if let Some(ref input) = cli.input_path {
-            verifier.with_input_path(input)?;
+            verifier.set_input_path(input)?;
         }
         verifier.verify_selected(&selectors)?;
     } else if !cli.stats.is_empty() {
@@ -131,65 +131,28 @@ fn run() -> Result<(), EgtError> {
         let prober = configured_prober(&cli)?;
         let outcome = prober.probe(&position)?;
 
-        let message = match outcome {
-            DtcOutcome::Win(ct, n) => {
-                let conversion_str = match (ct, n % 2) {
-                    (ConversionType::Checkmate, _) => "Checkmate",
-                    (ConversionType::Capture, 1) => {
-                        "A capture converting to a checkmated/winning position"
-                    }
-                    (ConversionType::Promotion, 1) => {
-                        "A promotion converting to a checkmated/winning position"
-                    }
-                    (ConversionType::Capture, _) => {
-                        "A capture of your own piece converting to a winning position"
-                    }
-                    (ConversionType::Promotion, _) => {
-                        "A promotion of an opponent's pawn converting to a winning position"
-                    }
-                };
-                if n.div_ceil(2) == 1 {
-                    format!("Win - {} can be played on this move", conversion_str)
-                } else {
-                    format!(
-                        "Win - {} can be forced in {} moves ({} plies)",
-                        conversion_str,
-                        n.div_ceil(2),
-                        n
-                    )
-                }
-            }
-            DtcOutcome::Draw => "Draw".to_string(),
-            DtcOutcome::Loss(ct, n) => {
-                let conversion_str = match (ct, n % 2) {
-                    (ConversionType::Checkmate, _) => "Checkmate cannot be avoided",
-                    (ConversionType::Capture, 0) => {
-                        "A capture converting to a checkmated/losing position cannot be avoided"
-                    }
-                    (ConversionType::Promotion, 0) => {
-                        "A promotion converting to a checkmated/losing position cannot be avoided"
-                    }
-                    (ConversionType::Capture, _) => {
-                        "A forced capture of an opponent's piece converting to a losing position cannot be avoided"
-                    }
-                    (ConversionType::Promotion, _) => {
-                        "A forced promotion of your pawn converting to a winning position cannot be avoided"
-                    }
-                };
-                if n / 2 == 0 {
-                    format!("Loss - {} on this move", conversion_str)
-                } else {
-                    format!("Loss - {} in {} moves ({} plies)", conversion_str, n / 2, n)
-                }
-            }
-        };
         print!("{:?}", position.board());
         println!("({} to move)", position.turn());
-        println!("{}", message);
+        println!("{}", format_outcome(outcome));
     } else {
         println!("No action specified. Use --help for options.");
     }
     Ok(())
+}
+
+fn format_outcome(outcome: DtcOutcome) -> String {
+    let (result, conversion, plies) = match outcome {
+        DtcOutcome::Win(ct, n) => ("Win", ct, n),
+        DtcOutcome::Loss(ct, n) => ("Loss", ct, n),
+        DtcOutcome::Draw => return "Draw".into(),
+    };
+    let conversion = match conversion {
+        ConversionType::Checkmate => "checkmate",
+        ConversionType::Capture => "capture",
+        ConversionType::Promotion => "promotion",
+    };
+    let unit = if plies == 1 { "ply" } else { "plies" };
+    format!("{result} - {conversion}, DTC {plies} {unit}")
 }
 
 fn generation_summary(
@@ -228,23 +191,23 @@ fn generation_summary(
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
     let mut prober = EgtProber::new(&cli.path)?;
     if let Some(cache_size) = cli.cache_size {
-        prober.with_cache_size(cache_size)?;
+        prober.set_cache_size(cache_size)?;
     }
     if let Some(ref input) = cli.input_path {
-        prober.with_input_path(input)?;
+        prober.set_input_path(input)?;
     }
     Ok(prober)
 }
 
 fn configure_generator(generator: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
-    generator.with_threads(usize::from(cli.threads));
+    generator.set_threads(usize::from(cli.threads));
     if let Some(cache_size) = cli.cache_size {
-        generator.with_cache_size(cache_size);
+        generator.set_cache_size(cache_size);
     }
     if let Some(ref input) = cli.input_path {
-        generator.with_input_path(input)?;
+        generator.set_input_path(input)?;
     }
-    generator.with_verify(!cli.noverify);
+    generator.set_verify(!cli.noverify);
     Ok(())
 }
 
@@ -261,6 +224,24 @@ mod tests {
         "--list",
     ];
     const FEN: &str = "8/8/8/8/8/8/3K4/k7 w - - 0 1";
+
+    #[test]
+    fn outcomes_report_conversion_and_exact_plies() {
+        use ConversionType::*;
+        use DtcOutcome::*;
+        for (outcome, expected) in [
+            (Draw, "Draw"),
+            (Win(Capture, 1), "Win - capture, DTC 1 ply"),
+            (Win(Capture, 2), "Win - capture, DTC 2 plies"),
+            (Win(Promotion, 8), "Win - promotion, DTC 8 plies"),
+            (Win(Checkmate, 3), "Win - checkmate, DTC 3 plies"),
+            (Loss(Checkmate, 0), "Loss - checkmate, DTC 0 plies"),
+            (Loss(Capture, 2), "Loss - capture, DTC 2 plies"),
+            (Loss(Promotion, 1), "Loss - promotion, DTC 1 ply"),
+        ] {
+            assert_eq!(format_outcome(outcome), expected);
+        }
+    }
 
     #[test]
     fn selector_actions_accept_multiple_selectors_without_a_path() {

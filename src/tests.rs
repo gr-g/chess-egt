@@ -6,8 +6,8 @@ use std::path::Path;
 
 fn unverified_generator(path: impl AsRef<Path>) -> EgtGenerator {
     let mut generator = EgtGenerator::new(path).unwrap();
-    generator.with_threads(2);
-    generator.with_verify(false);
+    generator.set_threads(2);
+    generator.set_verify(false);
     generator
 }
 
@@ -34,7 +34,7 @@ fn verify_internal_consistency(selector: &str) {
     let generator = unverified_generator(&dir.0);
     generator.generate_selected(&["K_K", selector]).unwrap();
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.with_threads(2);
+    verifier.set_threads(2);
     let mut tables = resolve_selectors(&[selector]).unwrap();
     tables.extend(tables.clone().into_iter().map(|id| id.twin().0));
     let names: Vec<_> = tables.iter().map(TableId::tablename).collect();
@@ -74,7 +74,7 @@ fn test_verify_internal_consistency_kp_k() {
         assert_eq!(file.egt().tablename(), id.tablename());
     }
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.with_threads(2);
+    verifier.set_threads(2);
     verifier.verify_selected(&["KP_K", "K_KP"]).unwrap();
 
     // Exact verification must not expand an identity to its material family.
@@ -86,7 +86,7 @@ fn test_verify_internal_consistency_kp_k() {
         std::fs::remove_file(dir.0.join(id.relative_path("ggegt"))).unwrap();
     }
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.with_threads(2);
+    verifier.set_threads(2);
     verifier.verify_internal_consistency("KPa_K").unwrap();
     assert!(matches!(
         verifier.verify_internal_consistency("KP_K"),
@@ -99,11 +99,11 @@ fn default_and_zero_threads_generate_and_verify() {
     for threads in [None, Some(0)] {
         let dir = TestDir::new(&format!("default_threads_{threads:?}"));
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
-        generator.with_verify(false);
+        generator.set_verify(false);
         let mut verifier = EgtVerifier::new(&dir.0).unwrap();
         if let Some(threads) = threads {
-            generator.with_threads(threads);
-            verifier.with_threads(threads);
+            generator.set_threads(threads);
+            verifier.set_threads(threads);
         }
         let tables = generator.generate("K_K").unwrap();
         assert_eq!(tables.len(), 1);
@@ -117,17 +117,17 @@ fn bounded_cache_size_supports_generation_verification_and_probing() {
     // Fit both queen-table frames, but force eviction when K_K is also probed.
     let cache_bytes = 2 * Egt::from_tablename("KQ_K").unwrap().index_range() * 2;
     let mut generator = EgtGenerator::new(&dir.0).unwrap();
-    generator.with_threads(2);
-    generator.with_cache_size(cache_bytes);
+    generator.set_threads(2);
+    generator.set_cache_size(cache_bytes);
     let tables = generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
     assert_eq!(tables.len(), 3);
 
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.with_threads(2);
-    verifier.with_cache_size(cache_bytes).unwrap();
+    verifier.set_threads(2);
+    verifier.set_cache_size(cache_bytes).unwrap();
     verifier.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
-    prober.with_cache_size(cache_bytes).unwrap();
+    prober.set_cache_size(cache_bytes).unwrap();
 
     let reference = TestDir::new("bounded_cache_size_reference");
     unverified_generator(&reference.0)
@@ -156,7 +156,7 @@ fn probe_with_moves_matches_scalar_probes() {
         .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
-    prober.with_cache_size(0).unwrap();
+    prober.set_cache_size(0).unwrap();
     for fen in [
         "7k/8/8/8/8/8/P7/K7 w - - 0 1",
         "7k/P7/2K5/8/8/8/8/8 w - - 0 1",
@@ -219,16 +219,16 @@ fn probing_rejects_castling_rights_before_table_lookup() {
 fn zero_cache_size_supports_generation_verification_and_probing() {
     let dir = TestDir::new("zero_cache_size");
     let mut generator = EgtGenerator::new(&dir.0).unwrap();
-    generator.with_threads(2);
-    generator.with_cache_size(0);
+    generator.set_threads(2);
+    generator.set_cache_size(0);
     generator.generate("K_K").unwrap();
 
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.with_threads(2);
-    verifier.with_cache_size(0).unwrap();
+    verifier.set_threads(2);
+    verifier.set_cache_size(0).unwrap();
     verifier.verify_internal_consistency("K_K").unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
-    prober.with_cache_size(0).unwrap();
+    prober.set_cache_size(0).unwrap();
     let egt = Egt::from_tablename("K_K").unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
@@ -249,8 +249,8 @@ fn generator_publishes_finalized_stats_and_verifies_both_outputs_not_input() {
         write_artifact(&input.0, name, "ggegt", &[0xff; 64]);
     }
     let mut generator = EgtGenerator::new(&output.0).unwrap();
-    generator.with_input_path(&input.0).unwrap();
-    generator.with_threads(2);
+    generator.set_input_path(&input.0).unwrap();
+    generator.set_threads(2);
     generator.generate("K_K").unwrap();
     let tables = generator.generate("KQ_K").unwrap();
     assert_eq!(tables.len(), 2);
@@ -263,7 +263,7 @@ fn generator_publishes_finalized_stats_and_verifies_both_outputs_not_input() {
         assert_eq!(serde_json::from_slice::<EgtStats>(&json).unwrap(), *stats);
     }
     let mut shadowed = EgtProber::new(&output.0).unwrap();
-    shadowed.with_input_path(&input.0).unwrap();
+    shadowed.set_input_path(&input.0).unwrap();
     for name in ["KQ_K", "K_KQ"] {
         let error = shadowed.probe(&position_for(name)).unwrap_err();
         assert!(!matches!(error, EgtError::FileNotFound(_)));
@@ -279,7 +279,7 @@ fn generator_publishes_finalized_stats_and_verifies_both_outputs_not_input() {
 fn read_only_output_is_rejected_before_generation() {
     let mut generator = EgtGenerator::new("https://example.com/tables/").unwrap();
     for threads in [1, 4] {
-        generator.with_threads(threads);
+        generator.set_threads(threads);
         assert!(matches!(generator.generate("K_K"),
             Err(EgtError::InvalidStorageLocation(message)) if message.contains("read-only")));
     }
@@ -289,14 +289,14 @@ fn read_only_output_is_rejected_before_generation() {
 fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
     let location = Location::parse("memory:///nested/tables").unwrap();
     let mut generator = EgtGenerator::from_location(location.clone());
-    generator.with_threads(2);
-    generator.with_verify(false);
+    generator.set_threads(2);
+    generator.set_verify(false);
     generator.generate("K_K").unwrap();
     let tables = generator.generate("KQ_K").unwrap();
     assert_eq!(tables.len(), 2);
 
     let mut verifier = EgtVerifier::from_location(location.clone());
-    verifier.with_threads(2);
+    verifier.set_threads(2);
     verifier.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
     let prober = EgtProber::from_location(location.clone());
     assert_eq!(
@@ -320,7 +320,7 @@ fn input_lookup_falls_back_only_for_missing_files() {
 
     let probe = || {
         let mut prober = EgtProber::new(&output.0).unwrap();
-        prober.with_input_path(&input.0).unwrap();
+        prober.set_input_path(&input.0).unwrap();
         prober.probe(&position_for("K_K"))
     };
     assert!(probe().is_ok());
@@ -346,7 +346,7 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
         .unwrap();
     let mut prober = EgtProber::new(&output.0).unwrap();
     assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
-    prober.with_input_path(&input.0).unwrap();
+    prober.set_input_path(&input.0).unwrap();
     assert!(prober.probe(&position).is_err());
 }
 
@@ -354,8 +354,8 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
 fn generation_replaces_placeholders_and_invalidates_hierarchy_summaries() {
     let location = Location::parse("memory:///stats-publication").unwrap();
     let mut generator = EgtGenerator::from_location(location.clone());
-    generator.with_threads(2);
-    generator.with_verify(false);
+    generator.set_threads(2);
+    generator.set_verify(false);
     let statistics = EgtStatistics::from_location(location.clone());
     let missing = statistics.cache_stats(&["2"]).unwrap();
     assert_eq!(missing.selected_tables, 1);
@@ -377,7 +377,7 @@ fn statistics_describe_one_root_independently_of_probing_overlays() {
     let location = Location::parse("memory:///stats-overlay").unwrap();
     location.ensure_format().unwrap();
     let mut prober = EgtProber::from_location(location.clone());
-    prober.with_input_path("memory:///stats-input").unwrap();
+    prober.set_input_path("memory:///stats-input").unwrap();
     let statistics = EgtStatistics::from_location(location.clone());
     let missing = statistics.stats(&["2"]).unwrap();
     assert_eq!((missing.selected_tables, missing.available_tables), (1, 0));

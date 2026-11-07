@@ -36,13 +36,13 @@ impl EgtGenerator {
     }
 
     /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
-    pub fn with_threads(&mut self, threads: usize) {
+    pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
 
     /// Sets the shared dependency-frame cache budget in bytes.
     /// Generation working arrays are allocated separately.
-    pub fn with_cache_size(&mut self, n: usize) {
+    pub fn set_cache_size(&mut self, n: usize) {
         self.cache_size = Some(n);
     }
 
@@ -53,14 +53,14 @@ impl EgtGenerator {
     /// Returns an error if the location cannot be resolved, leaving the previous
     /// setting unchanged. This synchronous API should run in `spawn_blocking`
     /// when called from an async application.
-    pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
+    pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         self.input_path = Some(Location::parse(path)?);
         Ok(())
     }
 
     /// Enables or disables the internal consistency check performed after
     /// generation. Enabled by default.
-    pub fn with_verify(&mut self, verify: bool) {
+    pub fn set_verify(&mut self, verify: bool) {
         self.verify = verify;
     }
 

@@ -4,7 +4,7 @@
 //! The crate root exports [`EgtGenerator`] for generation, [`EgtProber`] for
 //! position lookups, [`EgtVerifier`] for consistency checks, and [`EgtStatistics`]
 //! for metadata queries and hierarchy-cache rebuilding. Constructors and
-//! `with_input_path` resolve local directories or supported object-store URLs
+//! `set_input_path` resolve local directories or supported object-store URLs
 //! and return [`EgtResult`].
 //!
 //! ```no_run
@@ -12,8 +12,8 @@
 //!
 //! fn inspect(root: &str) -> EgtResult<()> {
 //!     let mut verifier = EgtVerifier::new(root)?;
-//!     verifier.with_threads(2);
-//!     verifier.with_cache_size(64 * 1024 * 1024)?;
+//!     verifier.set_threads(2);
+//!     verifier.set_cache_size(64 * 1024 * 1024)?;
 //!     verifier.verify_selected(&["KQ_K", "K_KQ"])?;
 //!
 //!     let statistics = EgtStatistics::new(root)?;
@@ -24,9 +24,9 @@
 //! }
 //! ```
 //!
-//! Verification workers are configured with [`EgtVerifier::with_threads`].
+//! Verification workers are configured with [`EgtVerifier::set_threads`].
 //! Generation verifies by default and configures both phases with
-//! [`EgtGenerator::with_threads`]. Each canonical table is published independently
+//! [`EgtGenerator::set_threads`]. Each canonical table is published independently
 //! after its twin pair is solved. Generation and verification print fixed
 //! progress and timing output.
 //!
@@ -66,7 +66,7 @@ pub use egt_file::EgtFileReader;
 pub use error::{EgtError, EgtResult};
 pub use generator::{EgtGenerator, print_pair_stats, print_table_stats};
 pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};
-pub use prober::{EgtProber, get_endgame};
+pub use prober::EgtProber;
 pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
 use shakmaty::Move;
 pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};

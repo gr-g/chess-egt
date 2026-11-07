@@ -1,3 +1,14 @@
+//! HTTP tablebase API. `/outcome` describes the requested position; `/query`
+//! also includes its legal moves, sorted best-first for the root.
+//!
+//! Root outcomes are from the requested position's side to move. Move outcomes
+//! are from the successor's side to move, so a winning move has category `loss`.
+//! Returned successor outcomes are not inverted or distance-adjusted. Captures
+//! and promotions reset DTC to one ply for ranking only.
+//!
+//! `dtc` is signed in plies: positive for wins, negative for losses, zero for an
+//! already checkmated position. Draws have null `dtc` and `dtc_type`.
+
 mod common;
 
 use axum::{
@@ -70,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let (prober, statistics) = tokio::task::spawn_blocking(move || {
         let mut prober = EgtProber::new(&cli.path)?;
-        prober.with_cache_size(cli.cache_size)?;
+        prober.set_cache_size(cli.cache_size)?;
         // An empty selection validates the root format without loading any tables.
         let statistics = EgtStatistics::new(&cli.path)?;
         statistics.stats(&[])?;
@@ -448,13 +459,13 @@ mod tests {
         let path = dir.0.clone();
         let prober = tokio::task::spawn_blocking(move || {
             let mut generator = EgtGenerator::new(&path).unwrap();
-            generator.with_threads(2);
-            generator.with_verify(false);
+            generator.set_threads(2);
+            generator.set_verify(false);
             generator
                 .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
                 .unwrap();
             let mut prober = EgtProber::new(path).unwrap();
-            prober.with_cache_size(0).unwrap();
+            prober.set_cache_size(0).unwrap();
             prober
         })
         .await

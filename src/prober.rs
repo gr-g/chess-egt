@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use shakmaty::{Chess, Position, Role};
+use shakmaty::{Chess, Position};
 
 use crate::egt_file::SharedFileCache;
 use crate::storage::Location;
@@ -40,7 +40,7 @@ impl EgtProber {
     }
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
-    pub fn with_cache_size(&mut self, n: usize) -> EgtResult<()> {
+    pub fn set_cache_size(&mut self, n: usize) -> EgtResult<()> {
         self.cache.set_cache_size(n)
     }
 
@@ -51,7 +51,7 @@ impl EgtProber {
     /// Returns an error if the location cannot be resolved, leaving the previous
     /// setting unchanged. This synchronous API should run in `spawn_blocking`
     /// when called from an async application.
-    pub fn with_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
+    pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         self.cache.set_input_path(Some(Location::parse(path)?))
     }
 
@@ -84,42 +84,4 @@ impl EgtProber {
                 .collect(),
         })
     }
-}
-
-pub fn get_endgame(position: &Chess) -> String {
-    let stm_color = position.turn();
-    let sntm_color = !stm_color;
-
-    let mut stm = String::new();
-    let mut sntm = String::new();
-
-    // We always have exactly 1 King for each side
-    stm.push('K');
-    sntm.push('K');
-
-    // Count other pieces in order: Q, R, B, N, P
-    let board = position.board();
-    for &role in &[
-        Role::Queen,
-        Role::Rook,
-        Role::Bishop,
-        Role::Knight,
-        Role::Pawn,
-    ] {
-        let stm_count = (board.by_role(role) & board.by_color(stm_color))
-            .into_iter()
-            .count();
-        for _ in 0..stm_count {
-            stm.push(role.upper_char());
-        }
-
-        let sntm_count = (board.by_role(role) & board.by_color(sntm_color))
-            .into_iter()
-            .count();
-        for _ in 0..sntm_count {
-            sntm.push(role.upper_char());
-        }
-    }
-
-    format!("{}_{}", stm, sntm)
 }
