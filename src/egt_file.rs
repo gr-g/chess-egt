@@ -112,17 +112,13 @@ struct FrameDescriptor {
 /// Read-only storage and frame cache for one existing canonical table.
 #[derive(Debug)]
 pub struct EgtFileReader {
-    pub egt: Egt,
-    pub id: TableId,
-    pub(crate) location: Location,
-    pub(crate) key: ObjectPath,
+    egt: Egt,
+    location: Location,
+    key: ObjectPath,
     seek_table: zeekstd::SeekTable,
     /// `None` means the frame has not been loaded or has been evicted.
     frames: Vec<Option<Vec<MaybeDtcOutcome>>>,
     frame_layout: Vec<FrameDescriptor>,
-    /// Maximum number of indexed locations per frame; the tail may be shorter.
-    pub frame_size: usize,
-    pub index_range: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -356,10 +352,10 @@ impl SharedFileCache {
         let reader = file
             .read()
             .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        if start > end || end > reader.index_range {
+        if start > end || end > reader.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
-                range: reader.index_range,
+                range: reader.egt.index_range(),
             });
         }
         if start == end {
@@ -508,7 +504,7 @@ impl SharedFileCache {
             .files
             .write()
             .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
-            .insert(file.id.tablename().to_owned(), Arc::new(RwLock::new(file)));
+            .insert(file.egt.tablename().to_owned(), Arc::new(RwLock::new(file)));
         if let Some(old) = old {
             self.forget_file(&old)?;
         }
@@ -556,6 +552,11 @@ impl SharedFileCache {
 }
 
 impl EgtFileReader {
+    /// The immutable descriptor of this canonical table.
+    pub fn egt(&self) -> &Egt {
+        &self.egt
+    }
+
     /// Opens an existing table without modifying storage. Data is read on demand.
     /// Objects must not be replaced while this reader is in use: reads are not
     /// pinned to an object version.
@@ -567,12 +568,11 @@ impl EgtFileReader {
         let id = TableId::parse(tablename)?;
         let egt = Egt::from_elements(id.parse_elements())?;
         let index_range = egt.index_range();
-        let frame_size = FRAME_SIZE;
         let frame_layout: Vec<_> = (0..index_range)
-            .step_by(frame_size)
+            .step_by(FRAME_SIZE)
             .map(|start| FrameDescriptor {
                 start,
-                len: frame_size.min(index_range - start),
+                len: FRAME_SIZE.min(index_range - start),
             })
             .collect();
         let key = location.key(&id.relative_path("ggegt"));
@@ -581,14 +581,11 @@ impl EgtFileReader {
         let frames = vec![None; frame_layout.len()];
         Ok(Self {
             key,
-            id,
             egt,
             location: location.clone(),
             seek_table,
             frames,
             frame_layout,
-            frame_size,
-            index_range,
         })
     }
 
@@ -645,10 +642,10 @@ impl EgtFileReader {
     }
 
     fn read_from_index_cached(&self, index: usize) -> EgtResult<Option<MaybeDtcOutcome>> {
-        if index >= self.index_range {
+        if index >= self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index,
-                range: self.index_range,
+                range: self.egt.index_range(),
             });
         }
         let (frame_idx, offset) = self.locate_frame(index);
@@ -671,10 +668,10 @@ impl EgtFileReader {
     /// within a single frame. This gives table scans direct slice access,
     /// avoiding the per-element overhead of `read_from_index`.
     pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[MaybeDtcOutcome]> {
-        if start > end || end > self.index_range {
+        if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
-                range: self.index_range,
+                range: self.egt.index_range(),
             });
         }
         if start == end {
@@ -695,10 +692,10 @@ impl EgtFileReader {
         start: usize,
         end: usize,
     ) -> EgtResult<Option<&[MaybeDtcOutcome]>> {
-        if start > end || end > self.index_range {
+        if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
-                range: self.index_range,
+                range: self.egt.index_range(),
             });
         }
         if start == end {
@@ -719,9 +716,9 @@ impl EgtFileReader {
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
         let (name, reflected) = position_table_name(position)?;
-        if name.as_str() != self.id.tablename() {
+        if name.as_str() != self.egt.tablename() {
             return Err(EgtError::PositionNotInTable {
-                table: self.id.tablename().to_owned(),
+                table: self.egt.tablename().to_owned(),
             });
         }
         self.map_routed_position_to_index(position, reflected)
@@ -739,10 +736,10 @@ impl EgtFileReader {
         } else {
             self.egt.position_to_index(position)
         };
-        if index >= self.index_range {
+        if index >= self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index,
-                range: self.index_range,
+                range: self.egt.index_range(),
             });
         }
         Ok(index)
@@ -750,9 +747,6 @@ impl EgtFileReader {
 
     /// Converts a table-local index to a position.
     pub fn index_to_position(&self, index: usize, side_to_move: Color) -> Option<Chess> {
-        if index >= self.index_range {
-            return None;
-        }
         self.egt.position_from_index(index, side_to_move)
     }
 
@@ -770,10 +764,10 @@ impl EgtFileReader {
 
     /// Reads an outcome directly by its table-local index.
     pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
-        if index >= self.index_range {
+        if index >= self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index,
-                range: self.index_range,
+                range: self.egt.index_range(),
             });
         }
 
@@ -969,7 +963,7 @@ mod tests {
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_err());
         assert!(!dir.0.join("format.json").exists());
         let file = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
-        assert!(dir.0.join(file.id.relative_path("ggegt")).exists());
+        assert!(table_path(&dir.0, file.egt().tablename()).exists());
         assert_eq!(std::fs::read(legacy).unwrap(), b"legacy indexing");
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_ok());
         assert!(EgtFileReader::new_from_file(&dir.0, "KP_K").is_err());
@@ -1054,7 +1048,7 @@ mod tests {
             let file = write_fixture(&dir.0, name, |_| MaybeDtcOutcome::DRAW);
             assert_eq!(file.num_frames(), 1);
             let bytes = file.frame_bytes(0);
-            assert_eq!(bytes, file.index_range * 2);
+            assert_eq!(bytes, file.egt.index_range() * 2);
             assert_eq!(frame_bytes.get_or_insert(bytes), &bytes);
         }
         let frame_bytes = frame_bytes.unwrap();
@@ -1194,9 +1188,7 @@ mod tests {
     fn test_egt_file_creation() {
         let dir = crate::TestDir::new("single_table_creation");
         let file = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
-        assert_eq!(file.id.tablename(), "KPa_K");
-        assert_eq!(file.id.tablename(), file.egt.tablename());
-        assert_eq!(file.index_range, file.egt.index_range());
+        assert_eq!(file.egt().tablename(), "KPa_K");
         let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"
             .parse::<Fen>()
             .unwrap()
@@ -1216,7 +1208,7 @@ mod tests {
             Err(EgtError::PositionNotInTable { .. })
         ));
         assert!(
-            file.index_to_position(file.index_range, Color::White)
+            file.index_to_position(file.egt.index_range(), Color::White)
                 .is_none()
         );
     }
@@ -1317,17 +1309,17 @@ mod tests {
         let mut reader = write_fixture(&dir.0, "KPa_K", outcome);
         assert_eq!(
             reader.num_frames(),
-            reader.index_range.div_ceil(reader.frame_size)
+            reader.egt.index_range().div_ceil(FRAME_SIZE)
         );
         for _ in 0..2 {
-            for idx in 0..reader.index_range {
+            for idx in 0..reader.egt.index_range() {
                 assert_eq!(reader.read_from_index(idx).unwrap(), outcome(idx));
             }
             reader.frames.fill(None);
         }
         assert_eq!(
             reader
-                .frame_chunk(reader.index_range, reader.index_range)
+                .frame_chunk(reader.egt.index_range(), reader.egt.index_range())
                 .unwrap(),
             &[]
         );
@@ -1358,10 +1350,10 @@ mod tests {
         let pawnful = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
         assert_eq!(pawnful.num_frames(), 1);
         assert_eq!(pawnful.frame_layout[0].start, 0);
-        assert_eq!(pawnful.frame_layout[0].len, pawnful.index_range);
-        assert!(reader.read_from_index(reader.index_range).is_err());
+        assert_eq!(pawnful.frame_layout[0].len, pawnful.egt.index_range());
+        assert!(reader.read_from_index(reader.egt.index_range()).is_err());
         assert!(reader.frame_chunk(1, 0).is_err());
-        assert!(reader.frame_chunk(0, reader.index_range + 1).is_err());
+        assert!(reader.frame_chunk(0, reader.egt.index_range() + 1).is_err());
     }
 
     #[test]
@@ -1378,7 +1370,7 @@ mod tests {
         // A correct payload with an extra empty frame has the wrong frame count.
         let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
         let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
-        encoder.compress(&vec![0; file.index_range * 2]).unwrap();
+        encoder.compress(&vec![0; file.egt.index_range() * 2]).unwrap();
         encoder.end_frame().unwrap();
         encoder.finish().unwrap();
         assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());

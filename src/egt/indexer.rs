@@ -170,7 +170,7 @@ static KINGS_MAP: std::sync::LazyLock<KingsMap> = std::sync::LazyLock::new(|| {
 });
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum IndexerPieceKind {
+enum IndexerPieceKind {
     Pieces { role: Role, side: EgtSide },
     // Distinct colors: a pawnless lookup, or an ordered two-square combination.
     KingPair,
@@ -178,13 +178,13 @@ pub enum IndexerPieceKind {
 
 // A non-pawn group together with its derived indexing metadata.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexerPieceGroup {
-    pub kind: IndexerPieceKind,
+struct IndexerPieceGroup {
+    kind: IndexerPieceKind,
 
-    pub n_squares: usize,
-    pub combinations: usize,
+    n_squares: usize,
+    combinations: usize,
     // Coordinate slots occupied by the group.
-    pub span: (usize, usize),
+    span: (usize, usize),
 }
 
 type PawnRanks = (ArrayVec<u8, 6>, Option<u8>);
@@ -270,15 +270,15 @@ type PidxBuf = ArrayVec<usize, MAX_PIECES>;
 // Helper object taking care of the efficient conversion from positions to
 // compact indices representing the positions, and viceversa.
 #[derive(Clone, Debug)]
-pub struct Indexer {
+pub(super) struct Indexer {
     // The number of pieces in the endgame.
-    pub n_pieces: usize,
+    n_pieces: usize,
 
     // The number of pawns in the endgame.
-    pub n_pawns: usize,
+    pub(super) n_pawns: usize,
 
     // The total number of positions indexed in this endgame table.
-    pub index_range: usize,
+    pub(super) index_range: usize,
 
     // Pawnful tables whose complete pawn key is invariant under file reflection.
     symmetric_pawns: bool,
@@ -303,7 +303,7 @@ pub struct Indexer {
 impl Indexer {
     /// Builds the indexing plan in canonical order: pawn files, kings, then
     /// other role/side groups. The element multiplicities describe physical pieces.
-    pub fn from_elements(elements: &[EgtElement]) -> EgtResult<Self> {
+    pub(super) fn from_elements(elements: &[EgtElement]) -> EgtResult<Self> {
         validate_elements(elements)?;
         let mut elements = elements.to_vec();
         elements.sort();
@@ -383,12 +383,12 @@ impl Indexer {
     }
 
     // Encodes the position into an index, which represents the position up to symmetries.
-    pub fn position_to_index(&self, position: &Chess) -> usize {
+    pub(super) fn position_to_index(&self, position: &Chess) -> usize {
         self.position_to_index_impl::<false>(position)
     }
 
     // Encodes the horizontal reflection without constructing another Chess.
-    pub(crate) fn reflected_position_to_index(&self, position: &Chess) -> usize {
+    pub(super) fn reflected_position_to_index(&self, position: &Chess) -> usize {
         self.position_to_index_impl::<true>(position)
     }
 
@@ -455,13 +455,13 @@ impl Indexer {
 
     // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
     // If the index represents an invalid position, returns None.
-    pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
+    pub(super) fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         self.position_from_index_impl::<true>(index, side_to_move)
     }
 
     /// Decodes an index already accepted by `position_from_index` for this table and turn.
     /// Skips all position validation, including legal en passant. Panics if out of range.
-    pub(crate) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
+    pub(super) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
         self.position_from_index_impl::<false>(index, side_to_move)
             .expect("position index out of range")
     }
@@ -474,7 +474,7 @@ impl Indexer {
     }
 
     /// Decode an in-range index, retaining its rejection reason for initialization.
-    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
+    pub(super) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
         crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
     }
 
@@ -535,7 +535,7 @@ impl Indexer {
     //    (i.e. `idx` represents 4 equivalent positions), with `other_idx` being the index
     //    of the symmetrical position along the diagonal. `other_idx` will be equal to `idx`
     //    for positions with all pieces on the diagonal.
-    pub fn diagonal_symmetric(&self, index: usize) -> Option<usize> {
+    pub(super) fn diagonal_symmetric(&self, index: usize) -> Option<usize> {
         if self.n_pawns != 0 {
             return None;
         }

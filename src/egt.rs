@@ -5,17 +5,12 @@ use crate::error::EgtResult;
 use crate::piece_set::EgtElement;
 use indexer::Indexer;
 
+/// An immutable indexing descriptor, in either horizontal orientation.
 #[derive(Clone, Debug)]
 pub struct Egt {
-    /// Canonically sorted pawn-file sequences and nonpawn material groups.
-    pub elements: Vec<EgtElement>,
-
-    // The helper object storing the piece set and the information required
-    // to convert positions to table indices.
-    pub indexer: Indexer,
-
-    // The name of this table (e.g. "KQ_KPa").
-    pub tablename: String,
+    elements: Vec<EgtElement>,
+    indexer: Indexer,
+    tablename: String,
 }
 
 impl Egt {
@@ -31,7 +26,7 @@ impl Egt {
 
     // Whether this a pawnless endgame.
     pub fn is_pawnless(&self) -> bool {
-        self.indexer.n_pawns == 0
+        self.n_pawns() == 0
     }
 
     // The total number of positions indexed in this table.
@@ -66,13 +61,16 @@ impl Egt {
         Self::from_elements(parse_elements(tablename)?)
     }
 
-    // Encodes the position into an index, which represents the position up to symmetries.
-    pub fn position_to_index(&self, position: &Chess) -> usize {
+    /// Encodes a no-castling position matching this table's material, pawn files,
+    /// and same-file pawn color order.
+    /// Callers must establish membership before using this trusted inner path.
+    pub(crate) fn position_to_index(&self, position: &Chess) -> usize {
         self.indexer.position_to_index(position)
     }
 
     /// Encodes the horizontal reflection of a no-castling position.
-    /// The reflected position must match this table's piece set and pawn files.
+    /// The reflected position must match this table's material, pawn files,
+    /// and same-file pawn color order.
     pub(crate) fn reflected_position_to_index(&self, position: &Chess) -> usize {
         self.indexer.reflected_position_to_index(position)
     }
@@ -81,6 +79,11 @@ impl Egt {
     // If the index represents an invalid position, returns None.
     pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
         self.indexer.position_from_index(index, side_to_move)
+    }
+
+    /// Decodes an in-range index, retaining its rejection reason for initialization.
+    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
+        self.indexer.position_from_index_with_reason(index, side_to_move)
     }
 
     /// Decodes an index already accepted by `position_from_index` for this table and turn.
@@ -356,7 +359,9 @@ mod tests {
             for turn in [Color::White, Color::Black] {
                 let mut accepted = 0;
                 for index in (0..egt.index_range()).step_by((egt.index_range() / 256).max(1)) {
-                    if let Some(position) = egt.position_from_index(index, turn) {
+                    let decoded = egt.position_from_index(index, turn);
+                    assert_eq!(egt.position_from_index_with_reason(index, turn).unwrap().ok(), decoded);
+                    if let Some(position) = decoded {
                         assert_eq!(egt.position_from_index_unchecked(index, turn), position);
                         accepted += 1;
                     }
@@ -438,26 +443,26 @@ mod tests {
         let egt = Egt::from_tablename("KR_K").unwrap();
 
         for i in [10, 100, 2100] {
-            println!("{:?}", egt.indexer.position_from_index(i, Color::White));
+            println!("{:?}", egt.position_from_index(i, Color::White));
             assert_eq!(egt.diagonal_symmetric(i), None);
         }
 
-        println!("{:?}", egt.indexer.position_from_index(773, Color::White));
-        println!("{:?}", egt.indexer.position_from_index(801, Color::White));
+        println!("{:?}", egt.position_from_index(773, Color::White));
+        println!("{:?}", egt.position_from_index(801, Color::White));
         assert_eq!(egt.diagonal_symmetric(773), Some(801));
         assert_eq!(egt.diagonal_symmetric(801), Some(773));
 
-        println!("{:?}", egt.indexer.position_from_index(805, Color::White));
+        println!("{:?}", egt.position_from_index(805, Color::White));
         assert_eq!(egt.diagonal_symmetric(805), Some(805));
 
         let egt_p = Egt::from_tablename("KPd_K").unwrap();
-        println!("{:?}", egt_p.indexer.position_from_index(0, Color::White));
+        println!("{:?}", egt_p.position_from_index(0, Color::White));
         assert_eq!(egt_p.diagonal_symmetric(0), None);
     }
 
     fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
-        if let Some(position) = egt.indexer.position_from_index(i, side_to_move) {
-            assert_eq!(i, egt.indexer.position_to_index(&position));
+        if let Some(position) = egt.position_from_index(i, side_to_move) {
+            assert_eq!(i, egt.position_to_index(&position));
         }
     }
 

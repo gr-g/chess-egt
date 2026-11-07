@@ -26,7 +26,7 @@ mod storage;
 mod table_id;
 
 use crate::egt_file::SharedFileCache;
-use crate::storage::Location;
+use crate::storage::{FRAME_SIZE, Location};
 pub use egt::Egt;
 pub use egt_file::EgtFileReader;
 pub use error::{EgtError, EgtResult};
@@ -188,11 +188,11 @@ impl EgtGenerator {
                     // both outputs so input artifacts cannot shadow either one.
                     for name in &names {
                         let file = EgtFileReader::open_in(&self.base_path, name)?;
-                        verification.push((file.egt.clone(), file.frame_size));
+                        verification.push(file.egt().clone());
                         reader.insert(file)?;
                     }
-                    for (name, (egt, frame_size)) in names.iter().zip(verification) {
-                        EgtProber::verify_egt(&reader, name, &egt, frame_size)?;
+                    for (name, egt) in names.iter().zip(verification) {
+                        EgtProber::verify_egt(&reader, name, &egt)?;
                     }
                     reader.remove(&names)?;
                 }
@@ -332,13 +332,13 @@ impl EgtProber {
     fn verify_tables_in_pool(&mut self, names: &[String]) -> EgtResult<()> {
         for name in names {
             let file = self.cache.file(name)?;
-            let (egt, frame_size) = {
+            let egt = {
                 let file = file
                     .read()
                     .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-                (file.egt.clone(), file.frame_size)
+                file.egt().clone()
             };
-            Self::verify_egt(&self.cache, name, &egt, frame_size)?;
+            Self::verify_egt(&self.cache, name, &egt)?;
             println!(
                 "Successfully verified internal consistency of table {}.",
                 name
@@ -378,7 +378,6 @@ impl EgtProber {
         reader: &SharedFileCache,
         endgame: &str,
         egt: &egt::Egt,
-        frame_size: usize,
     ) -> EgtResult<()> {
         let tablename = egt.tablename();
         let local_range = egt.index_range();
@@ -387,11 +386,11 @@ impl EgtProber {
 
         let completed = AtomicUsize::new(0);
         // Blocks divide frames so copying a block never crosses a frame boundary.
-        let block_size = 4096.min(frame_size);
+        let block_size = 4096.min(FRAME_SIZE);
         let blocks: Vec<_> = (0..local_range)
-            .step_by(frame_size)
+            .step_by(FRAME_SIZE)
             .flat_map(|frame_start| {
-                let frame_end = (frame_start + frame_size).min(local_range);
+                let frame_end = (frame_start + FRAME_SIZE).min(local_range);
                 (frame_start..frame_end)
                     .step_by(block_size)
                     .map(move |start| (start, (start + block_size).min(frame_end)))
@@ -781,8 +780,7 @@ mod tests {
         assert_eq!(pawn_tables.len(), 8);
         for id in &expected {
             let file = EgtFileReader::new_from_file(&dir.0, id.tablename()).unwrap();
-            assert_eq!(&file.id, id);
-            assert_eq!(file.egt.tablename(), id.tablename());
+            assert_eq!(file.egt().tablename(), id.tablename());
         }
         let mut prober = EgtProber::new(&dir.0).unwrap();
         prober.with_threads(2);
@@ -1044,11 +1042,8 @@ mod tests {
         let mut prober = EgtProber::from_location(generator.base_path.clone());
         prober.with_threads(2);
         prober.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
-        let file = prober.load_existing("K_K").unwrap();
-        assert_eq!(
-            file.key.as_ref(),
-            format!("nested/tables/{}", file.id.relative_path("ggegt"))
-        );
+        assert_eq!(prober.load_existing("K_K").unwrap().egt().tablename(), "K_K");
+        assert!(object_exists(&generator.base_path, "2/1v1/op0/0pawns/K_K.ggegt"));
         assert_eq!(prober.stats(&["KQ_K", "K_KQ"]).unwrap(), aggregate(&tables));
     }
 

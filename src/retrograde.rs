@@ -317,8 +317,8 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
 // Derive the reflection from the twin transformation, not from material counts.
 // This is computed once per table pair rather than per unmove.
 fn is_mirrored(table: &Egt, twin: &Egt) -> bool {
-    let (key, reflected) = PawnKey::from_elements(&table.elements).twin().canonicalized();
-    debug_assert_eq!(key, PawnKey::from_elements(&twin.elements));
+    let (key, reflected) = PawnKey::from_elements(table.elements()).twin().canonicalized();
+    debug_assert_eq!(key, PawnKey::from_elements(twin.elements()));
     reflected
 }
 
@@ -572,7 +572,7 @@ fn initialize_table(
         let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
             let idx = block * SUMMARY_BLOCK_SIZE + offset;
-            let position = match egt.indexer.position_from_index_with_reason(idx, Color::White)? {
+            let position = match egt.position_from_index_with_reason(idx, Color::White)? {
                 Ok(position) => position,
                 Err(reason) => {
                     *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();

@@ -446,7 +446,7 @@ together into a combined pawn index. A precomputed array maps a base-six
 encoding of the pawn ranks and an en passant selector to this index.
 For each combined pawn index, the positions of the other pieces are
 combinatorially encoded without overlaps into a fixed-size range. The
-`Indexer` exposes one contiguous index range for the entire table, combining
+`Egt::index_range()` covers one contiguous range for the entire table, combining
 the pawn and non-pawn indices.
 
 For the detailed indexing algorithm, see the module documentation in

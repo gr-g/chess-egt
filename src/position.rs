@@ -141,7 +141,7 @@ mod tests {
             let egt = crate::egt::Egt::from_elements(id.parse_elements()).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
-                match egt.indexer.position_from_index_with_reason(index, Color::White).unwrap() {
+                match egt.position_from_index_with_reason(index, Color::White).unwrap() {
                     Ok(_) => valid += 1,
                     Err(reason) => part.record(reason),
                 }
