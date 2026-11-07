@@ -72,7 +72,7 @@ use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, R
 use crate::ConversionType;
 use crate::egt_file::MaybeDtcOutcome;
 use crate::stats::EgtStats;
-use crate::table_id::{PawnKey, TableId};
+use crate::selection::TablePair;
 use crate::error::{EgtError, EgtResult};
 use crate::egt::Egt;
 use crate::position::InvalidCounts;
@@ -82,24 +82,6 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
 use crate::egt_file::SharedFileCache;
 use crate::storage::Location;
-
-type EgtHandle = usize;
-
-fn table_name(solver: &RetrogradeSolver, handle: EgtHandle) -> &str {
-    solver.tables[handle].tablename()
-}
-
-struct RetrogradeSolver {
-    tables: Vec<Egt>,
-}
-
-impl RetrogradeSolver {
-    fn new(table_a: Egt, table_b: Option<Egt>) -> Self {
-        let mut tables = vec![table_a];
-        tables.extend(table_b);
-        Self { tables }
-    }
-}
 
 /// Mutable values for only the current pair; a self-pair has one shared array.
 struct WorkingPair {
@@ -314,14 +296,6 @@ fn both_kings_on_diagonal(position: &Chess) -> bool {
     kings_on_long_diagonal(position.board().by_role(Role::King))
 }
 
-// Derive the reflection from the twin transformation, not from material counts.
-// This is computed once per table pair rather than per unmove.
-fn is_mirrored(table: &Egt, twin: &Egt) -> bool {
-    let (key, reflected) = PawnKey::from_elements(table.elements()).twin().canonicalized();
-    debug_assert_eq!(key, PawnKey::from_elements(twin.elements()));
-    reflected
-}
-
 /// Quiet predecessors of a pawnless tablebase position, without castling rights.
 fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
     debug_assert!(position.board().pawns().is_empty());
@@ -462,8 +436,6 @@ pub fn quiet_unmoves<F>(
     F: FnMut(usize),
 {
     let position = table.position_from_index_unchecked(local_index, Color::White);
-
-    debug_assert_eq!(mirrored, is_mirrored(table, twin));
 
     // The diagonal symmetry adjustment below only applies to pawnless tables,
     // and never to a source position that is already on the diagonal (`#p=4`).
@@ -653,64 +625,59 @@ fn initialize_table(
     }))
 }
 
-/// Per-pair output of `solve_pair`.
+struct TableState {
+    egt: Egt,
+    summary: PlySummary,
+    invalid: InvalidCounts,
+    previous: Found,
+    found: Found,
+    /// Maximum win and loss DTC, respectively.
+    maxima: [u16; 2],
+}
+
+impl TableState {
+    fn new(egt: Egt) -> Self {
+        Self {
+            summary: PlySummary::new(egt.index_range()),
+            egt,
+            invalid: InvalidCounts::default(),
+            previous: Found::default(),
+            found: Found::default(),
+            maxima: [0; 2],
+        }
+    }
+}
+
 struct PairResult {
     working: WorkingPair,
-    invalid: [InvalidCounts; 2],
-    max_win_dtc_a: u16,
-    max_loss_dtc_a: u16,
-    max_win_dtc_b: u16,
-    max_loss_dtc_b: u16,
     init_time: std::time::Duration,
     propagation_time: std::time::Duration,
 }
 
-/// Solves the logical tables `table_a` and `table_b` (twins under changing
-/// the side to move), leaving the draws as unknown.
+/// Solves one table or two twins, leaving the draws as unknown. Reversing
+/// the slot order selects the twin, including slot 0 for a self-twin.
 fn solve_pair(
-    solver: &RetrogradeSolver,
-    table_a: EgtHandle,
-    table_b: EgtHandle,
+    tables: &mut [TableState],
+    reflected: [bool; 2],
     reader: &SharedFileCache,
 ) -> EgtResult<PairResult> {
+    debug_assert!((1..=2).contains(&tables.len()));
     let init_start = std::time::Instant::now();
-    let egt = |table: EgtHandle| &solver.tables[table];
-
-    // (table, twin, mirrored, slot of the table, slot of the twin), where the
-    // slot indexes the per-table counts (0 for A, 1 for B).
-    let tables: Vec<(EgtHandle, EgtHandle, bool, usize, usize)> = if table_a == table_b {
-        vec![(table_a, table_a, is_mirrored(egt(table_a), egt(table_a)), 0, 0)]
-    } else {
-        vec![
-            (table_a, table_b, is_mirrored(egt(table_a), egt(table_b)), 0, 1),
-            (table_b, table_a, is_mirrored(egt(table_b), egt(table_a)), 1, 0),
-        ]
-    };
-
-    let mut working = WorkingPair::new(tables.iter().map(|&(table, ..)| {
-        (table_name(solver, table), egt(table).index_range())
+    let mut working = WorkingPair::new(tables.iter().map(|table| {
+        (table.egt.tablename(), table.egt.index_range())
     }))?;
 
-    // Indexed by slot. A symmetric pair has a single table and summary.
-    let summaries: Vec<PlySummary> = tables.iter().map(|&(table, ..)| PlySummary::new(egt(table).index_range())).collect();
-
-    // Checkmates count as losses at ply 0, so that phase W(1) scans them.
-    let mut previous = [Found::default(); 2];
-    let mut found_by_conversion = [Found::default(); 2];
-    let mut invalid = [InvalidCounts::default(); 2];
-    for &(table, _, _, slot, _) in &tables {
-        let counts = initialize_table(egt(table), &mut working.values[slot], &summaries[slot], reader)?;
-        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table_name(solver, table), counts.checkmates, counts.stalemates);
-        previous[slot].losses = counts.checkmates;
-        found_by_conversion[slot] = counts.found;
-        invalid[slot] = counts.invalid;
+    for (table, values) in tables.iter_mut().zip(&mut working.values) {
+        let counts = initialize_table(&table.egt, values, &table.summary, reader)?;
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table.egt.tablename(), counts.checkmates, counts.stalemates);
+        // Checkmates count as losses at ply 0, so that phase W(1) scans them.
+        table.previous.losses = counts.checkmates;
+        table.found = counts.found;
+        table.invalid = counts.invalid;
     }
 
     let init_time = init_start.elapsed();
     let propagation_start = std::time::Instant::now();
-
-    let mut max_win = [0u16; 2];
-    let mut max_loss = [0u16; 2];
 
     // Blocks visited by the scans, and blocks the same scans would visit
     // without the summaries.
@@ -719,90 +686,92 @@ fn solve_pair(
 
     let mut plies: u16 = 1;
     loop {
-        // Positions resolved at `plies`. The scans of a table are skipped
-        // when it resolved nothing at `plies - 1`.
-        let mut found = if plies == 1 { found_by_conversion } else { [Found::default(); 2] };
-
         // Phase W: losses at `plies - 1` make their predecessors wins.
-        for &(table, twin, mirrored, slot, twin_slot) in &tables {
-            if previous[slot].losses == 0 {
+        for slot in 0..tables.len() {
+            let table = &tables[slot];
+            let twin_slot = tables.len() - 1 - slot;
+            let twin = &tables[twin_slot];
+            if table.previous.losses == 0 {
                 continue;
             }
             // Blocks written during the scan only receive values at `plies`,
             // which the scan does not look for, so the snapshot is complete.
-            let blocks = summaries[slot].blocks_with(SummaryKind::Loss, plies - 1);
+            let blocks = table.summary.blocks_with(SummaryKind::Loss, plies - 1);
             blocks_scanned += blocks.len();
-            blocks_total += summaries[slot].num_blocks();
+            blocks_total += table.summary.num_blocks();
             if blocks.is_empty() {
                 continue;
             }
             let newly = scan_table(&working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v, local| {
                 let ct = outcome_ct(v);
-                quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
+                quiet_unmoves(&table.egt, &twin.egt, idx, reflected[slot], |pred_idx| {
                     match working.mark_win(twin_slot, pred_idx, ct, plies) {
                         WinUpdate::NewlyResolved => {
                             local.wins += 1;
-                            summaries[twin_slot].record(pred_idx, SummaryKind::Win(ct), plies);
+                            twin.summary.record(pred_idx, SummaryKind::Win(ct), plies);
                         }
                         WinUpdate::Upgraded => {
                             // Keep the old kind's bound: stale bounds only add scans.
-                            summaries[twin_slot].record(pred_idx, SummaryKind::Win(ct), plies);
+                            twin.summary.record(pred_idx, SummaryKind::Win(ct), plies);
                         }
                         WinUpdate::Unchanged => {}
                     }
                 });
             });
-            found[twin_slot] = found[twin_slot].merge(newly);
+            tables[twin_slot].found = tables[twin_slot].found.merge(newly);
         }
 
         // Phase L: wins at `plies - 1` decrement the counters of their
         // predecessors, one conversion type after the other.
         for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
             let target = MaybeDtcOutcome::new_win(ct, plies - 1);
-            for &(table, twin, mirrored, slot, twin_slot) in &tables {
-                if previous[slot].wins == 0 {
+            for slot in 0..tables.len() {
+                let table = &tables[slot];
+                let twin_slot = tables.len() - 1 - slot;
+                let twin = &tables[twin_slot];
+                if table.previous.wins == 0 {
                     continue;
                 }
-                let blocks = summaries[slot].blocks_with(SummaryKind::Win(ct), plies - 1);
+                let blocks = table.summary.blocks_with(SummaryKind::Win(ct), plies - 1);
                 blocks_scanned += blocks.len();
-                blocks_total += summaries[slot].num_blocks();
+                blocks_total += table.summary.num_blocks();
                 if blocks.is_empty() {
                     continue;
                 }
                 let newly = scan_table(&working, slot, &blocks, |v| v == target, |working, idx, _, local| {
-                    quiet_unmoves(egt(table), egt(twin), idx, mirrored, |pred_idx| {
+                    quiet_unmoves(&table.egt, &twin.egt, idx, reflected[slot], |pred_idx| {
                         if working.decrement(twin_slot, pred_idx, ct, plies) {
                             local.losses += 1;
-                            summaries[twin_slot].record(pred_idx, SummaryKind::Loss, plies);
+                            twin.summary.record(pred_idx, SummaryKind::Loss, plies);
                         }
                     });
                 });
-                found[twin_slot] = found[twin_slot].merge(newly);
+                tables[twin_slot].found = tables[twin_slot].found.merge(newly);
             }
         }
 
-        for &(table, _, _, slot, _) in &tables {
-            if found[slot].wins > 0 {
-                println!("{}: Found {} winning positions at depth {}", table_name(solver, table), found[slot].wins, plies);
-                max_win[slot] = plies;
+        for table in tables.iter_mut() {
+            if table.found.wins > 0 {
+                println!("{}: Found {} winning positions at depth {}", table.egt.tablename(), table.found.wins, plies);
+                table.maxima[0] = plies;
             }
-            if found[slot].losses > 0 {
-                println!("{}: Found {} losing positions at depth {}", table_name(solver, table), found[slot].losses, plies);
-                max_loss[slot] = plies;
+            if table.found.losses > 0 {
+                println!("{}: Found {} losing positions at depth {}", table.egt.tablename(), table.found.losses, plies);
+                table.maxima[1] = plies;
             }
+            table.previous = std::mem::take(&mut table.found);
         }
 
-        if found.iter().all(|f| f.is_empty()) {
+        if tables.iter().all(|table| table.previous.is_empty()) {
             break;
         }
-        previous = found;
         plies += 1;
     }
 
     if blocks_total > 0 {
         println!(
             "{}: scans visited {} of {} blocks ({:.1}%)",
-            table_name(solver, table_a),
+            tables[0].egt.tablename(),
             blocks_scanned,
             blocks_total,
             100.0 * blocks_scanned as f64 / blocks_total as f64,
@@ -811,11 +780,6 @@ fn solve_pair(
 
     Ok(PairResult {
         working,
-        invalid,
-        max_win_dtc_a: max_win[0],
-        max_loss_dtc_a: max_loss[0],
-        max_win_dtc_b: max_win[1],
-        max_loss_dtc_b: max_loss[1],
         init_time,
         propagation_time: propagation_start.elapsed(),
     })
@@ -829,43 +793,27 @@ fn solve_pair(
 /// in requested-table/twin order without opening the published outputs.
 pub(crate) fn generate_pair(
     base: &Location,
-    table: &TableId,
+    pair: &TablePair,
     reader: &SharedFileCache,
 ) -> EgtResult<Vec<EgtStats>> {
     base.ensure_writable()?;
-    let (twin, _) = table.twin()?;
-    let mut ids = vec![table.clone()];
-    let table_a = Egt::from_elements(table.parse_elements())?;
-    let table_b = if twin == *table {
-        None
-    } else {
-        let egt = Egt::from_elements(twin.parse_elements())?;
-        ids.push(twin);
-        Some(egt)
-    };
-    let solver = RetrogradeSolver::new(table_a, table_b);
-    let pair = solve_pair(&solver, 0, ids.len() - 1, reader)?;
+    let ids = || std::iter::once(&pair.table).chain(pair.twin.iter());
+    let mut tables = ids().map(|id| Egt::from_elements(id.parse_elements()).map(TableState::new))
+        .collect::<EgtResult<Vec<_>>>()?;
+    let result = solve_pair(&mut tables, pair.reflected, reader)?;
 
     let finalize_start = std::time::Instant::now();
-    let maxima = [
-        [pair.max_win_dtc_a, pair.max_loss_dtc_a],
-        [pair.max_win_dtc_b, pair.max_loss_dtc_b],
-    ];
-    let mut stats = Vec::with_capacity(ids.len());
-    for ((((id, egt), values), maxima), invalid) in ids.iter()
-        .zip(solver.tables)
-        .zip(pair.working.values)
-        .zip(maxima)
-        .zip(pair.invalid)
-    {
+    let mut stats = Vec::with_capacity(tables.len());
+    for ((id, table), values) in ids().zip(tables).zip(result.working.values) {
+        drop(table.summary);
         println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
-        stats.push(crate::finalization::finalize_table(base, id, &egt, values, maxima, invalid)?);
+        stats.push(crate::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
     }
     println!(
         "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
-        table.tablename(),
-        pair.init_time.as_secs_f64(),
-        pair.propagation_time.as_secs_f64(),
+        pair.table.tablename(),
+        result.init_time.as_secs_f64(),
+        result.propagation_time.as_secs_f64(),
         finalize_start.elapsed().as_secs_f64(),
     );
     Ok(stats)
@@ -875,8 +823,8 @@ pub(crate) fn generate_pair(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use crate::{EgtError, EgtGenerator};
-    use crate::selection::TableSelector;
+    use crate::{EgtError, EgtGenerator, TableId};
+    use crate::selection::{GenerationPlan, TableSelector};
 
     fn tables(material: &str) -> Vec<Egt> {
         TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
@@ -1012,12 +960,12 @@ mod tests {
     fn symmetric_pawn_quiet_edge_multiplicities() {
         let mut ep_predecessors = 0;
         let mut ep_successors = 0;
-        for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe"] {
+        for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe", "KPd_KPe", "KPaPa_KPh"] {
             let id = TableId::parse(name).unwrap();
             let (twin_id, mirrored) = id.twin().unwrap();
             let egt = Egt::from_elements(id.parse_elements()).unwrap();
             let twin = Egt::from_elements(twin_id.parse_elements()).unwrap();
-            let reverse_mirrored = is_mirrored(&twin, &egt);
+            let reverse_mirrored = twin_id.twin().unwrap().1;
             let stride = (egt.index_range() / 128).max(1);
             let mut samples: Vec<_> = (0..egt.index_range()).step_by(stride).collect();
             if name == "KPcPf_KPdPe" {
@@ -1384,16 +1332,15 @@ mod tests {
     #[test]
     fn pair_local_self_twin_uses_one_working_array() {
         let dir = crate::TestDir::new("pair_local_self_twin");
-        let solver = RetrogradeSolver::new(table("K_K"), None);
-        let table = 0;
+        let mut tables = [TableState::new(table("K_K"))];
         let location = Location::parse(&dir.0).unwrap();
         let reader = SharedFileCache::new(&location, None, None);
-        let pair = solve_pair(&solver, table, table, &reader).unwrap();
-        assert_eq!(pair.invalid, [InvalidCounts::default(); 2]);
+        let pair = solve_pair(&mut tables, [false; 2], &reader).unwrap();
+        assert_eq!(tables[0].invalid, InvalidCounts::default());
         assert_eq!(pair.working.values.len(), 1);
-        assert_eq!(pair.working.values[0].len(), solver.tables[0].index_range());
+        assert_eq!(pair.working.values[0].len(), tables[0].egt.index_range());
         assert!(plain_values(&pair.working.values[0]).iter().all(|v| v.is_unknown() || v.is_draw()));
-        assert_eq!((pair.max_win_dtc_a, pair.max_loss_dtc_a, pair.max_win_dtc_b, pair.max_loss_dtc_b), (0, 0, 0, 0));
+        assert_eq!(tables[0].maxima, [0, 0]);
     }
 
     #[test]
@@ -1409,11 +1356,17 @@ mod tests {
             let (twin, actual_reflection) = id.twin().unwrap();
             assert_eq!(twin.tablename(), twin_name);
             assert_eq!(actual_reflection, reflected);
-            let solver = RetrogradeSolver::new(table(name), (id != twin).then(|| table(twin_name)));
-            let twin_slot = solver.tables.len() - 1;
-            assert_eq!(is_mirrored(&solver.tables[0], &solver.tables[twin_slot]), reflected);
-            assert_eq!(table_name(&solver, twin_slot), twin_name);
-            assert_eq!(solver.tables.len(), if id == twin { 1 } else { 2 });
+            for selected in [id.clone(), twin.clone()] {
+                let plan = GenerationPlan::new([selected]).unwrap();
+                let pair = &plan.pairs[0];
+                let ids: Vec<_> = std::iter::once(&pair.table).chain(pair.twin.iter()).collect();
+                assert_eq!(ids.len(), if id == twin { 1 } else { 2 });
+                for (slot, source) in ids.iter().enumerate() {
+                    let (target, reflection) = source.twin().unwrap();
+                    assert_eq!(target, *ids[ids.len() - 1 - slot]);
+                    assert_eq!(pair.reflected[slot], reflection);
+                }
+            }
         }
     }
 

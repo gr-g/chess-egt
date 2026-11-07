@@ -31,7 +31,7 @@ pub use egt::Egt;
 pub use egt_file::EgtFileReader;
 pub use error::{EgtError, EgtResult};
 use rayon::prelude::*;
-pub use selection::{GenerationPlan, TableSelector, resolve_selectors};
+pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
 use shakmaty::{Chess, Color, Move, MoveList, Position, Role};
 pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
 use std::cmp::Ordering;
@@ -170,14 +170,14 @@ impl EgtGenerator {
             pool.current_num_threads()
         );
         pool.install(|| -> EgtResult<()> {
-            for (table, _) in plan.pairs {
-                let material = material_family(&table)?;
+            for pair in plan.pairs {
+                let material = material_family(&pair);
                 if previous_material.as_ref() != Some(&material) {
                     reader.clear()?;
                     previous_material = Some(material);
                 }
                 let start = std::time::Instant::now();
-                let pair_stats = retrograde::generate_pair(&self.base_path, &table, &reader)?;
+                let pair_stats = retrograde::generate_pair(&self.base_path, &pair, &reader)?;
                 if self.verify {
                     let names: Vec<_> = pair_stats
                         .iter()
@@ -539,10 +539,10 @@ impl EgtProber {
 }
 
 /// An unordered material family, independent of the oriented representative.
-fn material_family(table: &TableId) -> EgtResult<String> {
-    let material = table.material();
-    let twin = table.twin()?.0.material();
-    Ok(material.min(twin))
+fn material_family(pair: &TablePair) -> String {
+    let material = pair.table.material();
+    let twin = pair.twin.as_ref().unwrap_or(&pair.table).material();
+    material.min(twin)
 }
 
 /// The value of a position for the side to move after playing `m`, given the

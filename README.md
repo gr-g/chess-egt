@@ -196,7 +196,7 @@ The following sections describe the tablebase's main building blocks:
   endgame tables and assigns each table a name and storage path.
 - **Indexing layer (`Egt`, `Indexer`)**: Maps positions to a contiguous index
   range `[0, index_range)` within each table.
-- **Retrograde analysis (`RetrogradeSolver`)**: Computes outcomes by propagating
+- **Retrograde analysis (`solve_pair`)**: Computes outcomes by propagating
   known results backward to predecessor positions.
 - **Storage and memory layer (`EgtFileReader`, `EgtFileWriter`,
   `SharedFileCache`)**: Reads and writes compressed tables and caches
@@ -458,8 +458,11 @@ terminal positions (checkmates, stalemates, and conversions) to determine the
 outcome and depth-to-conversion (DTC) for all other positions.
 
 For any pair of tables (e.g., `KQ_KPa` and `KPa_KQ`), retrograde analysis runs
-on both tables simultaneously. Both tables are initialized and propagated
-together.
+on both tables simultaneously. `GenerationPlan::pairs` contains `TablePair`
+values carrying the exact IDs and directional reflection flags through solving.
+Each active table has one working array and its own summary and counters;
+self-twins use a single slot, including when the twin transformation reflects
+horizontally. The indexing descriptors are reused during finalization.
 
 Dependencies are queried during the initialization phase: when positions have
 available captures (including en passant) or promotions converting to a

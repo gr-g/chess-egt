@@ -313,31 +313,52 @@ pub(crate) fn hierarchy_prefixes(selectors: &[&str]) -> EgtResult<Option<Vec<Str
     Ok(Some(disjoint))
 }
 
+/// Exact quiet-move twins and their directional horizontal reflections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TablePair {
+    pub(crate) table: TableId,
+    pub(crate) twin: Option<TableId>,
+    /// Table-to-twin and twin-to-table, including reflected self-twins.
+    pub(crate) reflected: [bool; 2],
+}
+
+impl TablePair {
+    pub fn table(&self) -> &TableId {
+        &self.table
+    }
+
+    /// Absent for a self-twin, which uses a single working array.
+    pub fn twin(&self) -> Option<&TableId> {
+        self.twin.as_ref()
+    }
+}
+
 /// Quiet-move pairs only; capture/promotion prerequisites are not auto-generated.
 #[derive(Clone, Debug)]
 pub struct GenerationPlan {
-    /// Lexically smaller name first; self-twins have no second table.
+    /// Smaller `TableId` first; self-twins have no second table.
     /// Pairs use selection order: total pieces, then pawns, then representative
     /// name in KQRBNP order.
-    pub pairs: Vec<(TableId, Option<TableId>)>,
+    pub pairs: Vec<TablePair>,
 }
 
 impl GenerationPlan {
     pub fn new(tables: impl IntoIterator<Item = TableId>) -> EgtResult<Self> {
         let mut pairs = BTreeMap::new();
         for table in tables {
-            let twin = table.twin()?.0;
-            let (first, second) = if table == twin {
-                (table, None)
+            let (twin, reflected) = table.twin()?;
+            let reverse = PawnKey::from_elements(&twin.parse_elements()).twin().canonicalized().1;
+            let (first, second, reflected) = if table == twin {
+                (table, None, [reflected, reverse])
             } else if table < twin {
-                (table, Some(twin))
+                (table, Some(twin), [reflected, reverse])
             } else {
-                (twin, Some(table))
+                (twin, Some(table), [reverse, reflected])
             };
-            pairs.insert(first, second);
+            pairs.insert(first, (second, reflected));
         }
         Ok(Self {
-            pairs: pairs.into_iter().collect(),
+            pairs: pairs.into_iter().map(|(table, (twin, reflected))| TablePair { table, twin, reflected }).collect(),
         })
     }
 }
@@ -616,7 +637,7 @@ mod tests {
     fn opposition_variants_are_adjacent() {
         let tables = resolve("KP_KP");
         let plan = GenerationPlan::new(tables.clone()).unwrap();
-        let representatives: Vec<_> = plan.pairs.into_iter().map(|(table, _)| table).collect();
+        let representatives: Vec<_> = plan.pairs.into_iter().map(|pair| pair.table).collect();
         for tables in [&tables, &representatives] {
             for file in ['a', 'b', 'c', 'd'] {
                 let unopposed = format!("KP{file}_KP{file}");
@@ -631,7 +652,7 @@ mod tests {
     #[test]
     fn plan_uses_selection_order_for_pair_representatives() {
         let plan = GenerationPlan::new(resolve_selectors(&["3/", "2/"]).unwrap()).unwrap();
-        let representatives: Vec<_> = plan.pairs.iter().map(|(table, _)| table.clone()).collect();
+        let representatives: Vec<_> = plan.pairs.iter().map(|pair| pair.table.clone()).collect();
         assert_eq!(
             names(&representatives),
             [
@@ -650,9 +671,10 @@ mod tests {
         .collect();
         let plan = GenerationPlan::new(selected.clone()).unwrap();
         assert_eq!(plan.pairs.len(), 6);
-        assert!(plan.pairs.windows(2).all(|w| w[0].0 < w[1].0));
-        for (first, second) in &plan.pairs {
-            match second {
+        assert!(plan.pairs.windows(2).all(|w| w[0].table < w[1].table));
+        for pair in &plan.pairs {
+            let first = pair.table();
+            match pair.twin() {
                 Some(second) => {
                     assert!(first < second);
                     assert_eq!(first.twin().unwrap().0, *second);
@@ -664,14 +686,14 @@ mod tests {
             assert!(
                 plan.pairs
                     .iter()
-                    .any(|(a, b)| *a == table || b.as_ref() == Some(&table))
+                    .any(|pair| pair.table == table || pair.twin.as_ref() == Some(&table))
             );
         }
         let only_pawn = GenerationPlan::new(resolve("KPa_K")).unwrap();
         assert_eq!(only_pawn.pairs.len(), 1);
-        assert!(only_pawn.pairs.iter().all(|(a, _)| a.n_pawns() == 1));
+        assert!(only_pawn.pairs.iter().all(|pair| pair.table.n_pawns() == 1));
         let self_twin = GenerationPlan::new(resolve("KPd_KPe")).unwrap();
-        assert_eq!(self_twin.pairs[0].1, None);
+        assert_eq!(self_twin.pairs[0].twin(), None);
         assert!(
             GenerationPlan::new(Vec::<TableId>::new())
                 .unwrap()
