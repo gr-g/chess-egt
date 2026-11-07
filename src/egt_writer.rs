@@ -9,7 +9,8 @@ use tokio::io::AsyncWriteExt;
 
 #[cfg(test)]
 use crate::egt_file::COMPRESSION_LEVEL;
-use crate::egt_file::{MaybeDtcOutcome, transpose_frame};
+use crate::egt_file::transpose_frame;
+use crate::PackedOutcome;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
@@ -102,7 +103,7 @@ impl EgtFileWriter {
     }
 
     #[cfg(test)]
-    pub(crate) fn write_table(&mut self, values: &[MaybeDtcOutcome]) -> EgtResult<()> {
+    pub(crate) fn write_table(&mut self, values: &[PackedOutcome]) -> EgtResult<()> {
         let length = self.writable_table_length()?;
         if values.len() != length {
             return Err(EgtError::Internal("finalized table has wrong length"));
@@ -220,7 +221,7 @@ pub(crate) fn publish_buffers(
 
 pub(crate) fn encode_frame<W: Write>(
     encoder: &mut zeekstd::Encoder<'_, W>,
-    values: &[MaybeDtcOutcome],
+    values: &[PackedOutcome],
 ) -> EgtResult<()> {
     encoder.compress(&transpose_frame(values))?;
     encoder.end_frame()?;
@@ -232,7 +233,7 @@ pub(crate) fn encode_frame<W: Write>(
 pub(crate) fn write_fixture(
     base: &std::path::Path,
     name: &str,
-    outcome: impl Fn(usize) -> MaybeDtcOutcome,
+    outcome: impl Fn(usize) -> PackedOutcome,
 ) -> crate::egt_file::EgtFileReader {
     use crate::storage::FRAME_SIZE;
 
@@ -284,7 +285,7 @@ mod tests {
         let mut writer = writer(&dir.0, "K_K");
         writer.frame_size = 8;
         let values: Vec<_> = (0..writer.length)
-            .map(|i| [MaybeDtcOutcome::DRAW, MaybeDtcOutcome::INVALID][i % 2])
+            .map(|i| [PackedOutcome::DRAW, PackedOutcome::INVALID][i % 2])
             .collect();
         let options = || zeekstd::EncodeOptions::new().compression_level(COMPRESSION_LEVEL);
         let mut expected = Vec::new();
@@ -370,9 +371,9 @@ mod tests {
         let values: Vec<_> = (0..writer.length)
             .map(|index| {
                 if index % 2 == 0 {
-                    MaybeDtcOutcome::DRAW
+                    PackedOutcome::DRAW
                 } else {
-                    MaybeDtcOutcome::INVALID
+                    PackedOutcome::INVALID
                 }
             })
             .collect();
@@ -423,10 +424,10 @@ mod tests {
         assert!(writer.finish().is_err());
         assert!(writer.publish().is_err());
         assert!(writer.write_table(&[]).is_err());
-        let mut values = vec![MaybeDtcOutcome::DRAW; writer.length];
-        values[0] = MaybeDtcOutcome::new_unknown(1);
+        let mut values = vec![PackedOutcome::DRAW; writer.length];
+        values[0] = PackedOutcome::new_unknown(1);
         assert!(writer.write_table(&values).is_err());
-        values[0] = MaybeDtcOutcome::INVALID;
+        values[0] = PackedOutcome::INVALID;
         writer.write_table(&values).unwrap();
         assert!(writer.write_table(&values).is_err());
         writer.finish().unwrap();
@@ -442,7 +443,7 @@ mod tests {
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::write(&destination, b"existing destination").unwrap();
         writer
-            .write_table(&vec![MaybeDtcOutcome::DRAW; writer.length])
+            .write_table(&vec![PackedOutcome::DRAW; writer.length])
             .unwrap();
         writer.finish().unwrap();
         drop(writer);

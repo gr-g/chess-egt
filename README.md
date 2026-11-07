@@ -226,7 +226,7 @@ losses prefer promotion, then capture, then checkmate. A capturing promotion
 is classified as a capture.
 
 The public `DtcOutcome` enum represents a win, draw, or loss. During generation
-and storage, outcomes use a packed 16-bit representation, `MaybeDtcOutcome`,
+and storage, outcomes use a packed 16-bit representation, `PackedOutcome`,
 which also represents invalid or unresolved entries. It is structured as
 follows:
 - **Bits 0-2 (WDL and Conversion Type)**:
@@ -561,7 +561,7 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
 - Readers cache the seek table. To load a frame not already cached, they fetch
   its compressed byte range and decompress it.
 - Before applying Zstd compression to a frame of _N_ positions, the 16-bit
-  `MaybeDtcOutcome` values are transposed to maximize compressibility. They are
+  `PackedOutcome` values are transposed to maximize compressibility. They are
   reshaped as a sequence of bytes by taking:
   1. First: the low byte of all _N_ outcomes (_N_ bytes).
   2. Second: the high byte of all _N_ outcomes, skipping the (unused) high

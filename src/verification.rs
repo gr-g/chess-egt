@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use rayon::prelude::*;
-use shakmaty::{Chess, Color, Move, MoveList, Position};
+use shakmaty::{Chess, Color, MoveList, Position};
 
 use crate::egt_file::SharedFileCache;
 use crate::storage::{FRAME_SIZE, Location};
@@ -200,7 +200,7 @@ fn best_outcome(
         successor_position.play_unchecked(*m);
 
         let successor_outcome = reader.probe_outcome(&successor_position)?;
-        let v_m = move_value(m, successor_outcome);
+        let v_m = successor_outcome.before_move(m);
 
         if let Some(ref mut best) = best_value {
             if v_m > *best {
@@ -235,7 +235,7 @@ fn describe_mismatch(
         successor_position.play_unchecked(*m);
         // Best-effort diagnostic: skip moves whose successor cannot be probed.
         if let Ok(successor_outcome) = reader.probe_outcome(&successor_position) {
-            let v_m = move_value(m, successor_outcome);
+            let v_m = successor_outcome.before_move(m);
             reason.push_str(&format!(
                 "\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}",
                 m, successor_outcome, v_m
@@ -244,29 +244,7 @@ fn describe_mismatch(
     }
     reason
 }
-/// The value of a position for the side to move after playing `m`, given the
-/// outcome of the successor position. Conversions (captures and promotions)
-/// reset the distance to conversion to 1.
-fn move_value(m: &Move, successor_outcome: DtcOutcome) -> DtcOutcome {
-    if m.is_capture() || m.is_promotion() {
-        let ct = if m.is_capture() {
-            ConversionType::Capture
-        } else {
-            ConversionType::Promotion
-        };
-        match successor_outcome {
-            DtcOutcome::Loss(_, _) => DtcOutcome::Win(ct, 1),
-            DtcOutcome::Draw => DtcOutcome::Draw,
-            DtcOutcome::Win(_, _) => DtcOutcome::Loss(ct, 1),
-        }
-    } else {
-        match successor_outcome {
-            DtcOutcome::Loss(ct, n) => DtcOutcome::Win(ct, n + 1),
-            DtcOutcome::Draw => DtcOutcome::Draw,
-            DtcOutcome::Win(ct, n) => DtcOutcome::Loss(ct, n + 1),
-        }
-    }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -275,7 +253,7 @@ mod tests {
 
     #[test]
     fn verification_rejects_invalid_outcomes_and_recovers_cache() {
-        use crate::egt_file::MaybeDtcOutcome;
+        use crate::PackedOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
         let egt = Egt::from_tablename("K_K").unwrap();
@@ -286,9 +264,9 @@ mod tests {
         for threads in [0, 1, 4] {
             verifier.with_threads(threads);
             for outcome in [
-                MaybeDtcOutcome::INVALID,
-                MaybeDtcOutcome::from_u16(8),
-                MaybeDtcOutcome::DRAW,
+                PackedOutcome::INVALID,
+                PackedOutcome::from_u16(8),
+                PackedOutcome::DRAW,
             ] {
                 // Drop cached readers before replacing their backing artifact.
                 verifier.cache.clear().unwrap();
@@ -296,7 +274,7 @@ mod tests {
                     if i == index {
                         outcome
                     } else {
-                        MaybeDtcOutcome::DRAW
+                        PackedOutcome::DRAW
                     }
                 });
                 verifier.cache.insert(file).unwrap();

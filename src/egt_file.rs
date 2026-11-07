@@ -4,7 +4,9 @@ use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 use crate::table_id::{TableId, position_table_name};
-use crate::{ConversionType, DtcOutcome};
+use crate::{DtcOutcome, PackedOutcome};
+#[cfg(test)]
+use crate::ConversionType;
 use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
 #[cfg(test)]
 use shakmaty::CastlingMode;
@@ -18,89 +20,6 @@ use crate::storage::FRAME_SIZE;
 
 // Compression level used when storing data on disk.
 pub(crate) const COMPRESSION_LEVEL: i32 = 19;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MaybeDtcOutcome(pub u16);
-
-impl MaybeDtcOutcome {
-    pub const INVALID: Self = Self(0b000);
-    pub const DRAW: Self = Self(0b001);
-
-    pub fn from_u16(value: u16) -> Self {
-        Self(value)
-    }
-
-    pub fn to_u16(self) -> u16 {
-        self.0
-    }
-
-    pub fn is_assigned(self) -> bool {
-        (self.0 & 0b111) != 0b000
-    }
-
-    pub fn is_invalid(self) -> bool {
-        self.0 == 0b000
-    }
-
-    pub fn is_unknown(self) -> bool {
-        (self.0 & 0b111) == 0b000 && (self.0 >> 3) != 0
-    }
-
-    pub fn get_unknown_counter(self) -> u16 {
-        self.0 >> 3
-    }
-
-    pub fn is_draw(self) -> bool {
-        self.0 == 0b001
-    }
-
-    pub fn is_win(self) -> bool {
-        matches!(self.0 & 0b111, 0b010 | 0b100 | 0b110)
-    }
-
-    pub fn is_loss(self) -> bool {
-        matches!(self.0 & 0b111, 0b011 | 0b101 | 0b111)
-    }
-
-    pub fn new_win(ct: ConversionType, distance: u16) -> Self {
-        let bits = match ct {
-            ConversionType::Checkmate => 0b010,
-            ConversionType::Capture => 0b100,
-            ConversionType::Promotion => 0b110,
-        };
-        Self(bits | (distance << 3))
-    }
-
-    pub fn new_loss(ct: ConversionType, distance: u16) -> Self {
-        let bits = match ct {
-            ConversionType::Checkmate => 0b011,
-            ConversionType::Capture => 0b101,
-            ConversionType::Promotion => 0b111,
-        };
-        Self(bits | (distance << 3))
-    }
-
-    pub fn new_unknown(counter: u16) -> Self {
-        Self(counter << 3)
-    }
-
-    pub fn to_outcome_at(self, index: usize) -> EgtResult<DtcOutcome> {
-        let n = self.0 >> 3;
-        match self.0 & 0b111 {
-            0b001 => Ok(DtcOutcome::Draw),
-            0b010 => Ok(DtcOutcome::Win(ConversionType::Checkmate, n)),
-            0b100 => Ok(DtcOutcome::Win(ConversionType::Capture, n)),
-            0b110 => Ok(DtcOutcome::Win(ConversionType::Promotion, n)),
-            0b011 => Ok(DtcOutcome::Loss(ConversionType::Checkmate, n)),
-            0b101 => Ok(DtcOutcome::Loss(ConversionType::Capture, n)),
-            0b111 => Ok(DtcOutcome::Loss(ConversionType::Promotion, n)),
-            _ => Err(EgtError::CorruptedOutcome {
-                value: self.0,
-                index,
-            }),
-        }
-    }
-}
 
 /// Attempts to load an existing table, looking it up first in `input_path`
 /// (if set) and then in `base_path`, falling back only when a file is missing.
@@ -134,7 +53,7 @@ pub struct EgtFileReader {
     key: ObjectPath,
     seek_table: zeekstd::SeekTable,
     /// `None` means the frame has not been loaded or has been evicted.
-    frames: Vec<Option<Vec<MaybeDtcOutcome>>>,
+    frames: Vec<Option<Vec<PackedOutcome>>>,
     frame_layout: Vec<FrameDescriptor>,
 }
 
@@ -230,7 +149,7 @@ impl SharedFileCache {
         Ok(file)
     }
 
-    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
+    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<PackedOutcome> {
         self.probe_indexed(position).map(|(_, outcome)| outcome)
     }
 
@@ -311,7 +230,7 @@ impl SharedFileCache {
         Ok(outcomes)
     }
 
-    fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, MaybeDtcOutcome)> {
+    fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {
         let (name, reflected) = position_table_name(position)?;
         self.probe_routed(position, name.as_str(), reflected)
             .map_err(|source| match source {
@@ -328,7 +247,7 @@ impl SharedFileCache {
         position: &Chess,
         endgame: &str,
         reflected: bool,
-    ) -> EgtResult<(usize, MaybeDtcOutcome)> {
+    ) -> EgtResult<(usize, PackedOutcome)> {
         let file = self.file(endgame)?;
         let reader = file
             .read()
@@ -363,7 +282,7 @@ impl SharedFileCache {
         endgame: &str,
         start: usize,
         end: usize,
-    ) -> EgtResult<Vec<MaybeDtcOutcome>> {
+    ) -> EgtResult<Vec<PackedOutcome>> {
         let file = self.file(endgame)?;
         let reader = file
             .read()
@@ -645,7 +564,7 @@ impl EgtFileReader {
     }
 
     /// Probes the outcome of a specific position.
-    pub fn probe(&mut self, position: &Chess) -> EgtResult<MaybeDtcOutcome> {
+    pub fn probe(&mut self, position: &Chess) -> EgtResult<PackedOutcome> {
         let index = self.map_position_to_index(position)?;
         self.read_from_index(index)
     }
@@ -653,11 +572,11 @@ impl EgtFileReader {
     /// Probes without allocating, decompressing, or reading from disk.
     /// `None` means the frame is cold, not that the outcome is invalid/unknown.
     #[cfg(test)]
-    pub(crate) fn probe_cached(&self, position: &Chess) -> EgtResult<Option<MaybeDtcOutcome>> {
+    pub(crate) fn probe_cached(&self, position: &Chess) -> EgtResult<Option<PackedOutcome>> {
         self.read_from_index_cached(self.map_position_to_index(position)?)
     }
 
-    fn read_from_index_cached(&self, index: usize) -> EgtResult<Option<MaybeDtcOutcome>> {
+    fn read_from_index_cached(&self, index: usize) -> EgtResult<Option<PackedOutcome>> {
         if index >= self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index,
@@ -671,7 +590,7 @@ impl EgtFileReader {
     }
 
     /// Get uncompressed data for the frame at `frame_index`.
-    fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&[MaybeDtcOutcome]> {
+    fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&[PackedOutcome]> {
         self.ensure_uncompressed_frames(&[frame_idx])?;
 
         self.frames[frame_idx]
@@ -683,7 +602,7 @@ impl EgtFileReader {
     /// loading and decompressing the frame if needed. The range must lie
     /// within a single frame. This gives table scans direct slice access,
     /// avoiding the per-element overhead of `read_from_index`.
-    pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[MaybeDtcOutcome]> {
+    pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[PackedOutcome]> {
         if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
@@ -707,7 +626,7 @@ impl EgtFileReader {
         &self,
         start: usize,
         end: usize,
-    ) -> EgtResult<Option<&[MaybeDtcOutcome]>> {
+    ) -> EgtResult<Option<&[PackedOutcome]>> {
         if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
@@ -775,11 +694,11 @@ impl EgtFileReader {
     }
 
     fn frame_bytes(&self, frame_idx: usize) -> usize {
-        self.frame_layout[frame_idx].len * std::mem::size_of::<MaybeDtcOutcome>()
+        self.frame_layout[frame_idx].len * std::mem::size_of::<PackedOutcome>()
     }
 
     /// Reads an outcome directly by its table-local index.
-    pub fn read_from_index(&mut self, index: usize) -> EgtResult<MaybeDtcOutcome> {
+    pub fn read_from_index(&mut self, index: usize) -> EgtResult<PackedOutcome> {
         if index >= self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index,
@@ -793,7 +712,7 @@ impl EgtFileReader {
         Ok(data[offset])
     }
 
-    fn read_indices_cached(&self, indices: &[usize]) -> EgtResult<Option<Vec<MaybeDtcOutcome>>> {
+    fn read_indices_cached(&self, indices: &[usize]) -> EgtResult<Option<Vec<PackedOutcome>>> {
         indices
             .iter()
             .map(|&index| self.read_from_index_cached(index))
@@ -838,7 +757,7 @@ impl EgtFileReader {
     }
 }
 
-fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<MaybeDtcOutcome>> {
+fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<PackedOutcome>> {
     let mut transposed = vec![0; len * 2];
     // One-shot decoding is bounded by both slices and rejects truncated input.
     // zeekstd's streaming decoder can otherwise loop at premature EOF.
@@ -861,10 +780,10 @@ fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<MaybeDtcOutcome>
     Ok(detranspose_frame(&transposed, len))
 }
 
-/// Transposes (bit-slices) a frame of `MaybeDtcOutcome` values using an 8-8
+/// Transposes (bit-slices) a frame of `PackedOutcome` values using an 8-8
 /// pattern: the low bytes (bits 0-7) are written first, then the high bytes
 /// (bits 8-15).
-pub fn transpose_frame(uncompressed: &[MaybeDtcOutcome]) -> Vec<u8> {
+pub fn transpose_frame(uncompressed: &[PackedOutcome]) -> Vec<u8> {
     let n = uncompressed.len();
     let mut output = vec![0u8; n * 2];
 
@@ -887,17 +806,17 @@ pub fn transpose_frame(uncompressed: &[MaybeDtcOutcome]) -> Vec<u8> {
 
 /// Reverses the transposition (un-bit-slices) of a frame produced by
 /// `transpose_frame` using the 8-8 pattern.
-pub fn detranspose_frame(transposed: &[u8], n: usize) -> Vec<MaybeDtcOutcome> {
-    let mut output = vec![MaybeDtcOutcome::INVALID; n];
+pub fn detranspose_frame(transposed: &[u8], n: usize) -> Vec<PackedOutcome> {
+    let mut output = vec![PackedOutcome::INVALID; n];
 
     let mut j = n;
     for i in 0..n {
         if transposed[i] == 0b000 || transposed[i] == 0b001 {
             let val = transposed[i] as u16;
-            output[i] = MaybeDtcOutcome::from_u16(val);
+            output[i] = PackedOutcome::from_u16(val);
         } else {
             let val = u16::from_le_bytes([transposed[i], transposed[j]]);
-            output[i] = MaybeDtcOutcome::from_u16(val);
+            output[i] = PackedOutcome::from_u16(val);
             j += 1;
         }
     }
@@ -978,7 +897,7 @@ mod tests {
         std::fs::write(&legacy, b"legacy indexing").unwrap();
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_err());
         assert!(!dir.0.join("format.json").exists());
-        let file = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
+        let file = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
         assert!(table_path(&dir.0, file.egt().tablename()).exists());
         assert_eq!(std::fs::read(legacy).unwrap(), b"legacy indexing");
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_ok());
@@ -994,9 +913,9 @@ mod tests {
             .into_position(CastlingMode::Standard)
             .unwrap();
         for outcome in [
-            MaybeDtcOutcome::INVALID,
-            MaybeDtcOutcome::new_unknown(3),
-            MaybeDtcOutcome::DRAW,
+            PackedOutcome::INVALID,
+            PackedOutcome::new_unknown(3),
+            PackedOutcome::DRAW,
         ] {
             let mut file = write_fixture(&dir.0, "KPa_K", |_| outcome);
             assert_eq!(file.probe_cached(&position).unwrap(), None);
@@ -1015,9 +934,9 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let outcome = MaybeDtcOutcome::new_win(ConversionType::Promotion, 7);
+        let outcome = PackedOutcome::new_win(ConversionType::Promotion, 7);
         // Distinct values verify that lazy loading honors input-path precedence.
-        for (path, value) in [(&base.0, MaybeDtcOutcome::DRAW), (&input.0, outcome)] {
+        for (path, value) in [(&base.0, PackedOutcome::DRAW), (&input.0, outcome)] {
             write_fixture(path, "KPa_K", |_| value);
         }
         let reader = SharedFileCache::new(
@@ -1061,7 +980,7 @@ mod tests {
         ];
         let mut frame_bytes = None;
         for (name, _) in positions {
-            let file = write_fixture(&dir.0, name, |_| MaybeDtcOutcome::DRAW);
+            let file = write_fixture(&dir.0, name, |_| PackedOutcome::DRAW);
             assert_eq!(file.num_frames(), 1);
             let bytes = file.frame_bytes(0);
             assert_eq!(bytes, file.egt.index_range() * 2);
@@ -1109,7 +1028,7 @@ mod tests {
                 scope.spawn(move || {
                     for _ in 0..20 {
                         for (_, position) in positions {
-                            assert_eq!(cache.probe(position).unwrap(), MaybeDtcOutcome::DRAW);
+                            assert_eq!(cache.probe(position).unwrap(), PackedOutcome::DRAW);
                         }
                     }
                 });
@@ -1120,7 +1039,7 @@ mod tests {
         cache.set_cache_size(0).unwrap();
         assert_eq!(cache.cache.lock().unwrap().resident, 0);
         assert!(positions.iter().all(|(name, _)| !resident(name)));
-        assert_eq!(cache.probe(&positions[0].1).unwrap(), MaybeDtcOutcome::DRAW);
+        assert_eq!(cache.probe(&positions[0].1).unwrap(), PackedOutcome::DRAW);
         assert!(!resident("KQ_K"));
         assert_eq!(cache.cache.lock().unwrap().resident, 0);
     }
@@ -1139,11 +1058,11 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let dependency_value = MaybeDtcOutcome::new_win(ConversionType::Promotion, 7);
-        let output_value = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 3);
+        let dependency_value = PackedOutcome::new_win(ConversionType::Promotion, 7);
+        let output_value = PackedOutcome::new_win(ConversionType::Checkmate, 3);
         for (path, name, value) in [
             (&input.0, "KPa_K", dependency_value),
-            (&input.0, "KQ_K", MaybeDtcOutcome::DRAW),
+            (&input.0, "KQ_K", PackedOutcome::DRAW),
             (&base.0, "KQ_K", output_value),
         ] {
             write_fixture(path, name, |_| value);
@@ -1154,7 +1073,7 @@ mod tests {
             None,
         );
         assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
+        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
         let dependency = Arc::downgrade(&reader.files.read().unwrap()["KPa_K"]);
         let old_output = Arc::downgrade(&reader.files.read().unwrap()["KQ_K"]);
 
@@ -1168,14 +1087,14 @@ mod tests {
         assert!(pinned_output.upgrade().is_none());
         assert!(dependency.upgrade().is_some());
         assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
+        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
         assert_eq!(reader.probe_outcome(&queen).unwrap(), DtcOutcome::Draw);
 
         reader.clear().unwrap();
         assert!(dependency.upgrade().is_none());
         assert!(reader.files.read().unwrap().is_empty());
         assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), MaybeDtcOutcome::DRAW);
+        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
     }
 
     #[test]
@@ -1203,7 +1122,7 @@ mod tests {
     #[test]
     fn test_egt_file_creation() {
         let dir = crate::TestDir::new("single_table_creation");
-        let file = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
+        let file = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
         assert_eq!(file.egt().tablename(), "KPa_K");
         let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"
             .parse::<Fen>()
@@ -1264,15 +1183,15 @@ mod tests {
     fn test_transpose_detranspose_roundtrip() {
         // Use a frame size that is a multiple of 8 (as in production).
         let n = 16;
-        let mut inputs = vec![MaybeDtcOutcome::INVALID; n];
-        inputs[4] = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 67);
-        inputs[6] = MaybeDtcOutcome::new_loss(ConversionType::Capture, 12);
-        inputs[7] = MaybeDtcOutcome::new_win(ConversionType::Promotion, 4567);
-        inputs[8] = MaybeDtcOutcome::DRAW;
-        inputs[10] = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 30);
-        inputs[11] = MaybeDtcOutcome::new_win(ConversionType::Capture, 1);
-        inputs[12] = MaybeDtcOutcome::DRAW;
-        inputs[13] = MaybeDtcOutcome::new_loss(ConversionType::Promotion, 1200);
+        let mut inputs = vec![PackedOutcome::INVALID; n];
+        inputs[4] = PackedOutcome::new_win(ConversionType::Checkmate, 67);
+        inputs[6] = PackedOutcome::new_loss(ConversionType::Capture, 12);
+        inputs[7] = PackedOutcome::new_win(ConversionType::Promotion, 4567);
+        inputs[8] = PackedOutcome::DRAW;
+        inputs[10] = PackedOutcome::new_loss(ConversionType::Checkmate, 30);
+        inputs[11] = PackedOutcome::new_win(ConversionType::Capture, 1);
+        inputs[12] = PackedOutcome::DRAW;
+        inputs[13] = PackedOutcome::new_loss(ConversionType::Promotion, 1200);
         let transposed = transpose_frame(&inputs);
         let recovered = detranspose_frame(&transposed, n);
         for i in 0..n {
@@ -1295,12 +1214,12 @@ mod tests {
             .unwrap();
         let egt = Egt::from_tablename("KPa_K").unwrap();
         let index = egt.position_to_index(&position);
-        let outcome = MaybeDtcOutcome::new_win(ConversionType::Checkmate, 987);
+        let outcome = PackedOutcome::new_win(ConversionType::Checkmate, 987);
         let mut reader = write_fixture(&dir.0, "KPa_K", |i| {
             if i == index {
                 outcome
             } else {
-                MaybeDtcOutcome::INVALID
+                PackedOutcome::INVALID
             }
         });
         assert!(reader.frames.iter().all(Option::is_none));
@@ -1317,9 +1236,9 @@ mod tests {
         let dir = crate::TestDir::new("published_file_scan");
         let outcome = |idx| {
             if idx % 3 == 0 {
-                MaybeDtcOutcome::new_win(ConversionType::Promotion, 4567)
+                PackedOutcome::new_win(ConversionType::Promotion, 4567)
             } else {
-                MaybeDtcOutcome::DRAW
+                PackedOutcome::DRAW
             }
         };
         let mut reader = write_fixture(&dir.0, "KPa_K", outcome);
@@ -1350,8 +1269,8 @@ mod tests {
             indexes
                 .iter()
                 .position(|&i| i == idx)
-                .map_or(MaybeDtcOutcome::INVALID, |n| {
-                    MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
+                .map_or(PackedOutcome::INVALID, |n| {
+                    PackedOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
                 })
         });
         assert!(reader.num_frames() > 1);
@@ -1360,10 +1279,10 @@ mod tests {
         for (n, &idx) in indexes.iter().enumerate() {
             assert_eq!(
                 reader.read_from_index(idx).unwrap(),
-                MaybeDtcOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
+                PackedOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
             );
         }
-        let pawnful = write_fixture(&dir.0, "KPa_K", |_| MaybeDtcOutcome::INVALID);
+        let pawnful = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
         assert_eq!(pawnful.num_frames(), 1);
         assert_eq!(pawnful.frame_layout[0].start, 0);
         assert_eq!(pawnful.frame_layout[0].len, pawnful.egt.index_range());
@@ -1375,7 +1294,7 @@ mod tests {
     #[test]
     fn rejects_invalid_frame_layout() {
         let dir = crate::TestDir::new("invalid_frame_layout");
-        let file = write_fixture(&dir.0, "K_K", |_| MaybeDtcOutcome::INVALID);
+        let file = write_fixture(&dir.0, "K_K", |_| PackedOutcome::INVALID);
         for bytes in [0, 3, 922, 926, FRAME_SIZE * 2, FRAME_SIZE * 2 + 2] {
             let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
@@ -1396,7 +1315,7 @@ mod tests {
     fn rejects_malformed_seek_table_suffixes() {
         let dir = crate::TestDir::new("malformed_seek_table_suffixes");
         let path = table_path(&dir.0, "K_K");
-        write_fixture(&dir.0, "K_K", |_| MaybeDtcOutcome::INVALID);
+        write_fixture(&dir.0, "K_K", |_| PackedOutcome::INVALID);
         let valid = std::fs::read(&path).unwrap();
         let table_start = valid.len() - 25;
 
@@ -1446,7 +1365,7 @@ mod tests {
     fn rejects_short_frame_range() {
         let dir = crate::TestDir::new("short_frame_range");
         let path = table_path(&dir.0, "K_K");
-        let mut reader = write_fixture(&dir.0, "K_K", |_| MaybeDtcOutcome::INVALID);
+        let mut reader = write_fixture(&dir.0, "K_K", |_| PackedOutcome::INVALID);
         let frame_end = reader.seek_table.frame_end_comp(0).unwrap();
         std::fs::OpenOptions::new()
             .write(true)

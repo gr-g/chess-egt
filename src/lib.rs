@@ -48,6 +48,7 @@ pub mod error;
 mod finalization;
 mod finalization_stats;
 mod generator;
+mod outcome;
 pub mod piece_set;
 mod position;
 mod prober;
@@ -63,11 +64,11 @@ pub use egt::Egt;
 pub use egt_file::EgtFileReader;
 pub use error::{EgtError, EgtResult};
 pub use generator::{EgtGenerator, print_pair_stats, print_table_stats};
+pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};
 pub use prober::{EgtProber, get_endgame};
 pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
 use shakmaty::Move;
 pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
-use std::cmp::Ordering;
 
 pub use stats_cache::EgtStatistics;
 #[cfg(test)]
@@ -75,47 +76,11 @@ use std::path::PathBuf;
 pub use table_id::TableId;
 pub use verification::EgtVerifier;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ConversionType {
-    Promotion,
-    Capture,
-    Checkmate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DtcOutcome {
-    Win(ConversionType, u16),
-    Draw,
-    Loss(ConversionType, u16),
-}
-
 /// A position's outcome and its legal moves with successor-side-to-move outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeWithMoves {
     pub outcome: DtcOutcome,
     pub moves: Vec<(Move, DtcOutcome)>,
-}
-
-impl Ord for DtcOutcome {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (DtcOutcome::Win(ct1, n1), DtcOutcome::Win(ct2, n2)) => n2.cmp(n1).then(ct1.cmp(ct2)),
-            (DtcOutcome::Draw, DtcOutcome::Draw) => Ordering::Equal,
-            (DtcOutcome::Loss(ct1, n1), DtcOutcome::Loss(ct2, n2)) => n1.cmp(n2).then(ct2.cmp(ct1)),
-            (DtcOutcome::Win(_, _), DtcOutcome::Draw) => Ordering::Greater,
-            (DtcOutcome::Draw, DtcOutcome::Win(_, _)) => Ordering::Less,
-            (DtcOutcome::Win(_, _), DtcOutcome::Loss(_, _)) => Ordering::Greater,
-            (DtcOutcome::Loss(_, _), DtcOutcome::Win(_, _)) => Ordering::Less,
-            (DtcOutcome::Draw, DtcOutcome::Loss(_, _)) => Ordering::Greater,
-            (DtcOutcome::Loss(_, _), DtcOutcome::Draw) => Ordering::Less,
-        }
-    }
-}
-
-impl PartialOrd for DtcOutcome {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// A fresh, test-specific directory under the system temp dir. Tests running in

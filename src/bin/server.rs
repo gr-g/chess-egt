@@ -236,21 +236,9 @@ async fn query(
         .run(move |state| {
             let position = parse_position(&params.fen)?;
             let mut result = state.prober.probe_with_moves(&position)?;
-            // Successor losses come first. Immediate conversions reset the distance;
-            // the returned outcomes still describe the successors unchanged.
+            // Best for the root first; response outcomes still describe successors.
             result.moves.sort_by_key(|(m, outcome)| {
-                let conversion = if m.is_capture() {
-                    ConversionType::Capture
-                } else if m.is_promotion() {
-                    ConversionType::Promotion
-                } else {
-                    return *outcome;
-                };
-                match *outcome {
-                    DtcOutcome::Win(_, _) => DtcOutcome::Win(conversion, 0),
-                    DtcOutcome::Loss(_, _) => DtcOutcome::Loss(conversion, 0),
-                    DtcOutcome::Draw => DtcOutcome::Draw,
-                }
+                std::cmp::Reverse(outcome.before_move(m))
             });
             let moves = result
                 .moves

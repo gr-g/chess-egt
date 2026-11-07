@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
 use crate::egt::Egt;
-use crate::egt_file::MaybeDtcOutcome;
+use crate::PackedOutcome;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
 use crate::storage::FRAME_SIZE;
@@ -25,7 +25,7 @@ impl TableStats {
     /// Use the same table maxima for every record in a batch and for its merge.
     pub(crate) fn record_outcome(
         &mut self,
-        outcome: MaybeDtcOutcome,
+        outcome: PackedOutcome,
         local_idx: usize,
         egt: &Egt,
         max_win: u16,
@@ -50,7 +50,7 @@ impl TableStats {
             }
             return;
         };
-        let ply = outcome.to_u16() >> 3;
+        let ply = outcome.plies();
         *self.histograms[side].entry(ply).or_default() += 1;
         if (side == 0 && ply == max_win && max_win > 0) || (side == 1 && ply == max_loss) {
             self.candidates[side].push(local_idx);
@@ -154,14 +154,14 @@ mod tests {
         let part = |w, l, win, loss| {
             let mut stats = TableStats::default();
             for (local_idx, outcome) in [
-                (w, MaybeDtcOutcome::new_win(ConversionType::Capture, win)),
+                (w, PackedOutcome::new_win(ConversionType::Capture, win)),
                 (
                     l,
-                    MaybeDtcOutcome::new_loss(ConversionType::Checkmate, loss),
+                    PackedOutcome::new_loss(ConversionType::Checkmate, loss),
                 ),
-                (w, MaybeDtcOutcome::DRAW),
+                (w, PackedOutcome::DRAW),
                 // A synthetic invalid outcome at a legal index must not be decoded.
-                (w, MaybeDtcOutcome::INVALID),
+                (w, PackedOutcome::INVALID),
             ] {
                 stats.record_outcome(outcome, local_idx, &egt, 5, 3);
             }
@@ -199,7 +199,7 @@ mod tests {
         let mut builder = EgtStatsBuilder::new([0, 0], invalid);
         for _ in 0..2 {
             let mut part = TableStats::default();
-            part.record_outcome(MaybeDtcOutcome::INVALID, 0, &egt, 0, 0);
+            part.record_outcome(PackedOutcome::INVALID, 0, &egt, 0, 0);
             builder.merge([part, TableStats::default()]);
             assert_eq!(builder.invalid, invalid);
         }
@@ -228,14 +228,14 @@ mod tests {
             .unwrap();
         let mut stats = TableStats::default();
         stats.record_outcome(
-            MaybeDtcOutcome::new_win(ConversionType::Capture, 0),
+            PackedOutcome::new_win(ConversionType::Capture, 0),
             idx,
             &egt,
             0,
             0,
         );
         stats.record_outcome(
-            MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0),
+            PackedOutcome::new_loss(ConversionType::Checkmate, 0),
             idx,
             &egt,
             0,
@@ -260,13 +260,13 @@ mod tests {
             .unwrap();
         let mut stats = TableStats::default();
         stats.record_outcome(
-            MaybeDtcOutcome::new_win(ConversionType::Checkmate, 5),
+            PackedOutcome::new_win(ConversionType::Checkmate, 5),
             idx,
             &egt,
             5,
             0,
         );
-        stats.record_outcome(MaybeDtcOutcome::INVALID, idx, &egt, 5, 0);
+        stats.record_outcome(PackedOutcome::INVALID, idx, &egt, 5, 0);
         assert_eq!(stats.redundant, 2);
         assert_eq!(stats.win, 0);
         assert!(stats.histograms[0].is_empty());

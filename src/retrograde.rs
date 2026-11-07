@@ -70,7 +70,7 @@
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
-use crate::egt_file::MaybeDtcOutcome;
+use crate::PackedOutcome;
 use crate::stats::EgtStats;
 use crate::selection::TablePair;
 use crate::error::{EgtError, EgtResult};
@@ -113,14 +113,14 @@ impl WorkingPair {
                 bytes: bytes as u128,
                 reason: err.to_string(),
             })?;
-            table_values.resize_with(len, || AtomicU16::new(MaybeDtcOutcome::INVALID.to_u16()));
+            table_values.resize_with(len, || AtomicU16::new(PackedOutcome::INVALID.to_u16()));
             values.push(table_values);
         }
         Ok(Self { values })
     }
 
-    fn load(&self, slot: usize, idx: usize) -> MaybeDtcOutcome {
-        MaybeDtcOutcome::from_u16(self.values[slot][idx].load(Ordering::Relaxed))
+    fn load(&self, slot: usize, idx: usize) -> PackedOutcome {
+        PackedOutcome::from_u16(self.values[slot][idx].load(Ordering::Relaxed))
     }
 
     /// CAS preserves the best same-ply conversion even when workers race.
@@ -128,12 +128,12 @@ impl WorkingPair {
         let cell = &self.values[slot][idx];
         let mut raw = cell.load(Ordering::Relaxed);
         loop {
-            let v = MaybeDtcOutcome::from_u16(raw);
+            let v = PackedOutcome::from_u16(raw);
             let newly_resolved = v.is_unknown();
-            if !newly_resolved && !(v.is_win() && ply(v) == plies && ct > outcome_ct(v)) {
+            if !newly_resolved && !(v.is_win() && v.plies() == plies && ct > v.conversion_type()) {
                 return WinUpdate::Unchanged;
             }
-            match cell.compare_exchange_weak(raw, MaybeDtcOutcome::new_win(ct, plies).to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
+            match cell.compare_exchange_weak(raw, PackedOutcome::new_win(ct, plies).to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return if newly_resolved { WinUpdate::NewlyResolved } else { WinUpdate::Upgraded },
                 Err(current) => raw = current,
             }
@@ -145,16 +145,16 @@ impl WorkingPair {
         let cell = &self.values[slot][idx];
         let mut raw = cell.load(Ordering::Relaxed);
         loop {
-            let v = MaybeDtcOutcome::from_u16(raw);
+            let v = PackedOutcome::from_u16(raw);
             if !v.is_unknown() {
                 return false;
             }
             let counter = v.get_unknown_counter();
             debug_assert!(counter > 0);
             let next = if counter == 1 {
-                MaybeDtcOutcome::new_loss(ct, plies)
+                PackedOutcome::new_loss(ct, plies)
             } else {
-                MaybeDtcOutcome::new_unknown(counter - 1)
+                PackedOutcome::new_unknown(counter - 1)
             };
             match cell.compare_exchange_weak(raw, next.to_u16(), Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return counter == 1,
@@ -164,37 +164,6 @@ impl WorkingPair {
     }
 }
 
-/// Distance (ply) of a win or loss value.
-fn ply(v: MaybeDtcOutcome) -> u16 {
-    v.to_u16() >> 3
-}
-
-/// Conversion type of a win or loss value.
-fn outcome_ct(v: MaybeDtcOutcome) -> ConversionType {
-    match v.to_u16() & 0b110 {
-        0b010 => ConversionType::Checkmate,
-        0b100 => ConversionType::Capture,
-        _ => ConversionType::Promotion,
-    }
-}
-
-// Preference among conversion types for a loss (Promotion > Capture > Checkmate),
-// the reverse of the win preference given by `ConversionType`'s `Ord`.
-fn loss_rank(ct: ConversionType) -> u8 {
-    match ct {
-        ConversionType::Checkmate => 0,
-        ConversionType::Capture => 1,
-        ConversionType::Promotion => 2,
-    }
-}
-
-/// The preferred conversion type for a loss among `a` (if any) and `b`.
-fn better_loss_ct(a: Option<ConversionType>, b: ConversionType) -> ConversionType {
-    match a {
-        Some(a) if loss_rank(a) >= loss_rank(b) => a,
-        _ => b,
-    }
-}
 
 /// Number of positions per summary block.
 const SUMMARY_BLOCK_SIZE: usize = 4096;
@@ -267,8 +236,8 @@ fn scan_table<S, F>(
     process: F,
 ) -> Found
 where
-    S: Fn(MaybeDtcOutcome) -> bool + Sync,
-    F: Fn(&WorkingPair, usize, MaybeDtcOutcome, &mut Found) + Sync,
+    S: Fn(PackedOutcome) -> bool + Sync,
+    F: Fn(&WorkingPair, usize, PackedOutcome, &mut Found) + Sync,
 {
     blocks.par_iter().map(|&(start, end)| {
         let matches: Vec<_> = (start..end).filter_map(|idx| {
@@ -547,7 +516,7 @@ fn initialize_table(
             let position = match egt.position_from_index_with_reason(idx, Color::White)? {
                 Ok(position) => position,
                 Err(reason) => {
-                    *cell.get_mut() = MaybeDtcOutcome::INVALID.to_u16();
+                    *cell.get_mut() = PackedOutcome::INVALID.to_u16();
                     // Finalization counts redundant indices before invalidity.
                     if !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other) {
                         counts.invalid.record(reason);
@@ -559,11 +528,11 @@ fn initialize_table(
 
             if legals.is_empty() {
                 if position.is_check() {
-                    *cell.get_mut() = MaybeDtcOutcome::new_loss(ConversionType::Checkmate, 0).to_u16();
+                    *cell.get_mut() = PackedOutcome::new_loss(ConversionType::Checkmate, 0).to_u16();
                     counts.checkmates += 1;
                     ply_bounds[SummaryKind::Loss.index()] = ply_bounds[SummaryKind::Loss.index()].max(1);
                 } else {
-                    *cell.get_mut() = MaybeDtcOutcome::DRAW.to_u16();
+                    *cell.get_mut() = PackedOutcome::DRAW.to_u16();
                     counts.stalemates += 1;
                 }
                 continue;
@@ -590,7 +559,7 @@ fn initialize_table(
                         // Conversion moves always count 1 in the counter (the
                         // symmetry adjustment only applies to quiet king moves).
                         counter -= 1;
-                        loss_conv = Some(better_loss_ct(loss_conv, ct));
+                        loss_conv = Some(loss_conv.map_or(ct, |previous| previous.min(ct)));
                     }
                 }
             }
@@ -600,14 +569,14 @@ fn initialize_table(
                 // conversion type.
                 counts.found.wins += 1;
                 ply_bounds[SummaryKind::Win(ct).index()] = 2;
-                MaybeDtcOutcome::new_win(ct, 1)
+                PackedOutcome::new_win(ct, 1)
             } else if counter == 0 {
                 // All moves are conversions to won positions.
                 counts.found.losses += 1;
                 ply_bounds[SummaryKind::Loss.index()] = 2;
-                MaybeDtcOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
+                PackedOutcome::new_loss(loss_conv.expect("a loss by conversion has a losing conversion"), 1)
             } else {
-                MaybeDtcOutcome::new_unknown(counter)
+                PackedOutcome::new_unknown(counter)
             };
             *cell.get_mut() = outcome.to_u16();
         }
@@ -702,8 +671,8 @@ fn solve_pair(
             if blocks.is_empty() {
                 continue;
             }
-            let newly = scan_table(&working, slot, &blocks, |v| v.is_loss() && ply(v) == plies - 1, |working, idx, v, local| {
-                let ct = outcome_ct(v);
+            let newly = scan_table(&working, slot, &blocks, |v| v.is_loss() && v.plies() == plies - 1, |working, idx, v, local| {
+                let ct = v.conversion_type();
                 quiet_unmoves(&table.egt, &twin.egt, idx, reflected[slot], |pred_idx| {
                     match working.mark_win(twin_slot, pred_idx, ct, plies) {
                         WinUpdate::NewlyResolved => {
@@ -724,7 +693,7 @@ fn solve_pair(
         // Phase L: wins at `plies - 1` decrement the counters of their
         // predecessors, one conversion type after the other.
         for ct in [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion] {
-            let target = MaybeDtcOutcome::new_win(ct, plies - 1);
+            let target = PackedOutcome::new_win(ct, plies - 1);
             for slot in 0..tables.len() {
                 let table = &tables[slot];
                 let twin_slot = tables.len() - 1 - slot;
@@ -1179,12 +1148,12 @@ mod tests {
         assert_eq!(hits, 1, "missing the b2-b4 predecessor edge");
     }
 
-    fn atomic_values(values: Vec<MaybeDtcOutcome>) -> Vec<AtomicU16> {
+    fn atomic_values(values: Vec<PackedOutcome>) -> Vec<AtomicU16> {
         values.into_iter().map(|v| AtomicU16::new(v.to_u16())).collect()
     }
 
-    fn plain_values(values: &[AtomicU16]) -> Vec<MaybeDtcOutcome> {
-        values.iter().map(|v| MaybeDtcOutcome::from_u16(v.load(Ordering::Relaxed))).collect()
+    fn plain_values(values: &[AtomicU16]) -> Vec<PackedOutcome> {
+        values.iter().map(|v| PackedOutcome::from_u16(v.load(Ordering::Relaxed))).collect()
     }
 
     #[test]
@@ -1207,7 +1176,7 @@ mod tests {
             [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion],
         ] {
             let working = WorkingPair {
-                values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(3)])],
+                values: vec![atomic_values(vec![PackedOutcome::new_unknown(3)])],
             };
             let mut preferred = ConversionType::Promotion;
             for (i, ct) in order.into_iter().enumerate() {
@@ -1220,17 +1189,17 @@ mod tests {
                 };
                 assert_eq!(working.mark_win(0, 0, ct, 7), expected);
                 preferred = preferred.max(ct);
-                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(preferred, 7));
+                assert_eq!(working.load(0, 0), PackedOutcome::new_win(preferred, 7));
             }
-            assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
+            assert_eq!(working.load(0, 0), PackedOutcome::new_win(ConversionType::Checkmate, 7));
             assert_eq!(working.mark_win(0, 0, ConversionType::Checkmate, 7), WinUpdate::Unchanged);
         }
 
         let existing = vec![
-            MaybeDtcOutcome::new_win(ConversionType::Promotion, 2),
-            MaybeDtcOutcome::new_loss(ConversionType::Capture, 4),
-            MaybeDtcOutcome::DRAW,
-            MaybeDtcOutcome::INVALID,
+            PackedOutcome::new_win(ConversionType::Promotion, 2),
+            PackedOutcome::new_loss(ConversionType::Capture, 4),
+            PackedOutcome::DRAW,
+            PackedOutcome::INVALID,
         ];
         let working = WorkingPair { values: vec![atomic_values(existing.clone())] };
         for idx in 0..existing.len() {
@@ -1241,24 +1210,24 @@ mod tests {
 
     #[test]
     fn pair_local_decrement_resolves_only_once_and_preserves_other_slot() {
-        let untouched = vec![MaybeDtcOutcome::new_unknown(5)];
+        let untouched = vec![PackedOutcome::new_unknown(5)];
         let mut working = WorkingPair {
-            values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(3)]), atomic_values(untouched.clone())],
+            values: vec![atomic_values(vec![PackedOutcome::new_unknown(3)]), atomic_values(untouched.clone())],
         };
         assert!(!working.decrement(0, 0, ConversionType::Checkmate, 8));
-        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_unknown(2));
+        assert_eq!(working.load(0, 0), PackedOutcome::new_unknown(2));
         assert!(!working.decrement(0, 0, ConversionType::Capture, 8));
-        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_unknown(1));
+        assert_eq!(working.load(0, 0), PackedOutcome::new_unknown(1));
         assert!(working.decrement(0, 0, ConversionType::Promotion, 8));
-        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert_eq!(working.load(0, 0), PackedOutcome::new_loss(ConversionType::Promotion, 8));
         assert!(!working.decrement(0, 0, ConversionType::Checkmate, 9));
-        assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+        assert_eq!(working.load(0, 0), PackedOutcome::new_loss(ConversionType::Promotion, 8));
         assert_eq!(plain_values(&working.values[1]), untouched);
 
         let assigned = vec![
-            MaybeDtcOutcome::new_win(ConversionType::Capture, 2),
-            MaybeDtcOutcome::DRAW,
-            MaybeDtcOutcome::INVALID,
+            PackedOutcome::new_win(ConversionType::Capture, 2),
+            PackedOutcome::DRAW,
+            PackedOutcome::INVALID,
         ];
         working.values[0] = atomic_values(assigned.clone());
         for idx in 0..assigned.len() {
@@ -1301,13 +1270,13 @@ mod tests {
         let reader = SharedFileCache::new(&location, None, None);
         for name in ["K_KQ", "KQ_K"] {
             let egt = table(name);
-            let mut values = atomic_values(vec![MaybeDtcOutcome::INVALID; egt.index_range()]);
+            let mut values = atomic_values(vec![PackedOutcome::INVALID; egt.index_range()]);
             let summary = PlySummary::new(values.len());
             let counts = initialize_table(&egt, &mut values, &summary, &reader).unwrap();
             assert_eq!(counts.checkmates > 0, name == "K_KQ");
             let invalid = values.iter().enumerate()
                 .filter(|(idx, cell)| {
-                    MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_invalid()
+                    PackedOutcome::from_u16(cell.load(Ordering::Relaxed)).is_invalid()
                         && !egt.diagonal_symmetric(*idx).is_some_and(|other| *idx > other)
                 }).count();
             assert_eq!(invalid > 0, name == "KQ_K");
@@ -1316,7 +1285,7 @@ mod tests {
                 ..InvalidCounts::default()
             });
             let expected: Vec<_> = values.chunks(SUMMARY_BLOCK_SIZE).enumerate()
-                .filter(|(_, chunk)| chunk.iter().any(|cell| MaybeDtcOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
+                .filter(|(_, chunk)| chunk.iter().any(|cell| PackedOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
                 .map(|(block, chunk)| {
                     let start = block * SUMMARY_BLOCK_SIZE;
                     (start, start + chunk.len())
@@ -1372,17 +1341,17 @@ mod tests {
 
     #[test]
     fn pair_local_self_twin_scan_snapshots_matches_before_updates() {
-        let win = MaybeDtcOutcome::new_win(ConversionType::Capture, 1);
-        let working = WorkingPair { values: vec![atomic_values(vec![win, win, MaybeDtcOutcome::new_unknown(1)])] };
+        let win = PackedOutcome::new_win(ConversionType::Capture, 1);
+        let working = WorkingPair { values: vec![atomic_values(vec![win, win, PackedOutcome::new_unknown(1)])] };
         let visited = std::sync::Mutex::new(Vec::new());
         scan_table(&working, 0, &[(0, 3)], |v| v == win, |working, idx, v, _| {
             visited.lock().unwrap().push((idx, v));
-            working.values[0][1].store(MaybeDtcOutcome::DRAW.to_u16(), Ordering::Relaxed);
+            working.values[0][1].store(PackedOutcome::DRAW.to_u16(), Ordering::Relaxed);
             working.mark_win(0, 2, ConversionType::Capture, 2);
         });
         assert_eq!(*visited.lock().unwrap(), vec![(0, win), (1, win)]);
         assert_eq!(working.values.len(), 1);
-        assert_eq!(working.load(0, 2), MaybeDtcOutcome::new_win(ConversionType::Capture, 2));
+        assert_eq!(working.load(0, 2), PackedOutcome::new_win(ConversionType::Capture, 2));
     }
 
     #[test]
@@ -1390,19 +1359,19 @@ mod tests {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         pool.install(|| {
             for _ in 0..32 {
-                let working = WorkingPair { values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(96)])] };
+                let working = WorkingPair { values: vec![atomic_values(vec![PackedOutcome::new_unknown(96)])] };
                 let wins: usize = (0..96).into_par_iter().map(|i| {
                     let ct = [ConversionType::Promotion, ConversionType::Capture, ConversionType::Checkmate][i % 3];
                     usize::from(working.mark_win(0, 0, ct, 7) == WinUpdate::NewlyResolved)
                 }).sum();
                 assert_eq!(wins, 1);
-                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_win(ConversionType::Checkmate, 7));
-                let working = WorkingPair { values: vec![atomic_values(vec![MaybeDtcOutcome::new_unknown(96)])] };
+                assert_eq!(working.load(0, 0), PackedOutcome::new_win(ConversionType::Checkmate, 7));
+                let working = WorkingPair { values: vec![atomic_values(vec![PackedOutcome::new_unknown(96)])] };
                 let losses: usize = (0..192).into_par_iter().map(|_| {
                     usize::from(working.decrement(0, 0, ConversionType::Promotion, 8))
                 }).sum();
                 assert_eq!(losses, 1);
-                assert_eq!(working.load(0, 0), MaybeDtcOutcome::new_loss(ConversionType::Promotion, 8));
+                assert_eq!(working.load(0, 0), PackedOutcome::new_loss(ConversionType::Promotion, 8));
             }
         });
     }
@@ -1449,9 +1418,9 @@ mod tests {
         pool.install(|| {
             let working = WorkingPair {
                 values: vec![atomic_values(vec![
-                    MaybeDtcOutcome::new_unknown(32),
-                    MaybeDtcOutcome::new_unknown(64),
-                    MaybeDtcOutcome::new_unknown(96),
+                    PackedOutcome::new_unknown(32),
+                    PackedOutcome::new_unknown(64),
+                    PackedOutcome::new_unknown(96),
                 ])],
             };
             let conversions = [ConversionType::Checkmate, ConversionType::Capture, ConversionType::Promotion];
@@ -1463,9 +1432,9 @@ mod tests {
                 assert_eq!(resolved, 1);
                 for (idx, expected_ct) in conversions.into_iter().enumerate() {
                     let expected = if idx <= phase {
-                        MaybeDtcOutcome::new_loss(expected_ct, 8)
+                        PackedOutcome::new_loss(expected_ct, 8)
                     } else {
-                        MaybeDtcOutcome::new_unknown(32 * (idx - phase) as u16)
+                        PackedOutcome::new_unknown(32 * (idx - phase) as u16)
                     };
                     assert_eq!(working.load(0, idx), expected);
                 }
@@ -1477,10 +1446,10 @@ mod tests {
     fn step4_concurrent_win_updates_preserve_resolved_values() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let existing = vec![
-            MaybeDtcOutcome::new_win(ConversionType::Promotion, 2),
-            MaybeDtcOutcome::INVALID,
-            MaybeDtcOutcome::DRAW,
-            MaybeDtcOutcome::new_loss(ConversionType::Capture, 4),
+            PackedOutcome::new_win(ConversionType::Promotion, 2),
+            PackedOutcome::INVALID,
+            PackedOutcome::DRAW,
+            PackedOutcome::new_loss(ConversionType::Capture, 4),
         ];
         let working = WorkingPair { values: vec![atomic_values(existing.clone())] };
         let resolved: usize = pool.install(|| {
@@ -1501,13 +1470,13 @@ mod tests {
             let plies = 7;
             for source_is_loss in [true, false] {
                 let source = if source_is_loss {
-                    MaybeDtcOutcome::new_loss(ConversionType::Capture, plies - 1)
+                    PackedOutcome::new_loss(ConversionType::Capture, plies - 1)
                 } else {
-                    MaybeDtcOutcome::new_win(ConversionType::Capture, plies - 1)
+                    PackedOutcome::new_win(ConversionType::Capture, plies - 1)
                 };
                 let working = WorkingPair {
                     values: vec![atomic_values((0..size).map(|idx| {
-                        if idx % 2 == 0 { source } else { MaybeDtcOutcome::new_unknown(1) }
+                        if idx % 2 == 0 { source } else { PackedOutcome::new_unknown(1) }
                     }).collect())],
                 };
                 let visits: Vec<_> = (0..size).map(|_| AtomicU16::new(0)).collect();
@@ -1521,7 +1490,7 @@ mod tests {
                 assert_eq!(blocks.len(), 4);
                 assert_eq!(blocks.last(), Some(&(3 * SUMMARY_BLOCK_SIZE, size)));
                 let found = scan_table(&working, 0, &blocks,
-                    |v| v == source && ply(v) == plies - 1,
+                    |v| v == source && v.plies() == plies - 1,
                     |working, idx, v, local| {
                         assert_eq!(v, source);
                         visits[idx].fetch_add(1, Ordering::Relaxed);
@@ -1538,9 +1507,9 @@ mod tests {
                     });
                 assert_eq!((found.wins, found.losses), if source_is_loss { (size / 2, 0) } else { (0, size / 2) });
                 let resolved = if source_is_loss {
-                    MaybeDtcOutcome::new_win(ConversionType::Capture, plies)
+                    PackedOutcome::new_win(ConversionType::Capture, plies)
                 } else {
-                    MaybeDtcOutcome::new_loss(ConversionType::Capture, plies)
+                    PackedOutcome::new_loss(ConversionType::Capture, plies)
                 };
                 for (idx, visits) in visits.iter().enumerate() {
                     assert_eq!(visits.load(Ordering::Relaxed), if idx % 2 == 0 { 1 } else { 0 });

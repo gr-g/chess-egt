@@ -6,7 +6,8 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use crate::egt::Egt;
-use crate::egt_file::{COMPRESSION_LEVEL, MaybeDtcOutcome};
+use crate::egt_file::COMPRESSION_LEVEL;
+use crate::PackedOutcome;
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
 use crate::finalization_stats::{EgtStatsBuilder, TableStats};
@@ -32,9 +33,9 @@ fn finalize_batch(
         plain.clear();
         for (offset, cell) in chunk.iter_mut().enumerate() {
             // Propagation has joined; exclusive access needs no atomic load/CAS.
-            let raw = MaybeDtcOutcome::from_u16(*cell.get_mut());
+            let raw = PackedOutcome::from_u16(*cell.get_mut());
             let outcome = if raw.is_unknown() {
-                MaybeDtcOutcome::DRAW
+                PackedOutcome::DRAW
             } else {
                 raw
             };
