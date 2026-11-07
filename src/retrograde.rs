@@ -931,10 +931,10 @@ mod tests {
         let mut ep_successors = 0;
         for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe", "KPd_KPe", "KPaPa_KPh"] {
             let id = TableId::parse(name).unwrap();
-            let (twin_id, mirrored) = id.twin().unwrap();
+            let (twin_id, mirrored) = id.twin();
             let egt = Egt::from_elements(id.parse_elements()).unwrap();
             let twin = Egt::from_elements(twin_id.parse_elements()).unwrap();
-            let reverse_mirrored = twin_id.twin().unwrap().1;
+            let reverse_mirrored = twin_id.twin().1;
             let stride = (egt.index_range() / 128).max(1);
             let mut samples: Vec<_> = (0..egt.index_range()).step_by(stride).collect();
             if name == "KPcPf_KPdPe" {
@@ -1322,16 +1322,16 @@ mod tests {
             ("KPaPa_KPh", "KPa_KPhPh", true),
         ] {
             let id = TableId::parse(name).unwrap();
-            let (twin, actual_reflection) = id.twin().unwrap();
+            let (twin, actual_reflection) = id.twin();
             assert_eq!(twin.tablename(), twin_name);
             assert_eq!(actual_reflection, reflected);
             for selected in [id.clone(), twin.clone()] {
-                let plan = GenerationPlan::new([selected]).unwrap();
+                let plan = GenerationPlan::new([selected]);
                 let pair = &plan.pairs[0];
                 let ids: Vec<_> = std::iter::once(&pair.table).chain(pair.twin.iter()).collect();
                 assert_eq!(ids.len(), if id == twin { 1 } else { 2 });
                 for (slot, source) in ids.iter().enumerate() {
-                    let (target, reflection) = source.twin().unwrap();
+                    let (target, reflection) = source.twin();
                     assert_eq!(target, *ids[ids.len() - 1 - slot]);
                     assert_eq!(pair.reflected[slot], reflection);
                 }
@@ -1590,7 +1590,7 @@ mod tests {
             assert_eq!(totals(&format!("{b}_{a}")), [expected_range_b, expected_wins_b.unwrap(), expected_draws_b.unwrap(), expected_losses_b.unwrap(), expected_invalid_b.unwrap()]);
         } else {
             let ids = TableSelector::parse(endgame).unwrap().resolve().unwrap();
-            assert!(ids.iter().all(|id| id.twin().unwrap().0 == *id));
+            assert!(ids.iter().all(|id| id.twin().0 == *id));
         }
     }
 

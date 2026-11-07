@@ -4,15 +4,15 @@ use std::collections::BTreeMap;
 
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
-use crate::egt::Egt;
 use crate::PackedOutcome;
+use crate::egt::Egt;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
 use crate::storage::FRAME_SIZE;
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
 #[derive(Default)]
-pub(crate) struct TableStats {
+pub(super) struct TableStats {
     win: usize,
     draw: usize,
     loss: usize,
@@ -23,7 +23,7 @@ pub(crate) struct TableStats {
 
 impl TableStats {
     /// Use the same table maxima for every record in a batch and for its merge.
-    pub(crate) fn record_outcome(
+    pub(super) fn record_outcome(
         &mut self,
         outcome: PackedOutcome,
         local_idx: usize,
@@ -56,44 +56,35 @@ impl TableStats {
             self.candidates[side].push(local_idx);
         }
     }
-}
-
-pub(crate) struct EgtStatsBuilder {
-    totals: TableStats,
-    maxima: [u16; 2],
-    invalid: InvalidCounts,
-}
-
-impl EgtStatsBuilder {
-    pub(crate) fn new(maxima: [u16; 2], invalid: InvalidCounts) -> Self {
-        Self {
-            totals: TableStats::default(),
-            maxima,
-            invalid,
-        }
-    }
 
     /// Merge contiguous batches in visitation order to preserve example order.
     /// All batches belong to this one table and use its fixed maxima.
-    pub(crate) fn merge(&mut self, parts: impl IntoIterator<Item = TableStats>) {
+    pub(super) fn merge(&mut self, parts: impl IntoIterator<Item = TableStats>) {
         for part in parts {
-            self.totals.win += part.win;
-            self.totals.draw += part.draw;
-            self.totals.loss += part.loss;
-            self.totals.redundant += part.redundant;
+            self.win += part.win;
+            self.draw += part.draw;
+            self.loss += part.loss;
+            self.redundant += part.redundant;
             for (side, (histogram, candidates)) in
                 part.histograms.into_iter().zip(part.candidates).enumerate()
             {
                 for (ply, count) in histogram {
-                    *self.totals.histograms[side].entry(ply).or_default() += count;
+                    *self.histograms[side].entry(ply).or_default() += count;
                 }
-                self.totals.candidates[side].extend(candidates);
+                self.candidates[side].extend(candidates);
             }
         }
     }
 
-    pub(crate) fn build(self, egt: &Egt, bytes: u64, sha256: String) -> EgtStats {
-        let [win_candidates, loss_candidates] = self.totals.candidates;
+    pub(super) fn build(
+        self,
+        egt: &Egt,
+        maxima: [u16; 2],
+        invalid: InvalidCounts,
+        bytes: u64,
+        sha256: String,
+    ) -> EgtStats {
+        let [win_candidates, loss_candidates] = self.candidates;
         let materialize = |candidates: Vec<usize>, ply| {
             candidates
                 .into_iter()
@@ -106,7 +97,7 @@ impl EgtStatsBuilder {
                 })
                 .collect()
         };
-        let [histogram_win, histogram_loss] = self.totals.histograms;
+        let [histogram_win, histogram_loss] = self.histograms;
         EgtStats {
             tablename: egt.tablename().to_owned(),
             bytes,
@@ -114,18 +105,18 @@ impl EgtStatsBuilder {
             index_range: egt.index_range(),
             frame_size: FRAME_SIZE,
             num_frames: egt.index_range().div_ceil(FRAME_SIZE),
-            unique_positions: self.totals.win + self.totals.draw + self.totals.loss,
-            win: self.totals.win,
-            draw: self.totals.draw,
-            loss: self.totals.loss,
-            invalid_opposite_check: self.invalid.opposite_check,
-            invalid_ep_squares_occupied: self.invalid.ep_squares_occupied,
-            invalid_illegal_ep_capture: self.invalid.illegal_ep_capture,
-            redundant: self.totals.redundant,
+            unique_positions: self.win + self.draw + self.loss,
+            win: self.win,
+            draw: self.draw,
+            loss: self.loss,
+            invalid_opposite_check: invalid.opposite_check,
+            invalid_ep_squares_occupied: invalid.ep_squares_occupied,
+            invalid_illegal_ep_capture: invalid.illegal_ep_capture,
+            redundant: self.redundant,
             histogram_win,
             histogram_loss,
-            longest_dtc_win: materialize(win_candidates, self.maxima[0]),
-            longest_dtc_loss: materialize(loss_candidates, self.maxima[1]),
+            longest_dtc_win: materialize(win_candidates, maxima[0]),
+            longest_dtc_loss: materialize(loss_candidates, maxima[1]),
         }
     }
 }
@@ -155,10 +146,7 @@ mod tests {
             let mut stats = TableStats::default();
             for (local_idx, outcome) in [
                 (w, PackedOutcome::new_win(ConversionType::Capture, win)),
-                (
-                    l,
-                    PackedOutcome::new_loss(ConversionType::Checkmate, loss),
-                ),
+                (l, PackedOutcome::new_loss(ConversionType::Checkmate, loss)),
                 (w, PackedOutcome::DRAW),
                 // A synthetic invalid outcome at a legal index must not be decoded.
                 (w, PackedOutcome::INVALID),
@@ -167,16 +155,15 @@ mod tests {
             }
             stats
         };
-        let mut builder = EgtStatsBuilder::new([5, 3], InvalidCounts::default());
-        builder.merge([
+        let mut totals = TableStats::default();
+        totals.merge([
             part(idx[0], idx[1], 0, 0),
             part(idx[4], idx[3], 5, 3),
             part(idx[2], idx[1], 5, 3),
         ]);
-        builder.merge([part(idx[0], idx[1], 4, 2), part(idx[0], idx[5], 5, 3)]);
-        assert_eq!(builder.totals.candidates[0], [idx[4], idx[2], idx[0]]);
-        assert_eq!(builder.totals.candidates[1], [idx[3], idx[1], idx[5]]);
-        let totals = builder.totals;
+        totals.merge([part(idx[0], idx[1], 4, 2), part(idx[0], idx[5], 5, 3)]);
+        assert_eq!(totals.candidates[0], [idx[4], idx[2], idx[0]]);
+        assert_eq!(totals.candidates[1], [idx[3], idx[1], idx[5]]);
         assert_eq!((totals.win, totals.draw, totals.loss), (5, 5, 5));
         assert_eq!(
             totals.histograms[0],
@@ -196,23 +183,22 @@ mod tests {
             ep_squares_occupied: 11,
             illegal_ep_capture: 13,
         };
-        let mut builder = EgtStatsBuilder::new([0, 0], invalid);
+        let mut totals = TableStats::default();
         for _ in 0..2 {
             let mut part = TableStats::default();
             part.record_outcome(PackedOutcome::INVALID, 0, &egt, 0, 0);
-            builder.merge([part, TableStats::default()]);
-            assert_eq!(builder.invalid, invalid);
+            totals.merge([part, TableStats::default()]);
         }
-        assert_eq!(builder.totals.redundant, 0);
-        assert_eq!(
-            builder.totals.win + builder.totals.draw + builder.totals.loss,
-            0
-        );
-        assert!(builder.totals.histograms.iter().all(BTreeMap::is_empty));
-        assert!(builder.totals.candidates.iter().all(Vec::is_empty));
-        let stats = builder.build(&egt, 0, String::new());
+        assert_eq!(totals.redundant, 0);
+        assert_eq!(totals.win + totals.draw + totals.loss, 0);
+        assert!(totals.histograms.iter().all(BTreeMap::is_empty));
+        assert!(totals.candidates.iter().all(Vec::is_empty));
+        let stats = totals.build(&egt, [0, 0], invalid, 0, String::new());
         assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
-        assert_eq!(stats.invalid_ep_squares_occupied, invalid.ep_squares_occupied);
+        assert_eq!(
+            stats.invalid_ep_squares_occupied,
+            invalid.ep_squares_occupied
+        );
         assert_eq!(stats.invalid_illegal_ep_capture, invalid.illegal_ep_capture);
         assert_eq!(stats.unique_positions, 0);
     }

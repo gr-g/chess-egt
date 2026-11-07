@@ -48,7 +48,6 @@ mod egt_file;
 mod egt_writer;
 pub mod error;
 mod finalization;
-mod finalization_stats;
 mod generator;
 mod outcome;
 pub mod piece_set;

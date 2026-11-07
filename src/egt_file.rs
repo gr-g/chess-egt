@@ -871,7 +871,7 @@ mod tests {
         for name in ["KPa_KPa", "KPao_KPao", "KPaPa_KPb", "KPa_KPbPb"] {
             let id = TableId::parse(name).unwrap();
             let egt = Egt::from_elements(id.parse_elements()).unwrap();
-            let (twin, _) = id.twin().unwrap();
+            let (twin, _) = id.twin();
             let twin_egt = Egt::from_elements(twin.parse_elements()).unwrap();
             let stride = (egt.index_range() / 64).max(1);
             for turn in [Color::White, Color::Black] {

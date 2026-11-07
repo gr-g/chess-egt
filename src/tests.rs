@@ -36,7 +36,7 @@ fn verify_internal_consistency(selector: &str) {
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
     verifier.with_threads(2);
     let mut tables = resolve_selectors(&[selector]).unwrap();
-    tables.extend(tables.clone().into_iter().map(|id| id.twin().unwrap().0));
+    tables.extend(tables.clone().into_iter().map(|id| id.twin().0));
     let names: Vec<_> = tables.iter().map(TableId::tablename).collect();
     verifier.verify_selected(&names).unwrap();
 }

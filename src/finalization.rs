@@ -1,16 +1,18 @@
 //! Single-table finalization in the caller's Rayon pool, with ordered frames.
 
+mod stats;
+
 use std::io::Write;
 use std::sync::atomic::AtomicU16;
 
 use rayon::prelude::*;
 
+use self::stats::TableStats;
+use crate::PackedOutcome;
 use crate::egt::Egt;
 use crate::egt_file::COMPRESSION_LEVEL;
-use crate::PackedOutcome;
 use crate::egt_writer::{CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
-use crate::finalization_stats::{EgtStatsBuilder, TableStats};
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, write_stats};
 use crate::storage::{FRAME_SIZE, Location};
@@ -88,11 +90,11 @@ pub(crate) fn finalize_table(
         .collect();
     drop(values);
     let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
-    let (segments, stats): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
-    let mut builder = EgtStatsBuilder::new(maxima, invalid);
-    builder.merge(stats);
+    let (segments, parts): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
+    let mut stats = TableStats::default();
+    stats.merge(parts);
     let (bytes, sha256) = writer.publish(segments)?;
-    let stats = builder.build(egt, bytes, sha256);
+    let stats = stats.build(egt, maxima, invalid, bytes, sha256);
     write_stats(location, id, &stats)?;
     Ok(stats)
 }

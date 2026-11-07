@@ -89,7 +89,8 @@ impl TableId {
         self.0.chars().filter(|c| !c.is_ascii_lowercase()).collect()
     }
 
-    pub fn twin(&self) -> EgtResult<(Self, bool)> {
+    /// Exchanges STM and SNTM, returning the canonical identity and file reflection.
+    pub fn twin(&self) -> (Self, bool) {
         let elements = self.parse_elements();
         let (key, reflected) = PawnKey::from_elements(&elements).twin().canonicalized();
         let mut twin = key.elements();
@@ -105,7 +106,7 @@ impl TableId {
             }),
             _ => None,
         }));
-        Ok((Self::from_elements(twin)?, reflected))
+        (Self(compute_tablename(&twin)), reflected)
     }
     pub fn n_pieces(&self) -> usize {
         self.0.bytes().filter(u8::is_ascii_uppercase).count()
@@ -635,7 +636,7 @@ mod tests {
     #[test]
     fn twins_and_paths() {
         let table = TableId::parse("KPd_KPe").unwrap();
-        let (twin, reflected) = table.twin().unwrap();
+        let (twin, reflected) = table.twin();
         assert_eq!(twin, table);
         assert!(reflected);
         assert_eq!(table.material(), "KP_KP");
@@ -689,8 +690,9 @@ mod tests {
         for material in ["K_K", "KQ_K", "KP_K", "KP_KP", "KPP_KP", "KPP_KPP"] {
             let tables = TableSelector::parse(material).unwrap().resolve().unwrap();
             for table in tables {
-                let (twin, reflected) = table.twin().unwrap();
-                assert_eq!(twin.twin().unwrap().0, table);
+                let (twin, reflected) = table.twin();
+                assert_eq!(twin.twin().0, table);
+                assert_eq!(TableId::parse(twin.tablename()).unwrap(), twin);
                 let key = PawnKey::from_elements(&table.parse_elements());
                 assert_eq!(key.reflected().reflected(), key);
                 assert_eq!(key.twin().twin(), key);

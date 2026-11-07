@@ -76,7 +76,7 @@ impl EgtGenerator {
     /// an assigned cache-size limit is configured. Completed pairs are
     /// published and optionally verified before the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
-        let plan = GenerationPlan::new(resolve_selectors(selectors)?)?;
+        let plan = GenerationPlan::new(resolve_selectors(selectors)?);
         self.base_path.ensure_format()?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
