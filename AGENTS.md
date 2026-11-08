@@ -24,25 +24,28 @@
 
 See the design specifications in `README.md` for more information.
 
-Current tablebase generation results (with --threads=2, --noverify):
+Current tablebase generation results (with --noverify):
 ```
-== All 3 pieces ==
-Generated 16 tables: 367868 unique positions, 0.04 MiB in 00h00m00s.
+== All 3 pieces, 2 threads ==
+Generated 16 tables: 367868 unique positions, 0.04 MiB in 00h00m01s.
 Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 ```
 ```
-== All 4 pieces ==
-Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m40s.
+== All 4 pieces, 2 threads ==
+Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m39s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 ```
 ```
-== All 5 pieces ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h31m58s.
+== All 5 pieces, 2 threads ==
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h24m08s.
+Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
+
+== All 5 pieces, 32 threads on AMD EPYC-Turin Processor ==
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 01h44m47s.
 Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ```
 
 ## TODO
-- Test on EC2 c6g instance.
 - `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
 - Internal module layout; visibility and public interface.
