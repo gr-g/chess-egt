@@ -32,12 +32,17 @@ Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 ```
 ```
 == All 4 pieces, 2 threads ==
-Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m39s.
+Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m37s.
 Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 ```
 ```
 == All 5 pieces, 2 threads ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h24m08s.
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h17m06s.
+Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
+```
+```
+== All 5 pieces, 32 threads on AMD EPYC-Genoa ==
+Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 00h32m47s.
 Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ```
 

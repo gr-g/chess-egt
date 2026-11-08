@@ -16,17 +16,18 @@ unique positions unless explicitly stated otherwise.
 | Pieces | Table files | Twin-pair jobs | Index positions | Largest working job |
 |---|---:|---:|---:|---:|
 | 3 | 16 | 8 | 416,640 | 0.11 MB |
-| 4 | 176 | 96 | 156,098,268 | 6.99 MB |
-| 5 | 1,496 | 748 | 35,342,347,140 | 0.42 GB |
-| 6 | 10,526 | 5,338 | 5,626,522,905,000 | 24.7 GB |
-| 7 | 63,784 | 31,892 | 683,014,118,224,656 | 1.44 TB |
+| 4 | 176 | 96 | 155,965,898 | 6.99 MB |
+| 5 | 1,496 | 748 | 35,268,305,340 | 0.42 GB |
+| 6 | 10,526 | 5,338 | 5,606,162,736,600 | 24.7 GB |
+| 7 | 63,784 | 31,892 | 679,345,381,690,216 | 1.44 TB |
 
 ### Working memory
 
 Generation stores a 16-bit value per index slot in each active table. For a
 pair with `N` slots per side, the working arrays therefore occupy `4N` bytes.
-These figures exclude dependency caches, block summaries, compression buffers,
-and other process overhead.
+These figures exclude eagerly loaded dependency tables, block summaries,
+compression buffers, and other process overhead. A self-twin has only one
+working array.
 
 Worst-case pairs, with all non-king pieces distinct:
 
@@ -46,22 +47,20 @@ All six-piece jobs fit below 25 GB of working arrays.
 
 ## 2. Measured generation performance
 
-Complete generation-only runs on an AMD Ryzen 7 5700G, with two threads and
-verification disabled (`--threads=2 --noverify`):
+Historical complete generation-only runs on an AMD Ryzen 7 5700G, with two
+threads and verification disabled (`--threads=2 --noverify`):
 
-| Pieces | Unique positions | Wall time | Allocated core-hours | Core time / index position |
+| Pieces | Index positions | Wall time | Allocated core-hours | Core time / index position |
 |---|---:|---:|---:|---:|
-| 3 | 367,868 | < 1 s | < 0.00056 | — |
-| 4 | 125,132,316 | 1 m 41 s | 0.0561 | 1.29 µs |
-| 5 | 25,880,730,473 | 6 h 36 m 07 s | 13.20 | 1.345 µs |
+| 3 | 416,640 | < 1 s | — | — |
+| 4 | 155,965,898 | 1 m 37 s | 0.0539 | 1.24 µs |
+| 5 | 35,268,305,340 | 6 h 17 m 06 s | 12.57 | 1.28 µs |
 
 Allocated core-hours are wall time multiplied by the two worker threads, not
 measured CPU utilization.
 
 From four to five pieces, index positions grow 226× and generation time grows
-235×: the cost per index position rises only 1.04×. The five-piece cost is
-also 1.84 µs per unique position. These timings include initialization,
-propagation, compression, and publication, but exclude verification.
+233×: the cost per index position rises only 1.03×.
 
 Measured compressed sizes are listed in Section 4. The five-piece set occupies
 3,578.66 MiB, averaging 1.16 bits per unique position, or 0.849 bits per
@@ -71,16 +70,15 @@ index position.
 
 ### Model
 
-Use the five-piece measurement as the reference: `c = 1.345 µs` of allocated
+Use the five-piece measurement as the reference: `c = 1.28 µs` of allocated
 core time per index position. For six and seven pieces, assume:
 
-- **Per-position growth:** a factor `g = 1.5–2.4` per additional piece,
-  with central value `2`. More moves and deeper, low-yield scans can increase
+- **Per-position growth:** a factor `g = 1.0–1.8` per additional piece,
+  with central value `1.4`. More moves and deeper, low-yield scans can increase
   the cost. The measured four-to-five-piece growth is much smaller; this
   wider range is a conservative assumption, not a measured scaling law.
 - **Parallel efficiency:** `η = 0.70` relative to the two-thread reference.
-  This is an additional allowance for scaling to many cores. Dependency
-  stalls, insufficient runnable jobs, and interruptions are not included.
+  This is an additional allowance for scaling to many cores.
 - **Relative per-core speed:** Zen 4 = `1.0`, Zen 5 = `1.15`, and
   Graviton4 = `0.75`, relative to the reference core. These are assumptions,
   not cross-platform benchmarks. The listed AMD and Graviton instances have
@@ -96,12 +94,12 @@ EC2 cost                                  = wall hours × instance price/hour
 
 Here `c` is in seconds. Applying the 70% efficiency allowance gives:
 
-| Set | Reference-equivalent core-hours | Central estimate |
+| Set | Reference-equivalent core-hours | Central scenario |
 |---|---:|---:|
-| 6-piece | 4,500–7,200 | 6,000 |
-| 7-piece | 820,000–2,100,000 | 1,460,000 |
+| 6-piece | 2,800–5,200 | 4,000 |
+| 7-piece | 350,000–1,100,000 | 725,000 |
 
-The measured five-piece total is 13.20 core-hours before this additional
+The measured five-piece total is 12.57 core-hours before this additional
 large-machine efficiency allowance.
 
 ### Instance prices and memory tiers
@@ -121,32 +119,26 @@ inputs, not live quotes. Spot prices and capacity availability fluctuate.
 | `r8g.48xlarge` (Graviton4) | 192 | 1.5 TiB | $11.31 | $3.23 |
 | `x8g.48xlarge` (Graviton4) | 192 | 3 TiB | $18.76 | $4.59 |
 
-For six pieces, compute-optimized machines can hold several jobs at once;
 `hpc7a` offers a lower on-demand core-hour price and more RAM per core, but
-has limited regional availability. Seven-piece estimates use three memory
-tiers: `m8g` for jobs up to 300 GB, `r8g` for 300–700 GB, and `x8g` above
-700 GB. This leaves headroom for dependency data and other overhead.
-
-Weighting these tiers by their share of index positions, and accounting for
-the assumed Graviton4 speed, gives approximately **$0.090 on-demand** or
-**$0.027 spot** per reference-equivalent core-hour. These blended rates assume
-that memory and CPU capacity can be used efficiently across jobs.
+has limited regional availability. Concurrent jobs must be sized using working
+arrays plus all loaded dependencies and overhead, not the array table alone.
 
 ### Generation time and compute bill
 
-All rows are projections using the model above, not measured cloud runs.
-Individual seven-piece rows cover both files in the pair. Fleet rows assume
+Except for the explicitly measured five-piece row, these are conditional
+scenarios using the model above, not measured cloud runs. Individual
+seven-piece rows cover both files in the pair. Fleet rows assume
 balanced scheduling of independent, dependency-ready jobs; the EC2 estimates
 exclude verification, idle dependency waits, storage, and transfer charges.
 
 | Target | Fleet | Modeled wall time | On-demand | Spot |
 |---|---|---:|---:|---:|
-| All 5-piece | 1 × `c7a.24xlarge` (96 vCPUs) | ~12 min | ~$1 | ~$0.4 |
+| All 5-piece (measured) | Genoa guest, 32 SMT vCPUs | 32 m 47 s | — | — |
 | All 6-piece | 2 × `hpc7a.96xlarge`; spot alternative: 2 × `c7a.48xlarge` | 12–19 h | $210–340 | $85–135 |
-| Representative 587 GB 7-piece pair (`KRRPb_KQB`) | 1 × `m8g.48xlarge` | 2.4–6.3 h | $21–54 | $9–24 |
-| Heavy one-pawn 7-piece pair (`KRPa_KQBN`, 1.17 TB) | 1 × `x8g.48xlarge` | 4.9–12.5 h | $92–235 | $22–58 |
+| Representative 587 GB 7-piece pair (`KRRPb_KQB`) | 192 Graviton4-equivalent workers; RAM sizing unresolved | 2.4–6.3 h | — | — |
+| Heavy one-pawn 7-piece pair (`KRPa_KQBN`, 1.17 TB arrays) | >3.35 TiB RAM required; no priced configuration | — | — | — |
 | Largest pawnless 7-piece pair (`KN_KQRBN`, 1.44 TB) | 1 × `x8g.48xlarge` | 6.0–15.3 h | $112–287 | $27–70 |
-| All 7-piece | ~50 Graviton4 instances in three memory tiers (9,600 vCPUs) | 4.7–12.2 days | $74k–189k (~$131k central) | $22k–57k (~$40k central) |
+| All 7-piece | 9,600 Graviton4-equivalent workers; RAM sizing unresolved | 4.7–12.2 days | — | — |
 
 The all-seven-piece time includes the assumed `0.75` Graviton4 speed factor.
 It is a throughput estimate, not a calendar-time guarantee: capture and

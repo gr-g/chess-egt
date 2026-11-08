@@ -18,8 +18,8 @@ from stats_csv import (
 # dependency stalls and interruptions. The baseline is wall time times two
 # threads, not measured process CPU time; efficiency allows for larger machines.
 REFERENCE_PIECES = 5
-CORE_US_PER_INDEX = 1.345
-COMPUTE_GROWTH_PER_PIECE = 2.0
+CORE_US_PER_INDEX = 1.28
+COMPUTE_GROWTH_PER_PIECE = 1.4
 PARALLEL_EFFICIENCY = 0.70
 
 # Unlike the actual table CSV compression, these rates use INDEX positions.
