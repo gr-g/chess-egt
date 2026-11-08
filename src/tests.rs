@@ -112,19 +112,19 @@ fn default_and_zero_threads_generate_and_verify() {
 }
 
 #[test]
-fn bounded_cache_size_supports_generation_verification_and_probing() {
+fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
     let dir = TestDir::new("bounded_cache_size");
     // Fit both queen-table frames, but force eviction when K_K is also probed.
     let cache_bytes = 2 * Egt::from_tablename("KQ_K").unwrap().index_range() * 2;
     let mut generator = EgtGenerator::new(&dir.0).unwrap();
     generator.set_threads(2);
-    generator.set_cache_size(cache_bytes);
+
     let tables = generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
     assert_eq!(tables.len(), 3);
 
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
     verifier.set_threads(2);
-    verifier.set_cache_size(cache_bytes).unwrap();
+
     verifier.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(cache_bytes).unwrap();
@@ -216,16 +216,16 @@ fn probing_rejects_castling_rights_before_table_lookup() {
 }
 
 #[test]
-fn zero_cache_size_supports_generation_verification_and_probing() {
+fn zero_cache_size_supports_probing_generated_and_verified_tables() {
     let dir = TestDir::new("zero_cache_size");
     let mut generator = EgtGenerator::new(&dir.0).unwrap();
     generator.set_threads(2);
-    generator.set_cache_size(0);
+
     generator.generate("K_K").unwrap();
 
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
     verifier.set_threads(2);
-    verifier.set_cache_size(0).unwrap();
+
     verifier.verify_internal_consistency("K_K").unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(0).unwrap();

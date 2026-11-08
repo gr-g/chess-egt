@@ -80,7 +80,7 @@ use crate::position::InvalidCounts;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use rayon::prelude::*;
-use crate::egt_file::SharedFileCache;
+use crate::egt_file::BatchReader;
 use crate::storage::Location;
 
 /// Mutable values for only the current pair; a self-pair has one shared array.
@@ -503,7 +503,7 @@ fn initialize_table(
     egt: &Egt,
     values: &mut [AtomicU16],
     summary: &PlySummary,
-    reader: &SharedFileCache,
+    reader: &BatchReader,
 ) -> EgtResult<InitCounts> {
     let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
     debug_assert_eq!(values.len(), size);
@@ -628,7 +628,7 @@ struct PairResult {
 fn solve_pair(
     tables: &mut [TableState],
     reflected: [bool; 2],
-    reader: &SharedFileCache,
+    reader: &BatchReader,
 ) -> EgtResult<PairResult> {
     debug_assert!((1..=2).contains(&tables.len()));
     let init_start = std::time::Instant::now();
@@ -756,20 +756,23 @@ fn solve_pair(
 
 /// Generates one exact table and its twin in the caller's Rayon pool.
 ///
-/// The shared reader lazily opens existing conversion dependencies, including
-/// outputs of earlier jobs. Missing dependencies are errors, not generation
-/// requests. A self-twin is solved and published once. Statistics are returned
+/// The batch reader contains fully loaded conversion dependencies, including
+/// outputs of earlier jobs. A self-twin is solved and published once. Statistics are returned
 /// in requested-table/twin order without opening the published outputs.
 pub(super) fn generate_pair(
     base: &Location,
     pair: &TablePair,
-    reader: &SharedFileCache,
+    reader: &BatchReader,
+    dependency_time: std::time::Duration,
 ) -> EgtResult<Vec<EgtStats>> {
     base.ensure_writable()?;
     let ids = || std::iter::once(&pair.table).chain(pair.twin.iter());
+    let init_setup = std::time::Instant::now();
     let mut tables = ids().map(|id| Egt::from_elements(id.parse_elements()).map(TableState::new))
         .collect::<EgtResult<Vec<_>>>()?;
-    let result = solve_pair(&mut tables, pair.reflected, reader)?;
+    let init_setup = init_setup.elapsed();
+    let mut result = solve_pair(&mut tables, pair.reflected, reader)?;
+    result.init_time += init_setup;
 
     let finalize_start = std::time::Instant::now();
     let mut stats = Vec::with_capacity(tables.len());
@@ -779,8 +782,9 @@ pub(super) fn generate_pair(
         stats.push(super::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
     }
     println!(
-        "{}: phase timings: init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
+        "{}: phase timings: dependencies {:.3}s, init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
         pair.table.tablename(),
+        dependency_time.as_secs_f64(),
         result.init_time.as_secs_f64(),
         result.propagation_time.as_secs_f64(),
         finalize_start.elapsed().as_secs_f64(),
@@ -1267,7 +1271,8 @@ mod tests {
         let dir = crate::TestDir::new("initial_summary");
         EgtGenerator::new(&dir.0).unwrap().generate("K_K").unwrap();
         let location = Location::parse(&dir.0).unwrap();
-        let reader = SharedFileCache::new(&location, None, None);
+        let mut reader = BatchReader::open(&location, None, &[TableId::parse("K_K").unwrap()]).unwrap();
+        reader.load().unwrap();
         for name in ["K_KQ", "KQ_K"] {
             let egt = table(name);
             let mut values = atomic_values(vec![PackedOutcome::INVALID; egt.index_range()]);
@@ -1300,10 +1305,8 @@ mod tests {
 
     #[test]
     fn pair_local_self_twin_uses_one_working_array() {
-        let dir = crate::TestDir::new("pair_local_self_twin");
         let mut tables = [TableState::new(table("K_K"))];
-        let location = Location::parse(&dir.0).unwrap();
-        let reader = SharedFileCache::new(&location, None, None);
+        let reader = BatchReader::default();
         let pair = solve_pair(&mut tables, [false; 2], &reader).unwrap();
         assert_eq!(tables[0].invalid, InvalidCounts::default());
         assert_eq!(pair.working.values.len(), 1);

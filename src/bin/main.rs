@@ -1,11 +1,8 @@
-mod common;
-
 use chess_egt::{
     AggregateStats, ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics,
     EgtVerifier, resolve_selectors,
 };
 use clap::Parser;
-use common::parse_byte_size;
 use shakmaty::fen::Fen;
 use shakmaty::{CastlingMode, Position, PositionError};
 use std::path::PathBuf;
@@ -24,10 +21,6 @@ struct Cli {
     /// If not given, --path is used for dependencies as well.
     #[arg(long, conflicts_with_all = ["stats", "cache_stats"])]
     input_path: Option<PathBuf>,
-
-    /// Retained frame-cache memory (bytes, B, KiB, MiB, or GiB).
-    #[arg(long, value_parser = parse_byte_size)]
-    cache_size: Option<usize>,
 
     /// Number of generation and verification workers (0 uses Rayon's default).
     #[arg(long, default_value_t = 0)]
@@ -105,9 +98,6 @@ fn run() -> Result<(), EgtError> {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
         let mut verifier = EgtVerifier::new(&cli.path)?;
         verifier.set_threads(usize::from(cli.threads));
-        if let Some(cache_size) = cli.cache_size {
-            verifier.set_cache_size(cache_size)?;
-        }
         if let Some(ref input) = cli.input_path {
             verifier.set_input_path(input)?;
         }
@@ -190,9 +180,6 @@ fn generation_summary(
 
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
     let mut prober = EgtProber::new(&cli.path)?;
-    if let Some(cache_size) = cli.cache_size {
-        prober.set_cache_size(cache_size)?;
-    }
     if let Some(ref input) = cli.input_path {
         prober.set_input_path(input)?;
     }
@@ -201,9 +188,6 @@ fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
 
 fn configure_generator(generator: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
     generator.set_threads(usize::from(cli.threads));
-    if let Some(cache_size) = cli.cache_size {
-        generator.set_cache_size(cache_size);
-    }
     if let Some(ref input) = cli.input_path {
         generator.set_input_path(input)?;
     }
@@ -279,29 +263,6 @@ mod tests {
     fn selector_actions_require_at_least_one_selector() {
         for action in ACTIONS {
             assert!(Cli::try_parse_from(["chess-egt", action]).is_err());
-        }
-    }
-
-    #[test]
-    fn cache_size_accepts_byte_sizes() {
-        for (value, expected) in [
-            ("123", 123),
-            ("123B", 123),
-            ("2kib", 2 * 1024),
-            ("2MiB", 2 * 1024 * 1024),
-            ("1GiB", 1024 * 1024 * 1024),
-        ] {
-            let cli = Cli::try_parse_from(["chess-egt", "--cache-size", value]).unwrap();
-            assert_eq!(cli.cache_size, Some(expected));
-        }
-    }
-
-    #[test]
-    fn cache_size_rejects_malformed_or_overflowing_sizes() {
-        for value in ["", "MiB", "1.5GiB", "1KB", "-1", "18446744073709551615GiB"] {
-            let argument = format!("--cache-size={value}");
-            let error = Cli::try_parse_from(["chess-egt", &argument]).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ValueValidation);
         }
     }
 

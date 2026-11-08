@@ -3,16 +3,18 @@ mod solver;
 
 use std::path::Path;
 
-use crate::egt_file::SharedFileCache;
+use crate::egt_file::BatchReader;
 use crate::storage::Location;
 use crate::{
-    EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, TablePair, resolve_selectors,
+    EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, resolve_selectors,
     verification,
 };
 
+/// Generates one pair at a time with eagerly loaded conversion dependencies.
+/// Working arrays and all decompressed dependencies must fit in memory together;
+/// dependencies are retained through optional verification, then released.
 pub struct EgtGenerator {
     base_path: Location,
-    cache_size: Option<usize>,
     input_path: Option<Location>,
     verify: bool,
     threads: usize,
@@ -31,7 +33,6 @@ impl EgtGenerator {
     pub(crate) fn from_location(location: Location) -> Self {
         Self {
             base_path: location,
-            cache_size: None,
             input_path: None,
             verify: true,
             threads: 0,
@@ -41,12 +42,6 @@ impl EgtGenerator {
     /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
-    }
-
-    /// Sets the shared dependency-frame cache budget in bytes.
-    /// Generation working arrays are allocated separately.
-    pub fn set_cache_size(&mut self, n: usize) {
-        self.cache_size = Some(n);
     }
 
     /// Resolves an additional local directory or object-store URL for dependencies.
@@ -74,10 +69,10 @@ impl EgtGenerator {
     }
 
     /// Deduplicates selectors into twin-pair jobs, ordered by pieces then pawns.
-    /// Reuses one Rayon pool and shares dependency frames with verification.
-    /// The cache is released between material families, with LRU eviction when
-    /// an assigned cache-size limit is configured. Completed pairs are
-    /// published and optionally verified before the next job.
+    /// Reuses one Rayon pool and loaded dependencies with verification.
+    /// All enumerated dependencies must exist before initialization starts.
+    /// Completed pairs are published and optionally verified before releasing
+    /// their loaded tables and starting the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let plan = GenerationPlan::new(resolve_selectors(selectors)?);
         self.base_path.ensure_format()?;
@@ -85,10 +80,7 @@ impl EgtGenerator {
             .num_threads(self.threads)
             .build()
             .map_err(|_| EgtError::Internal("failed to build generation thread pool"))?;
-        let reader =
-            SharedFileCache::new(&self.base_path, self.input_path.as_ref(), self.cache_size);
         let mut results = Vec::new();
-        let mut previous_material = None;
         println!(
             "Generating {} twin-pair jobs using {} threads.",
             plan.pairs.len(),
@@ -96,30 +88,45 @@ impl EgtGenerator {
         );
         pool.install(|| -> EgtResult<()> {
             for pair in plan.pairs {
-                let material = material_family(&pair);
-                if previous_material.as_ref() != Some(&material) {
-                    reader.clear()?;
-                    previous_material = Some(material);
-                }
                 let start = std::time::Instant::now();
-                let pair_stats = solver::generate_pair(&self.base_path, &pair, &reader)?;
+                let mut dependencies: Vec<_> = std::iter::once(&pair.table)
+                    .chain(pair.twin.iter())
+                    .flat_map(|id| id.dependencies())
+                    .collect();
+                dependencies.sort();
+                dependencies.dedup();
+                let mut reader =
+                    BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
+                let working_bytes: u128 = std::iter::once(&pair.table)
+                    .chain(pair.twin.iter())
+                    .try_fold(0, |bytes, id| {
+                        let egt = crate::Egt::from_elements(id.parse_elements())?;
+                        Ok::<_, EgtError>(bytes + egt.index_range() as u128 * 2)
+                    })?;
+                println!(
+                    "{}: loading dependencies; {} bytes of working and dependency table data...",
+                    pair.table.tablename(), working_bytes + reader.resident_bytes(),
+                );
+                reader.load()?;
+                let dependency_time = start.elapsed();
+                let pair_stats =
+                    solver::generate_pair(&self.base_path, &pair, &reader, dependency_time)?;
                 if self.verify {
                     let names: Vec<_> = pair_stats
                         .iter()
                         .map(|stats| stats.tablename.clone())
                         .collect();
                     let mut verification = Vec::new();
-                    // Generation and verification share dependency frames. Pin
-                    // both outputs so input artifacts cannot shadow either one.
+                    // Load explicit outputs so input artifacts cannot shadow either one.
                     for name in &names {
                         let file = EgtFileReader::open_in(&self.base_path, name)?;
                         verification.push(file.egt().clone());
-                        reader.insert(file)?;
+                        reader.insert(file);
                     }
+                    reader.load()?;
                     for (name, egt) in names.iter().zip(verification) {
                         verification::verify_egt(&reader, name, &egt)?;
                     }
-                    reader.remove(&names)?;
                 }
                 print_pair_stats(&pair_stats[0], pair_stats.get(1), start.elapsed());
                 results.extend(pair_stats);
@@ -128,13 +135,6 @@ impl EgtGenerator {
         })?;
         Ok(results)
     }
-}
-
-/// An unordered material family, independent of the oriented representative.
-fn material_family(pair: &TablePair) -> String {
-    let material = pair.table.material();
-    let twin = pair.twin.as_ref().unwrap_or(&pair.table).material();
-    material.min(twin)
 }
 
 /// Prints table-specific statistics (wins, draws, losses, compression).

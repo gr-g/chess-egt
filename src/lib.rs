@@ -13,7 +13,7 @@
 //! fn inspect(root: &str) -> EgtResult<()> {
 //!     let mut verifier = EgtVerifier::new(root)?;
 //!     verifier.set_threads(2);
-//!     verifier.set_cache_size(64 * 1024 * 1024)?;
+
 //!     verifier.verify_selected(&["KQ_K", "K_KQ"])?;
 //!
 //!     let statistics = EgtStatistics::new(root)?;
@@ -31,8 +31,9 @@
 //! progress and timing output.
 //!
 //! Probers and verifiers support input-first overlays with fallback only for
-//! missing files. Their optional frame-cache budgets accept zero to retain no
-//! frames. Statistics describe one root, do not use the frame cache, and do not
+//! missing files. Probers accept optional frame-cache budgets, including zero
+//! to retain no frames. Generation and verification eagerly load the required
+//! tables for each job. Statistics describe one root, do not use the frame cache, and do not
 //! support overlays. Do not rebuild metadata concurrently with generation or
 //! another rebuild. Malformed stored artifacts return [`EgtError::InvalidData`]
 //! with their location and source error; backend failures return [`EgtError::Storage`].

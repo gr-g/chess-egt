@@ -8,27 +8,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use shakmaty::Chess;
 
-use super::EgtFileReader;
+use super::{EgtFileReader, load_existing_file};
 use crate::storage::Location;
 use crate::table_id::position_table_name;
 use crate::{DtcOutcome, EgtError, EgtResult, PackedOutcome};
 
-/// Attempts to load an existing table, looking it up first in `input_path`
-/// (if set) and then in `base_path`, falling back only when a file is missing.
-fn load_existing_file(
-    base_path: &Location,
-    input_path: Option<&Location>,
-    endgame: &str,
-) -> EgtResult<EgtFileReader> {
-    if let Some(input) = input_path {
-        match EgtFileReader::open_in(input, endgame) {
-            Ok(f) => return Ok(f),
-            Err(EgtError::FileNotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    EgtFileReader::open_in(base_path, endgame)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FrameKey {
@@ -51,7 +35,7 @@ struct CacheMemory {
     frames: HashMap<FrameKey, CachedFrame>,
 }
 
-/// Shared files and their uncompressed frames for probing and verification.
+/// Shared files and their uncompressed frames for on-demand probing.
 ///
 /// The assigned memory bounds retained frames between operations. Concurrent
 /// cold loads, copied chunks, metadata, and decompression buffers are excluded.
@@ -122,10 +106,12 @@ impl SharedFileCache {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(crate) fn probe(&self, position: &Chess) -> EgtResult<PackedOutcome> {
         self.probe_indexed(position).map(|(_, outcome)| outcome)
     }
 
+    #[cfg(test)]
     pub(crate) fn probe_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
         let (index, outcome) = self.probe_indexed(position)?;
         outcome.to_outcome_at(index)
@@ -203,6 +189,7 @@ impl SharedFileCache {
         Ok(outcomes)
     }
 
+    #[cfg(test)]
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {
         let (name, reflected) = position_table_name(position)?;
         self.probe_routed(position, name.as_str(), reflected)
@@ -248,47 +235,6 @@ impl SharedFileCache {
         Ok((index, outcome))
     }
 
-    /// Copies a scan block so no file lock is held while probing successors.
-    /// The range must lie within one frame.
-    pub(crate) fn read_chunk(
-        &self,
-        endgame: &str,
-        start: usize,
-        end: usize,
-    ) -> EgtResult<Vec<PackedOutcome>> {
-        let file = self.file(endgame)?;
-        let reader = file
-            .read()
-            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        if start > end || end > reader.egt.index_range() {
-            return Err(EgtError::IndexOutOfRange {
-                index: end,
-                range: reader.egt.index_range(),
-            });
-        }
-        if start == end {
-            return Ok(Vec::new());
-        }
-        let frame = reader.locate_frame(start).0;
-        let bytes = reader.frame_bytes(frame);
-        let (chunk, over_limit) = if let Some(chunk) = reader.frame_chunk_cached(start, end)? {
-            let chunk = chunk.to_vec();
-            let over_limit = self.record_access(&file, frame, bytes)?;
-            drop(reader);
-            (chunk, over_limit)
-        } else {
-            drop(reader);
-            let mut writer = file
-                .write()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            let chunk = writer.frame_chunk(start, end)?.to_vec();
-            (chunk, self.record_access(&file, frame, bytes)?)
-        };
-        if over_limit {
-            self.enforce_limit()?;
-        }
-        Ok(chunk)
-    }
 
     fn record_access(
         &self,
@@ -373,6 +319,7 @@ impl SharedFileCache {
         }
     }
 
+    #[cfg(test)]
     fn forget_file(&self, file: &Arc<RwLock<EgtFileReader>>) -> EgtResult<()> {
         let file_id = Arc::as_ptr(file) as usize;
         let mut cache = self
@@ -392,8 +339,8 @@ impl SharedFileCache {
         Ok(())
     }
 
-    /// Pins freshly published, cold output ahead of configured input lookup.
-    pub(crate) fn insert(&self, file: EgtFileReader) -> EgtResult<()> {
+    #[cfg(test)]
+    fn insert(&self, file: EgtFileReader) -> EgtResult<()> {
         let old = self
             .files
             .write()
@@ -405,8 +352,8 @@ impl SharedFileCache {
         Ok(())
     }
 
-    /// Releases completed outputs after verification without discarding warmed dependencies.
-    pub(crate) fn remove(&self, names: &[String]) -> EgtResult<()> {
+    #[cfg(test)]
+    fn remove(&self, names: &[String]) -> EgtResult<()> {
         let mut files = self
             .files
             .write()
@@ -419,7 +366,7 @@ impl SharedFileCache {
         Ok(())
     }
 
-    /// Bounds cache lifetime between material families; call after workers join.
+    /// Releases cached tables; call only when no probes are running.
     pub(crate) fn clear(&self) -> EgtResult<()> {
         self.files
             .write()
@@ -434,10 +381,6 @@ impl SharedFileCache {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn contains_key(&self, name: &str) -> bool {
-        self.files.read().unwrap().contains_key(name)
-    }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {

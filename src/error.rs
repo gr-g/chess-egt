@@ -59,8 +59,8 @@ pub enum EgtError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    /// Memory for a generation working array could not be allocated.
-    #[error("failed to allocate {bytes} bytes for {context}: {reason}; generation working memory is separate from the cache budget")]
+    /// Memory for working values or decompressed table data could not be allocated.
+    #[error("failed to allocate {bytes} bytes for {context}: {reason}")]
     WorkingMemoryAllocation {
         context: String,
         bytes: u128,

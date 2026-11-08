@@ -16,8 +16,9 @@ python3 scripts/benchmark_generation.py \
   --selectors KQ_K KPa_K --threads 1 4 --repeats 2 --timeout 600
 ```
 
-Each run records wall/CPU time, peak RSS, and summed initialization, propagation,
-and finalization/publication timings across its pair jobs.
+Each run records wall/CPU time, peak RSS, and summed dependency preparation/loading,
+initialization, propagation, and finalization/publication timings across its pair
+jobs.
 
 Artifacts are individual tables at `n/maxvmin/opK/Npawns/name.ggegt` with JSON
 sidecars. The script hashes relative hierarchical paths after timing,

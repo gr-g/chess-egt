@@ -39,10 +39,6 @@ Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
 == All 5 pieces, 2 threads ==
 Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h24m08s.
 Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
-
-== All 5 pieces, 32 threads on AMD EPYC-Turin Processor ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 01h44m47s.
-Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ```
 
 ## TODO

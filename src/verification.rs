@@ -4,17 +4,21 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use rayon::prelude::*;
 use shakmaty::{Chess, Color, MoveList, Position};
 
-use crate::egt_file::SharedFileCache;
+use crate::egt_file::{BatchReader, load_existing_file};
 use crate::storage::{FRAME_SIZE, Location};
+use crate::table_id::TableId;
 use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, resolve_selectors};
 
-/// Checks table outcomes against legal successors using a shared frame cache.
+/// Checks table outcomes against legal successors using eagerly loaded tables.
+/// Each source, its quiet twin, and its direct conversion dependencies must fit
+/// in memory together; loaded tables are released after verifying each source.
 ///
 /// Verification is synchronous and prints fixed progress lines. Async callers
 /// should construct, configure and use the verifier in `tokio::task::spawn_blocking`.
 /// Input overlays have the same missing-only fallback as [`crate::EgtProber`].
 pub struct EgtVerifier {
-    cache: SharedFileCache,
+    base_path: Location,
+    input_path: Option<Location>,
     threads: usize,
 }
 
@@ -26,7 +30,8 @@ impl EgtVerifier {
 
     pub(crate) fn from_location(location: Location) -> Self {
         Self {
-            cache: SharedFileCache::new(&location, None, None),
+            base_path: location,
+            input_path: None,
             threads: 0,
         }
     }
@@ -36,47 +41,49 @@ impl EgtVerifier {
         self.threads = threads;
     }
 
-    /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
-    pub fn set_cache_size(&mut self, n: usize) -> EgtResult<()> {
-        self.cache.set_cache_size(n)
-    }
-
     /// Resolves an input location, searched first with missing-only fallback to
     /// the base location. A resolution failure leaves the previous setting intact.
     pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
-        self.cache.set_input_path(Some(Location::parse(path)?))
+        self.input_path = Some(Location::parse(path)?);
+        Ok(())
     }
 
     /// Verifies exactly the tables selected, without implicitly adding twins.
-    /// Successor dependencies must be available. Frames are shared and subject
-    /// to the configured LRU cache budget.
+    /// The quiet twin and all conversion dependencies must be available and
+    /// are loaded before checking the selected source.
     pub fn verify_internal_consistency(&self, selector: &str) -> EgtResult<()> {
         self.verify_selected(&[selector])
     }
 
     /// Verifies the sorted, deduplicated union of selectors without adding twins.
     pub fn verify_selected(&self, selectors: &[&str]) -> EgtResult<()> {
-        let names: Vec<_> = resolve_selectors(selectors)?
-            .into_iter()
-            .map(|id| id.tablename().to_owned())
-            .collect();
+        let ids = resolve_selectors(selectors)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build()
             .map_err(|_| EgtError::Internal("failed to build verification thread pool"))?;
-        pool.install(|| self.verify_tables_in_pool(&names))
+        pool.install(|| self.verify_tables_in_pool(&ids))
     }
 
-    fn verify_tables_in_pool(&self, names: &[String]) -> EgtResult<()> {
-        for name in names {
-            let file = self.cache.file(name)?;
-            let egt = {
-                let file = file
-                    .read()
-                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-                file.egt().clone()
-            };
-            verify_egt(&self.cache, name, &egt)?;
+    fn verify_tables_in_pool(&self, ids: &[TableId]) -> EgtResult<()> {
+        for id in ids {
+            let name = id.tablename();
+            let source = load_existing_file(&self.base_path, self.input_path.as_ref(), name)?;
+            let mut dependencies = id.dependencies();
+            dependencies.push(id.twin().0);
+            dependencies.retain(|dependency| dependency != id);
+            dependencies.sort();
+            dependencies.dedup();
+            let mut reader =
+                BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
+            reader.insert(source);
+            println!(
+                "{}: loading {} bytes of resident table data...",
+                name,
+                reader.resident_bytes()
+            );
+            reader.load()?;
+            verify_egt(&reader, name, reader.file(name)?.egt())?;
             println!(
                 "Successfully verified internal consistency of table {}.",
                 name
@@ -87,14 +94,14 @@ impl EgtVerifier {
 }
 
 /// Verifies independent blocks of one table using table-local indices.
-pub(crate) fn verify_egt(reader: &SharedFileCache, endgame: &str, egt: &Egt) -> EgtResult<()> {
+pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<()> {
     let tablename = egt.tablename();
     let local_range = egt.index_range();
 
     println!("{}: verifying {} indices...", tablename, local_range);
 
     let completed = AtomicUsize::new(0);
-    // Blocks divide frames so copying a block never crosses a frame boundary.
+    // Keep each borrowed block within a single frame.
     let block_size = 4096.min(FRAME_SIZE);
     let blocks: Vec<_> = (0..local_range)
         .step_by(FRAME_SIZE)
@@ -120,7 +127,7 @@ pub(crate) fn verify_egt(reader: &SharedFileCache, endgame: &str, egt: &Egt) -> 
 }
 
 fn verify_block(
-    reader: &SharedFileCache,
+    reader: &BatchReader,
     endgame: &str,
     egt: &Egt,
     start: usize,
@@ -135,7 +142,7 @@ fn verify_block(
         reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
     };
 
-    for (relative_idx, outcome_maybe) in outcomes.into_iter().enumerate() {
+    for (relative_idx, outcome_maybe) in outcomes.iter().copied().enumerate() {
         let local_idx = start + relative_idx;
         let index = local_idx;
         let position_opt = egt.position_from_index(local_idx, Color::White);
@@ -189,7 +196,7 @@ fn verify_block(
 /// Computes the best outcome reachable from `position` by playing one of
 /// `legals`, probing each successor in the tablebases.
 fn best_outcome(
-    reader: &SharedFileCache,
+    reader: &BatchReader,
     position: &Chess,
     legals: &MoveList,
 ) -> EgtResult<DtcOutcome> {
@@ -219,7 +226,7 @@ fn best_outcome(
 /// Builds a human-readable diagnostic for a mismatch between the outcome
 /// stored in the file and the best outcome computed from the legal moves.
 fn describe_mismatch(
-    reader: &SharedFileCache,
+    reader: &BatchReader,
     position: &Chess,
     legals: &MoveList,
     outcome: DtcOutcome,
@@ -245,14 +252,13 @@ fn describe_mismatch(
     reason
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::TestDir;
 
     #[test]
-    fn verification_rejects_invalid_outcomes_and_recovers_cache() {
+    fn verification_rejects_invalid_outcomes_and_recovers() {
         use crate::PackedOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
@@ -268,16 +274,14 @@ mod tests {
                 PackedOutcome::from_u16(8),
                 PackedOutcome::DRAW,
             ] {
-                // Drop cached readers before replacing their backing artifact.
-                verifier.cache.clear().unwrap();
-                let file = crate::egt_file::writer::write_fixture(&dir.0, "K_K", |i| {
+                crate::egt_file::writer::write_fixture(&dir.0, "K_K", |i| {
                     if i == index {
                         outcome
                     } else {
                         PackedOutcome::DRAW
                     }
                 });
-                verifier.cache.insert(file).unwrap();
+
                 let result = verifier.verify_internal_consistency("K_K");
                 if outcome.is_invalid() {
                     assert!(matches!(result,
@@ -288,7 +292,6 @@ mod tests {
                 } else {
                     result.unwrap();
                 }
-                assert!(verifier.cache.contains_key("K_K"));
             }
         }
     }

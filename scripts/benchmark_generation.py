@@ -19,7 +19,8 @@ import time
 
 
 PHASES = re.compile(
-    r"phase timings: init ([\d.]+)s, propagation ([\d.]+)s, finalize/publish ([\d.]+)s"
+    r"phase timings: dependencies ([\d.]+)s, init ([\d.]+)s, "
+    r"propagation ([\d.]+)s, finalize/publish ([\d.]+)s"
 )
 
 
@@ -53,14 +54,15 @@ def measure(command, log_path, timeout):
     phases = PHASES.findall(text)
     if not phases:
         raise RuntimeError(f"Expected pair timing records in {log_path}")
-    init, propagation, finalize = (
-        sum(float(phase[column]) for phase in phases) for column in range(3)
+    dependencies, init, propagation, finalize = (
+        sum(float(phase[column]) for phase in phases) for column in range(4)
     )
     return {
         "wall_s": elapsed,
         "user_s": usage.ru_utime,
         "system_s": usage.ru_stime,
         "peak_rss_mib": usage.ru_maxrss / 1024,
+        "dependencies_s": dependencies,
         "init_s": init,
         "propagation_s": propagation,
         "finalize_publish_s": finalize,
@@ -144,7 +146,8 @@ def main():
                 results.append(record)
                 (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
                 print(json.dumps({k: record[k] for k in (
-                    "selector", "threads", "repeat", "pairs", "init_s", "propagation_s",
+                    "selector", "threads", "repeat", "pairs", "dependencies_s",
+                    "init_s", "propagation_s",
                     "finalize_publish_s", "wall_s", "peak_rss_mib", "matches_first_run",
                 )}), flush=True)
                 if not stable:

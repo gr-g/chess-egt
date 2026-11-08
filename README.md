@@ -243,9 +243,9 @@ follows:
     This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 As a result, the working outcome array for a table with _n_ indexed locations
-requires _2n_ bytes, which is the main memory cost of generation. Some
-additional memory overhead comes from block summaries, scan buffers,
-dependency-cache entries, and compression buffers.
+requires _2n_ bytes. Loaded dependency outcomes also require two bytes per
+index slot. Additional memory overhead comes from block summaries, scan buffers,
+and compression buffers.
 
 ### Tablebase organization and naming conventions
 
@@ -584,4 +584,5 @@ most one encoder per configured thread.
 
 Probing (`EgtProber`) uses a shared cache that keeps track of frames already
 available in memory, evicting the least recently used stored frames to keep
-retained frame data within the configured cache budget (`--cache-size`).
+retained frame data within the configured cache budget (the server's
+`--cache-size` option).

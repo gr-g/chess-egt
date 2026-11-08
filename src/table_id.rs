@@ -10,6 +10,8 @@ use std::cmp::Ordering;
 use crate::error::{EgtError, EgtResult};
 use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
 
+mod dependencies;
+
 type TableName = ArrayString<{ 3 * MAX_PIECES + 1 }>;
 
 /// A validated exact table name, without an indexing plan or storage access.
@@ -551,6 +553,54 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap()
+    }
+
+    #[test]
+    fn conversion_dependencies_cover_legal_successors() {
+        for fen in [
+            "7k/8/8/8/8/2r5/2K5/8 w - - 0 1",
+            "7k/8/8/8/8/2p5/2K5/8 w - - 0 1",
+            "8/7k/8/8/1r6/1RQ5/8/K7 w - - 0 1",
+            "7k/8/8/1r1r4/2P5/8/8/K7 w - - 0 1",
+            "7k/8/8/1p1p4/2P5/8/8/K7 w - - 0 1",
+            "7k/8/2p5/1p1r4/2P5/3P4/8/K7 w - - 0 1",
+            "7k/8/3p4/3r4/2P5/3p4/8/K7 w - - 0 1",
+            "7k/8/8/3Pp3/8/8/8/K7 w - e6 0 1",
+            "7k/8/8/8/3pP3/8/8/K7 b - e3 0 1",
+            "2r4k/1P6/8/8/8/8/8/K7 w - - 0 1",
+            "k4r2/6P1/8/8/8/8/8/7K w - - 0 1",
+            "7k/8/8/8/8/8/1p6/2R4K b - - 0 1",
+        ] {
+            let position = position(fen);
+            let table = TableId::from_position(&position).unwrap().0;
+            let dependencies = table.dependencies();
+            assert!(dependencies.windows(2).all(|pair| pair[0] < pair[1]));
+            for mv in position.legal_moves() {
+                if mv.is_capture() || mv.is_promotion() {
+                    let successor = position.clone().play(mv).unwrap();
+                    let next = TableId::from_position(&successor).unwrap().0;
+                    assert!(dependencies.contains(&next), "{fen}: {mv:?} -> {next:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conversion_dependencies_exclude_blocked_promotions() {
+        for (name, expected) in [
+            ("K_K", vec![]),
+            ("KPao_KPao", vec!["K_KPa"]),
+            ("KPaPao_KPao", vec!["K_KPaPa"]),
+            ("KPao_KRPao", vec!["KPao_KPao", "KR_KPa", "KPa_KPb"]),
+        ] {
+            let dependencies = TableId::parse(name).unwrap().dependencies();
+            let mut expected: Vec<_> = expected
+                .into_iter()
+                .map(|name| TableId::parse(name).unwrap())
+                .collect();
+            expected.sort();
+            assert_eq!(dependencies, expected, "{name}");
+        }
     }
 
     #[test]
