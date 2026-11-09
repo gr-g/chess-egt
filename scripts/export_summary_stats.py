@@ -3,13 +3,15 @@
 
 Refresh --cache-stats for the desired scope before exporting. Do not run while
 metadata is being generated or rebuilt. No tablebase contents are read.
+Memory columns are independent peak array sizes under the target streaming model.
 """
 
 import argparse
 from pathlib import Path
 
 from stats_csv import (
-    OUTCOME_FIELDS, count, decimal, leaf_directories, read_json, table_records,
+    MEMORY_FIELDS, OUTCOME_FIELDS, count, decimal, leaf_directories,
+    memory_columns, memory_estimates, read_json, table_records,
     validate_root, write_csv,
 )
 
@@ -25,17 +27,11 @@ COMPRESSION_BITS_PER_INDEX = 0.849
 COMPRESSION_BITS_PER_INDEX_6 = 1.05
 COMPRESSION_GROWTH_PER_PIECE = 0.20  # 7 pieces: 1.25; extrapolate beyond seven.
 
-# Bound the largest working pair by two largest-table arrays, 2 bytes/index each.
-# Overhead is a rough allowance for cache, encoders and other working memory;
-# increase it for larger cache budgets or thread counts. Jobs run serially.
-# This provisioning heuristic includes headroom, unlike scaling.md's array sizes.
-MEMORY_OVERHEAD_GIB = 2
-MEMORY_ROUNDING_GIB = 32
 
 FIELDS = (
     "path", "table_count", "available_tables", "index_range",
     "unique_positions", "win", "draw", "loss", "size_gib",
-    "estimated_final_size_gib", "estimated_total_core_hours", "estimated_memory_gib",
+    "estimated_final_size_gib", "estimated_total_core_hours", *MEMORY_FIELDS,
 )
 
 
@@ -83,32 +79,34 @@ def leaf_row(root, leaf):
         known_bytes = sum(record["bytes"] for record in complete)
         missing_indexes = sum(record["index_range"] for record in records if record["bytes"] is None)
         core_us = CORE_US_PER_INDEX * COMPUTE_GROWTH_PER_PIECE ** (pieces - REFERENCE_PIECES)
-        working_bytes = 4 * max(record["index_range"] for record in records)
-        memory_bytes = working_bytes + MEMORY_OVERHEAD_GIB * 2**30
-        rounding_bytes = MEMORY_ROUNDING_GIB * 2**30
         row.update({
             "estimated_final_size_gib": decimal((known_bytes + missing_indexes * bits_per_index / 8) / 2**30),
             "estimated_total_core_hours": decimal(index_range * core_us / (3_600_000_000 * PARALLEL_EFFICIENCY)),
-            "estimated_memory_gib": ((memory_bytes + rounding_bytes - 1) // rounding_bytes) * MEMORY_ROUNDING_GIB,
         })
     return row
 
 
-def collect_rows(root):
+def collect_rows(root, executable="chess-egt"):
     leaves = leaf_directories(root)
     if not leaves:
         raise ValueError(f"{root}: no cached leaves; run --cache-stats for the desired scope")
-    return [leaf_row(root, leaf) for leaf in leaves]
+    rows = [leaf_row(root, leaf) for leaf in leaves]
+    estimates = memory_estimates([row["path"] for row in rows], executable)
+    for leaf, row in zip(leaves, rows):
+        row.update(memory_columns(estimates, [record["tablename"] for record in table_records(leaf)]))
+    return rows
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="Local tablebase root prepared with --cache-stats")
     parser.add_argument("output", type=Path, help="CSV output file")
+    parser.add_argument("--chess-egt", default="chess-egt",
+                        help="Executable for theoretical memory estimates (default: chess-egt on PATH)")
     args = parser.parse_args()
     try:
         root = validate_root(args.root)
-        rows = collect_rows(root)
+        rows = collect_rows(root, args.chess_egt)
         write_csv(root, args.output, FIELDS, rows)
     except (OSError, ValueError) as error:
         parser.exit(1, f"error: {error}\n")

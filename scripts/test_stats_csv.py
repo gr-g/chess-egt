@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import export_summary_stats as leaf_stats
 import export_table_stats as table_stats
@@ -27,6 +28,12 @@ class StatsCsvTests(unittest.TestCase):
         self.root = self.base / "tables"
         self.root.mkdir()
         self.put_json(self.root / "format.json", {"format": "ggegt-v0.12"})
+        self.estimates = {}
+        self.memory_queries = []
+        for module in (table_stats, leaf_stats):
+            mocked = patch.object(module, "memory_estimates", side_effect=lambda *args: self.estimates)
+            self.memory_queries.append(mocked.start())
+            self.addCleanup(mocked.stop)
 
     def put_json(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +64,7 @@ class StatsCsvTests(unittest.TestCase):
         leaf.mkdir(parents=True, exist_ok=True)
         for record in records:
             self.put_json(leaf / (record["tablename"] + ".json"), record)
+            self.estimates[record["tablename"]] = (4 * record["index_range"], 7 * record["index_range"])
         complete = [record for record in records if record["bytes"] is not None]
         stats = {
             "selected_tables": len(records),
@@ -83,11 +91,13 @@ class StatsCsvTests(unittest.TestCase):
             "name": "KQ_K", "index_range": GIB, "unique_positions": MIB,
             "win": MIB // 2, "draw": MIB // 2, "loss": 0,
             "size_mib": "1.000000", "compression_bits_per_pos": "8.000000",
+            "estimated_generation_memory_gib": "4.000000",
+            "estimated_verification_memory_gib": "7.000000",
         }])
         # Dividing by index_range instead would give 0.007812 bits/position.
         self.assertNotEqual(rows[0]["compression_bits_per_pos"], "0.007812")
 
-    def test_complete_leaf_has_actual_totals_and_no_estimates(self):
+    def test_complete_leaf_has_actual_totals_and_memory_estimates(self):
         self.make_leaf([
             self.complete("KQ_K", 3 * GIB, 30, GIB),
             self.complete("KR_K", GIB, 10, GIB // 2),
@@ -97,6 +107,8 @@ class StatsCsvTests(unittest.TestCase):
             "available_tables": 2, "index_range": 4 * GIB,
             "unique_positions": 40, "win": 20, "draw": 20, "loss": 0,
             "size_gib": "1.500000",
+            "estimated_generation_memory_gib": "12.000000",
+            "estimated_verification_memory_gib": "21.000000",
         }])
 
     def test_mixed_leaf_adds_known_bytes_to_estimated_missing_indexes(self):
@@ -146,24 +158,23 @@ class StatsCsvTests(unittest.TestCase):
                 self.assertAlmostEqual(float(row["estimated_total_core_hours"]),
                                        core_hours, delta=core_hours * 0.002)
 
-    def test_memory_rounds_up_at_32_gib_boundary(self):
-        # Four bytes/index plus 2 GiB overhead is exactly 32 GiB here.
-        boundary = 30 * GIB // 4
-        for offset, expected in ((-1, 32), (0, 32), (1, 64)):
-            with self.subTest(offset=offset):
-                leaf, _ = self.make_leaf([
-                    self.placeholder(index_range=boundary + offset),
-                ])
-                self.assertEqual(leaf_stats.leaf_row(self.root, leaf)
-                                 ["estimated_memory_gib"], expected)
+    def test_memory_has_no_provisioning_rounding_or_overhead(self):
+        self.make_leaf([self.placeholder()])
+        self.estimates["KR_K"] = (32 * GIB + 1024, 7 * GIB + 1024)
+        row = leaf_stats.collect_rows(self.root)[0]
+        self.assertEqual(row["estimated_generation_memory_gib"], "32.000001")
+        self.assertEqual(row["estimated_verification_memory_gib"], "7.000001")
 
-    def test_memory_uses_largest_table_including_completed_tables(self):
-        leaf, _ = self.make_leaf([
+    def test_memory_maxima_are_independent_and_include_completed_tables(self):
+        self.make_leaf([
             self.complete(index_range=8 * GIB),
             self.placeholder(index_range=GIB),
         ])
-        self.assertEqual(leaf_stats.leaf_row(self.root, leaf)
-                         ["estimated_memory_gib"], 64)
+        self.estimates.update({"KQ_K": (32 * GIB, GIB), "KR_K": (4 * GIB, 40 * GIB)})
+        row = leaf_stats.collect_rows(self.root)[0]
+        self.assertEqual(row["estimated_generation_memory_gib"], "32.000000")
+        self.assertEqual(row["estimated_verification_memory_gib"], "40.000000")
+        self.memory_queries[1].assert_called_once_with([row["path"]], "chess-egt")
 
     def test_zero_unique_positions_have_blank_csv_compression(self):
         self.make_leaf([self.complete(unique_positions=0, size=123)])
@@ -185,8 +196,7 @@ class StatsCsvTests(unittest.TestCase):
         fields, rows = self.read_csv(output)
         self.assertEqual(fields, list(leaf_stats.FIELDS))
         self.assertEqual(len(rows), 2)
-        for key in ("estimated_final_size_gib", "estimated_total_core_hours",
-                    "estimated_memory_gib"):
+        for key in ("estimated_final_size_gib", "estimated_total_core_hours"):
             self.assertEqual(rows[0][key], "")
             self.assertNotEqual(rows[1][key], "")
         for key in ("unique_positions", "win", "draw", "loss", "size_gib"):
@@ -361,9 +371,34 @@ class StatsCsvTests(unittest.TestCase):
             stats_csv.write_csv(self.root, path, table_stats.FIELDS, [])
         self.assertEqual(path.read_bytes(), original)
 
+    def fake_executable(self):
+        executable = self.base / "fake-chess-egt"
+        records = [{"tablename": name, "generation_bytes": sizes[0], "verification_bytes": sizes[1]}
+                   for name, sizes in self.estimates.items()]
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\nassert sys.argv[1] == '--memory-estimates'\n"
+            f"print({json.dumps(records)!r})\n", encoding="utf-8")
+        executable.chmod(0o755)
+        return executable
+
+    def test_memory_command_parses_json_and_reports_failures(self):
+        self.estimates["K_K"] = (924, 924)
+        self.assertEqual(stats_csv.memory_estimates(["2/"], self.fake_executable()), self.estimates)
+        with patch("stats_csv.subprocess.run") as run:
+            for response in ("{}", "[{}]", '[{"tablename":"K_K","generation_bytes":true}]'):
+                run.return_value.stdout = response
+                with self.assertRaises(ValueError):
+                    stats_csv.memory_estimates(["2/"])
+            run.side_effect = subprocess.CalledProcessError(1, "chess-egt", stderr="bad selector")
+            with self.assertRaisesRegex(ValueError, "bad selector"):
+                stats_csv.memory_estimates(["2/"])
+        with self.assertRaisesRegex(ValueError, "missing memory estimate for K_K"):
+            stats_csv.memory_columns({}, ["K_K"])
+
     def run_cli(self, script, output):
         return subprocess.run(
-            [sys.executable, str(SCRIPTS / script), str(self.root), str(output)],
+            [sys.executable, str(SCRIPTS / script), str(self.root), str(output),
+             "--chess-egt", str(self.fake_executable())],
             cwd=self.base, capture_output=True, text=True, timeout=10,
         )
 

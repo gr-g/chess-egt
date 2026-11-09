@@ -2,10 +2,11 @@
 
 import csv
 import json
-
 import re
+import subprocess
 
 
+MEMORY_FIELDS = ("estimated_generation_memory_gib", "estimated_verification_memory_gib")
 LEAF_PATH = re.compile(r"[2-9][0-9]*/[0-9]+v[0-9]+/op[0-9]+/[0-9]+pawns")
 OUTCOME_FIELDS = ("unique_positions", "win", "draw", "loss", "bytes")
 
@@ -73,6 +74,45 @@ def write_csv(root, output, fields, rows):
         writer = csv.DictWriter(destination, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def memory_estimates(selectors, executable="chess-egt"):
+    if not selectors:
+        return {}
+    try:
+        result = subprocess.run(
+            [str(executable), "--memory-estimates", *selectors],
+            check=True, capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f"{executable}: memory estimates failed: {error.stderr.strip()}") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"{executable}: memory estimates timed out after 300 seconds") from error
+    try:
+        records = json.loads(result.stdout)
+    except ValueError as error:
+        raise ValueError(f"{executable}: invalid memory estimates JSON") from error
+    if not isinstance(records, list):
+        raise ValueError(f"{executable}: expected a memory estimates array")
+    estimates = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("tablename"), str):
+            raise ValueError(f"{executable}: invalid memory estimate record")
+        name = record["tablename"]
+        if name in estimates:
+            raise ValueError(f"{executable}: duplicate memory estimate for {name}")
+        estimates[name] = tuple(count(record, key, executable, positive=True)
+                                for key in ("generation_bytes", "verification_bytes"))
+    return estimates
+
+
+def memory_columns(estimates, names):
+    try:
+        sizes = [estimates[name] for name in names]
+    except KeyError as error:
+        raise ValueError(f"missing memory estimate for {error.args[0]}") from error
+    return {field: decimal(max(size[i] for size in sizes) / 2**30)
+            for i, field in enumerate(MEMORY_FIELDS)}
 
 
 def decimal(value):

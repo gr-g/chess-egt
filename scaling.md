@@ -1,8 +1,8 @@
 # Tablebase scaling and cloud costs
 
-Resource estimates for generating and storing `chess-egt` depth-to-conversion
-(DTC) tables. Three-, four-, and five-piece results are measured; larger sets
-are projections.
+Resource estimates for generating, verifying, and storing `chess-egt`
+depth-to-conversion (DTC) tables. Three-, four-, and five-piece results are
+measured; larger sets are projections.
 
 ## 1. Problem size
 
@@ -13,23 +13,26 @@ count valid, nonredundant positions after symmetry reduction. Generation work
 scales with index positions; reported compression in bits per position uses
 unique positions unless explicitly stated otherwise.
 
-| Pieces | Table files | Twin-pair jobs | Index positions | Largest working job |
-|---|---:|---:|---:|---:|
-| 3 | 16 | 8 | 416,640 | 0.11 MB |
-| 4 | 176 | 96 | 155,965,898 | 6.99 MB |
-| 5 | 1,496 | 748 | 35,268,305,340 | 0.42 GB |
-| 6 | 10,526 | 5,338 | 5,606,162,736,600 | 24.7 GB |
-| 7 | 63,784 | 31,892 | 679,345,381,690,216 | 1.44 TB |
+| Pieces | Table files | Twin-pair jobs | Index positions | Max generation memory | Max verification memory |
+|---|---:|---:|---:|---:|---:|
+| 3 | 16 | 8 | 416,640 | 0.11 MB | 0.28 MB |
+| 4 | 176 | 96 | 155,965,898 | 6.99 MB | 23.1 MB |
+| 5 | 1,496 | 748 | 35,268,305,340 | 0.42 GB | 1.41 GB |
+| 6 | 10,526 | 5,338 | 5,606,162,736,600 | 24.7 GB | 84.8 GB |
+| 7 | 63,784 | 31,892 | 679,345,381,690,216 | 1.44 TB | 5.01 TB |
 
 ### Working memory
 
-Generation stores a 16-bit value per index slot in each active table. For a
-pair with `N` slots per side, the working arrays therefore occupy `4N` bytes.
-These figures exclude eagerly loaded dependency tables, block summaries,
-compression buffers, and other process overhead. A self-twin has only one
-working array.
+Target streaming model (not yet implemented): generation allocates the working
+arrays and streams the required dependencies; verification allocates the
+dependencies and streams the table to verify. With `mem(X) = 2 × index_range(X)`
+bytes:
 
-Worst-case pairs, with all non-king pieces distinct:
+```text
+generation(X)   = sum(mem(T) for T in {X, twin(X)})
+verification(X) = sum(mem(T) for T in {twin(X)} ∪ dependencies(X))
+```
+Worst-case generation pairs, with all non-king pieces distinct:
 
 | Pieces | Pawnless pair | One-pawn pair, fixed file | One pawn-rank slice |
 |---|---:|---:|---:|
@@ -39,11 +42,9 @@ Worst-case pairs, with all non-king pieces distinct:
 | 8 | 81.8 TB | 66.9 TB | 11.2 TB |
 
 Seven-piece jobs have a heavy-tailed size distribution: the median job needs
-about 1.06 GB of working arrays, but the position-weighted median needs
-587 GB. A job such as `KRRPb_KQB` has 146.76 billion slots per side and
-587 GB of arrays. By index-position weight, about 35% of seven-piece work is
-in jobs up to 300 GB, 31% in jobs from 300 to 700 GB, and 34% above 700 GB.
-All six-piece jobs fit below 25 GB of working arrays.
+about 1.06 GB of working arrays, but a job such as `KRRPb_KQB` has 146.76
+billion slots per side and 587 GB of arrays. All six-piece jobs fit below 25
+GB of working arrays.
 
 ## 2. Measured generation performance
 
@@ -57,12 +58,7 @@ threads and verification disabled (`--threads=2 --noverify`):
 | 5 | 35,268,305,340 | 6 h 17 m 06 s | 12.57 | 1.28 µs |
 
 Allocated core-hours are wall time multiplied by worker threads. Performance
-is allocated core-µs/index: `wall_seconds × worker_threads × 1e6 /
-sum(index_range)`.
-
-Generation timing includes dependency loading, table publishing, and optional
-verification. The scaling baselines here are generation-only runs with
-`--noverify`, so verification is excluded.
+is allocated core-µs/index: `wall_seconds × worker_threads × 1e6 / sum(index_range)`.
 
 From four to five pieces, index positions grow 226× and generation time grows
 233×: the cost per index position rises only 1.03×.
@@ -71,95 +67,35 @@ Measured compressed sizes are listed in Section 4. The five-piece set occupies
 3,578.66 MiB, averaging 1.16 bits per unique position, or 0.849 bits per
 index position.
 
-## 3. Compute projections and EC2 costs
+## 3. Compute projections and costs
 
-### Model
+Use `c = 1.28 µs/index` from the five-piece measurement, per-position growth
+`g = 1.0–1.8` per additional piece (central `1.4`), and parallel efficiency
+`η = 0.70`. Treat each vCPU as one reference-equivalent worker; actual CPU
+and SMT performance may differ. These are planning assumptions, not benchmarks.
 
-Use the five-piece measurement as the reference: `c = 1.28 µs` of allocated
-core time per index position. For six and seven pieces, assume:
-
-- **Per-position growth:** a factor `g = 1.0–1.8` per additional piece,
-  with central value `1.4`. More moves and deeper, low-yield scans can increase
-  the cost. The measured four-to-five-piece growth is much smaller; this
-  wider range is a conservative assumption, not a measured scaling law.
-- **Parallel efficiency:** `η = 0.70` relative to the two-thread reference.
-  This is an additional allowance for scaling to many cores.
-- **Relative per-core speed:** Zen 4 = `1.0`, Zen 5 = `1.15`, and
-  Graviton4 = `0.75`, relative to the reference core. These are assumptions,
-  not cross-platform benchmarks. The listed AMD and Graviton instances have
-  one physical core per vCPU.
-
-For `N` index positions and `n` pieces:
+For `N` index positions and `n` pieces, with `c` in seconds:
 
 ```text
-allocated reference-equivalent core-hours H = N × c × g^(n − 5) / (3,600 × η)
-wall hours on P cores of relative speed s  = H / (P × s)
-EC2 cost                                  = wall hours × instance price/hour
+allocated core-hours H = N × c × g^(n − 5) / (3,600 × η)
+wall hours            = H / total_vCPUs
+compute cost          = H × instance_price_per_hour / instance_vCPUs
 ```
 
-Here `c` is in seconds. Applying the 70% efficiency allowance gives:
+Assume **$1–2/hour per 32-vCPU instance** or **$6–18/hour per 192-vCPU
+instance**. Combining runtime and price ranges gives:
 
-| Set | Reference-equivalent core-hours | Central scenario |
-|---|---:|---:|
-| 6-piece | 2,800–5,200 | 4,000 |
-| 7-piece | 350,000–1,100,000 | 675,000 |
+| Set | Allocated core-hours (central) | Cost using 32-vCPU instances | Cost using 192-vCPU instances |
+|---|---:|---:|---:|
+| 6-piece | 2,800–5,200 (4,000) | $90–320 | $90–480 |
+| 7-piece | 350,000–1,100,000 (675,000) | $11k–70k | $11k–105k |
 
-The measured five-piece total is 12.57 core-hours before this additional
-large-machine efficiency allowance.
+Costs cover generation only, excluding verification, idle time, interruption
+losses, storage, and transfers. Prices do not guarantee sufficient RAM: use
+Section 1's separate generation/verification estimates plus overhead, under
+the target streaming model.
 
-### Instance prices and memory tiers
-
-Price snapshot: **2026-10-17, AWS `us-east-1`, Linux**. S3 rates are from the
-AWS Price List API; EC2 on-demand and spot rates are from
-[instances.vantage.sh](https://instances.vantage.sh/). These are dated planning
-inputs, not live quotes. Spot prices and capacity availability fluctuate.
-
-| Instance | vCPUs | Memory | On-demand / hour | Spot / hour |
-|---|---:|---:|---:|---:|
-| `c8a.48xlarge` (Zen 5) | 192 | 384 GiB | $10.35 | $4.88 |
-| `c7a.48xlarge` (Zen 4) | 192 | 384 GiB | $9.85 | $3.56 |
-| `hpc7a.96xlarge` (Zen 4) | 192 | 768 GiB | $9.08 | — |
-| `c8g.48xlarge` (Graviton4) | 192 | 384 GiB | $7.66 | $2.61 |
-| `m8g.48xlarge` (Graviton4) | 192 | 768 GiB | $8.62 | $3.84 |
-| `r8g.48xlarge` (Graviton4) | 192 | 1.5 TiB | $11.31 | $3.23 |
-| `x8g.48xlarge` (Graviton4) | 192 | 3 TiB | $18.76 | $4.59 |
-
-`hpc7a` offers a lower on-demand core-hour price and more RAM per core, but
-has limited regional availability. Concurrent jobs must be sized using working
-arrays plus all loaded dependencies and overhead, not the array table alone.
-
-### Generation time and compute bill
-
-Except for the explicitly measured five-piece row, these are conditional
-scenarios using the model above, not measured cloud runs. Individual
-seven-piece rows cover both files in the pair. Fleet rows assume
-balanced scheduling of independent, dependency-ready jobs; the EC2 estimates
-exclude verification, idle dependency waits, storage, and transfer charges.
-
-| Target | Fleet | Modeled wall time | On-demand | Spot |
-|---|---|---:|---:|---:|
-| All 5-piece (measured) | Genoa guest, 32 SMT vCPUs | 32 m 47 s | — | — |
-| All 6-piece | 2 × `hpc7a.96xlarge`; spot alternative: 2 × `c7a.48xlarge` | 12–19 h | $210–340 | $85–135 |
-| Representative 587 GB 7-piece pair (`KRRPb_KQB`) | 192 Graviton4-equivalent workers; RAM sizing unresolved | 2.4–6.3 h | — | — |
-| Heavy one-pawn 7-piece pair (`KRPa_KQBN`, 1.17 TB arrays) | >3.35 TiB RAM required; no priced configuration | — | — | — |
-| Largest pawnless 7-piece pair (`KN_KQRBN`, 1.44 TB) | 1 × `x8g.48xlarge` | 6.0–15.3 h | $112–287 | $27–70 |
-| All 7-piece | 9,600 Graviton4-equivalent workers; RAM sizing unresolved | 4.7–12.2 days | — | — |
-
-The all-seven-piece time includes the assumed `0.75` Graviton4 speed factor.
-It is a throughput estimate, not a calendar-time guarantee: capture and
-promotion dependencies constrain job order, and a long tail of heavy jobs
-can leave much of a fleet idle. Instances must be released or reassigned when
-there is insufficient work; keeping idle capacity increases the bill.
-Likewise, scaling one job to 192 threads is an assumption, not established by
-the two-thread measurements. Dependency-cache and compression memory must fit
-alongside every concurrent job.
-
-Spot figures exclude interruption losses. An interrupted job must either be
-restarted or resumed from a consistent checkpoint; replaying counter updates
-can corrupt results because decrements are not idempotent. Without such
-recovery, frequent interruptions can make the quoted spot savings unrealistic.
-
-## 4. Compressed storage and S3 costs
+## 4. Compressed storage and costs
 
 Measured compression for complete three-, four-, and five-piece sets:
 
@@ -175,30 +111,14 @@ measurement is 0.849 bits per index position. Projected sizes use
 `index_positions × bits_per_index_position / 8`; unique-position counts for
 these larger sets are not needed.
 
-Monthly storage-only costs, using the same dated AWS price snapshot:
+Assume **$0.01–0.02 per GiB-month** for storage:
 
-| Set | Compressed size | S3 Standard | Standard-IA | Glacier Instant Retrieval | Deep Archive |
-|---|---:|---:|---:|---:|---:|
-| 5-piece (measured size) | 3.495 GiB | $0.08 | $0.04 | $0.014 | $0.0035 |
-| 6-piece (projected) | 0.58–0.77 TiB | $14–18 | $7–10 | $2–3 | < $1 |
-| 7-piece (projected) | 78–116 TiB | $1,800–2,700 | $990–1,490 | $320–480 | $79–118 |
+| Set | Compressed size | Monthly storage cost |
+|---|---:|---:|
+| 5-piece (measured size) | 3.495 GiB | $0.03–0.07 |
+| 6-piece (projected) | 0.57–0.77 TiB | $6–16 |
+| 7-piece (projected) | 77–116 TiB | $790–2,400 |
 
-Rates per GiB-month: Standard $0.023 for the first 50 TiB and $0.022 for the
-next tier; Standard-IA $0.0125; Glacier Instant Retrieval $0.004; Deep Archive
-$0.00099. Sizes cover compressed table files, not JSON statistics, checkpoints,
-scratch space, or extra copies. Lower-piece dependencies are additional,
-although small relative to a complete larger set.
-
-Storage class matters beyond the quoted capacity price:
-
-- Standard-IA and Glacier classes add retrieval charges, minimum storage
-  durations, and minimum billable sizes or metadata overhead. Frequent random
-  probing can make retrieval and request costs significant.
-- Deep Archive requires restoration and is unsuitable for interactive serving.
-- EC2–S3 transfers in the same region have no data-transfer charge, but S3
-  requests, retrievals, and some network paths (such as NAT gateways) can cost
-  extra.
-- At roughly $0.09 per GB of internet egress, a full seven-piece download is
-  on the order of **$7k–11k**, before volume discounts and free allowances.
-  Public distribution can therefore cost much more than storage. Requester
-  Pays or AWS Open Data sponsorship may be appropriate.
+Costs cover compressed table files only. Metadata, lower-piece dependencies,
+checkpoints, scratch space, extra copies, requests, retrievals, and data transfer
+are additional; public distribution can cost more than storage.

@@ -63,12 +63,16 @@ cargo run --release -- --stats 4/
 
 # Store summary statistics for groups of tables for faster retrieval.
 cargo run --release -- --cache-stats 2/ 3/ 4/ 5/
+
+# Report theoretical generation/verification memory requirements.
+cargo run --release -- --memory-estimates 6/ 7/
 ```
 
 For S3 access, configure credentials through environment variables using the
 conventions supported by [`object_store`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env).
 
-`--generate`, `--verify`, `--stats`, `--cache-stats`, and `--list` each accept
+`--generate`, `--verify`, `--stats`, `--cache-stats`, `--list`, and
+`--memory-estimates` each accept
 multiple `SELECTOR`s as arguments, in the following forms:
 
 - **Exact names**, e.g. `KPa_K`: a table identified by its canonical name (see
@@ -95,8 +99,8 @@ cargo test
 Two Python scripts are available to export statistics from a current tablebase.
 ```sh
 cargo run --release -- --path ROOT --cache-stats 3/ 4/ 5/ 6/
-python3 scripts/export_table_stats.py ROOT table_stats.csv
-python3 scripts/export_summary_stats.py ROOT summary_stats.csv
+python3 scripts/export_table_stats.py ROOT table_stats.csv --chess-egt ./target/release/chess-egt
+python3 scripts/export_summary_stats.py ROOT summary_stats.csv --chess-egt ./target/release/chess-egt
 ```
 
 ### API server

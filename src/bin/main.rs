@@ -1,6 +1,6 @@
 use chess_egt::{
     ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics, EgtVerifier,
-    resolve_selectors,
+    memory_estimates, resolve_selectors,
 };
 use clap::Parser;
 use shakmaty::fen::Fen;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[command(name = "chess-egt")]
 #[command(about = "Chess Endgame Tablebase Tool", long_about = None)]
 #[command(group(clap::ArgGroup::new("action")
-    .args(["generate", "verify", "stats", "cache_stats", "list", "position"])
+    .args(["generate", "verify", "stats", "cache_stats", "list", "memory_estimates", "position"])
     .multiple(false)))]
 struct Cli {
     #[arg(long, default_value = "./ggegt")]
@@ -19,7 +19,7 @@ struct Cli {
 
     /// Additional path used to look up dependency tables, in addition to --path.
     /// If not given, --path is used for dependencies as well.
-    #[arg(long, conflicts_with_all = ["stats", "cache_stats"])]
+    #[arg(long, conflicts_with_all = ["stats", "cache_stats", "memory_estimates"])]
     input_path: Option<PathBuf>,
 
     /// Number of generation and verification workers (0 uses Rayon's default).
@@ -46,8 +46,12 @@ struct Cli {
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     list: Vec<String>,
 
+    /// Print theoretical streaming memory estimates for the selected tables as JSON.
+    #[arg(long, value_name = "SELECTOR", num_args = 1..)]
+    memory_estimates: Vec<String>,
+
     /// Skip the internal consistency check performed after generation.
-    #[arg(long, requires = "generate", conflicts_with_all = ["verify", "stats", "cache_stats", "list", "position"])]
+    #[arg(long, requires = "generate", conflicts_with_all = ["verify", "stats", "cache_stats", "list", "memory_estimates", "position"])]
     noverify: bool,
 
     /// Probe a quoted FEN position (mutually exclusive with selector actions).
@@ -70,6 +74,9 @@ fn run() -> Result<(), EgtError> {
         for id in resolve_selectors(&selectors)? {
             println!("{}", id.tablename());
         }
+    } else if !cli.memory_estimates.is_empty() {
+        let selectors: Vec<_> = cli.memory_estimates.iter().map(String::as_str).collect();
+        println!("{}", serde_json::to_string_pretty(&memory_estimates(&selectors)?)?);
     } else if !cli.generate.is_empty() {
         let selectors: Vec<_> = cli.generate.iter().map(String::as_str).collect();
         let mut generator = EgtGenerator::new(&cli.path)?;
@@ -148,12 +155,13 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
-    const ACTIONS: [&str; 5] = [
+    const ACTIONS: [&str; 6] = [
         "--generate",
         "--verify",
         "--stats",
         "--cache-stats",
         "--list",
+        "--memory-estimates",
     ];
     const FEN: &str = "8/8/8/8/8/8/3K4/k7 w - - 0 1";
 
@@ -186,6 +194,7 @@ mod tests {
                 "--stats" => cli.stats,
                 "--cache-stats" => cli.cache_stats,
                 "--list" => cli.list,
+                "--memory-estimates" => cli.memory_estimates,
                 _ => unreachable!(),
             };
             assert_eq!(selectors, ["3", "4"]);
@@ -215,8 +224,8 @@ mod tests {
     }
 
     #[test]
-    fn statistics_actions_reject_input_overlays() {
-        for action in ["--stats", "--cache-stats"] {
+    fn metadata_actions_reject_input_overlays() {
+        for action in ["--stats", "--cache-stats", "--memory-estimates"] {
             let error = Cli::try_parse_from(["chess-egt", action, "3", "--input-path", "other"])
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
