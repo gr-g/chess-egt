@@ -1,6 +1,6 @@
 use chess_egt::{
-    AggregateStats, ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics,
-    EgtVerifier, resolve_selectors,
+    ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics, EgtVerifier,
+    resolve_selectors,
 };
 use clap::Parser;
 use shakmaty::fen::Fen;
@@ -74,26 +74,7 @@ fn run() -> Result<(), EgtError> {
         let selectors: Vec<_> = cli.generate.iter().map(String::as_str).collect();
         let mut generator = EgtGenerator::new(&cli.path)?;
         configure_generator(&mut generator, &cli)?;
-        let start = std::time::Instant::now();
-        let tables = generator.generate_selected(&selectors)?;
-        let mut total = AggregateStats::default();
-        for stats in &tables {
-            total.add(stats);
-        }
-        let lowest_compression = tables
-            .iter()
-            .filter(|stats| stats.unique_positions > 0)
-            .map(|stats| {
-                (
-                    stats.tablename.as_str(),
-                    stats.bytes as f64 * 8.0 / stats.unique_positions as f64,
-                )
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        println!(
-            "{}",
-            generation_summary(&total, start.elapsed(), lowest_compression)
-        );
+        generator.generate_selected(&selectors)?;
     } else if !cli.verify.is_empty() {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
         let mut verifier = EgtVerifier::new(&cli.path)?;
@@ -143,39 +124,6 @@ fn format_outcome(outcome: DtcOutcome) -> String {
     };
     let unit = if plies == 1 { "ply" } else { "plies" };
     format!("{result} - {conversion}, DTC {plies} {unit}")
-}
-
-fn generation_summary(
-    total: &AggregateStats,
-    elapsed: std::time::Duration,
-    lowest_compression: Option<(&str, f64)>,
-) -> String {
-    let seconds = elapsed.as_secs();
-    let unique_positions = total
-        .unique_positions
-        .expect("generation statistics are complete");
-    let bytes = total.bytes.expect("generation statistics are complete");
-    let average_compression = if unique_positions > 0 {
-        bytes as f64 * 8.0 / unique_positions as f64
-    } else {
-        0.0
-    };
-    let mut summary = format!(
-        "Generated {} tables: {} unique positions, {:.2} MiB in {:02}h{:02}m{:02}s.\nAverage compression: {:.2} bits/pos.",
-        total.available_tables,
-        unique_positions,
-        bytes as f64 / (1024.0 * 1024.0),
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60,
-        average_compression,
-    );
-    if let Some((tablename, bits_per_pos)) = lowest_compression {
-        summary.push_str(&format!(
-            " Lowest compression ({tablename}): {bits_per_pos:.2} bits/pos."
-        ));
-    }
-    summary
 }
 
 fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
@@ -274,25 +222,6 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
             assert!(Cli::try_parse_from(["chess-egt", action, "3", "--noverify"]).is_err());
         }
-    }
-
-    #[test]
-    fn generation_summary_uses_complete_statistics() {
-        let total = AggregateStats {
-            selected_tables: 2,
-            available_tables: 2,
-            bytes: Some(1024 * 1024),
-            unique_positions: Some(4 * 1024 * 1024),
-            ..Default::default()
-        };
-        assert_eq!(
-            generation_summary(
-                &total,
-                std::time::Duration::from_secs(65),
-                Some(("KQ_K", 3.0))
-            ),
-            "Generated 2 tables: 4194304 unique positions, 1.00 MiB in 00h01m05s.\nAverage compression: 2.00 bits/pos. Lowest compression (KQ_K): 3.00 bits/pos."
-        );
     }
 
     #[test]

@@ -47,6 +47,27 @@ pub struct EgtStats {
     pub longest_dtc_loss: Vec<LongestDtcPosition>,
 }
 
+/// Formats wall time and allocated core time per index slot.
+pub(crate) fn format_timing(
+    elapsed: std::time::Duration,
+    index_range: usize,
+    threads: usize,
+) -> String {
+    let seconds = elapsed.as_secs();
+    let core_us_per_index = if index_range > 0 {
+        elapsed.as_secs_f64() * threads as f64 * 1_000_000.0 / index_range as f64
+    } else {
+        0.0
+    };
+    let unit = if threads == 1 { "thread" } else { "threads" };
+    format!(
+        "{:02}h:{:02}m:{:02}s ({core_us_per_index:.2} μs/index on {threads} {unit})",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+    )
+}
+
 /// Unit fields accept only explicit JSON nulls, keeping placeholders all-or-nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

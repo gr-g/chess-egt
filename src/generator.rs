@@ -3,11 +3,12 @@ mod solver;
 
 use std::path::Path;
 
+use crate::AggregateStats;
 use crate::egt_file::BatchReader;
+use crate::stats::format_timing;
 use crate::storage::Location;
 use crate::{
-    EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, resolve_selectors,
-    verification,
+    EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, resolve_selectors, verification,
 };
 
 /// Generates one pair at a time with eagerly loaded conversion dependencies.
@@ -74,6 +75,7 @@ impl EgtGenerator {
     /// Completed pairs are published and optionally verified before releasing
     /// their loaded tables and starting the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
+        let start = std::time::Instant::now();
         let plan = GenerationPlan::new(resolve_selectors(selectors)?);
         self.base_path.ensure_format()?;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -99,7 +101,8 @@ impl EgtGenerator {
                     BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
                 println!(
                     "{}: loading {} bytes of dependencies...",
-                    pair.table.tablename(), reader.resident_bytes(),
+                    pair.table.tablename(),
+                    reader.resident_bytes(),
                 );
                 reader.load()?;
                 let dependency_time = start.elapsed();
@@ -127,7 +130,91 @@ impl EgtGenerator {
             }
             Ok(())
         })?;
+        let mut total = AggregateStats::default();
+        for stats in &results {
+            total.add(stats);
+        }
+        let lowest_compression = results
+            .iter()
+            .filter(|stats| stats.unique_positions > 0)
+            .map(|stats| {
+                (
+                    stats.tablename.as_str(),
+                    stats.bytes as f64 * 8.0 / stats.unique_positions as f64,
+                )
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        println!(
+            "{}",
+            generation_summary(
+                &total,
+                start.elapsed(),
+                pool.current_num_threads(),
+                lowest_compression
+            )
+        );
         Ok(results)
+    }
+}
+
+fn generation_summary(
+    total: &AggregateStats,
+    elapsed: std::time::Duration,
+    threads: usize,
+    lowest_compression: Option<(&str, f64)>,
+) -> String {
+    let unique_positions = total
+        .unique_positions
+        .expect("generation statistics are complete");
+    let bytes = total.bytes.expect("generation statistics are complete");
+    let average_compression = if unique_positions > 0 {
+        bytes as f64 * 8.0 / unique_positions as f64
+    } else {
+        0.0
+    };
+    let mut summary = format!(
+        "Generated {} tables: {} unique positions, {:.2} MiB in {}.\nAverage compression: {:.2} bits/pos.",
+        total.available_tables,
+        unique_positions,
+        bytes as f64 / (1024.0 * 1024.0),
+        format_timing(elapsed, total.index_range, threads),
+        average_compression,
+    );
+    if let Some((tablename, bits_per_pos)) = lowest_compression {
+        summary.push_str(&format!(
+            " Lowest compression ({tablename}): {bits_per_pos:.2} bits/pos."
+        ));
+    }
+    summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn summaries_use_allocated_core_time_per_index() {
+        let total = AggregateStats {
+            selected_tables: 2,
+            available_tables: 2,
+            bytes: Some(1024 * 1024),
+            index_range: 5_000_000,
+            unique_positions: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        assert_eq!(
+            generation_summary(&total, Duration::from_secs(65), 2, Some(("KQ_K", 3.0))),
+            "Generated 2 tables: 4194304 unique positions, 1.00 MiB in 00h:01m:05s (26.00 μs/index on 2 threads).\nAverage compression: 2.00 bits/pos. Lowest compression (KQ_K): 3.00 bits/pos."
+        );
+        assert_eq!(
+            format_timing(Duration::from_millis(1250), 1_000_000, 1),
+            "00h:00m:01s (1.25 μs/index on 1 thread)"
+        );
+        assert_eq!(
+            format_timing(Duration::from_secs(3661), 0, 4),
+            "01h:01m:01s (0.00 μs/index on 4 threads)"
+        );
     }
 }
 
@@ -159,25 +246,16 @@ pub fn print_pair_stats(
     stats_b: Option<&EgtStats>,
     duration: std::time::Duration,
 ) {
-    let mut unique_positions = stats_a.unique_positions;
+    let mut index_range = stats_a.index_range;
     print_table_stats(stats_a);
 
     if let Some(sb) = stats_b {
-        unique_positions += sb.unique_positions;
+        index_range += sb.index_range;
         print_table_stats(sb);
     }
 
-    let us_per_pos = if unique_positions > 0 {
-        duration.as_micros() as f64 / unique_positions as f64
-    } else {
-        0.0
-    };
-
-    let total_secs = duration.as_secs();
-    let hours = total_secs / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let seconds = total_secs % 60;
-    let format_dur = format!("{:02}h:{:02}m:{:02}s", hours, minutes, seconds);
-
-    println!("Time used {} ({:.2} μs/pos).", format_dur, us_per_pos,);
+    println!(
+        "Time used {}.",
+        format_timing(duration, index_range, rayon::current_num_threads())
+    );
 }

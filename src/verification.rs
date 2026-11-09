@@ -5,6 +5,7 @@ use rayon::prelude::*;
 use shakmaty::{Chess, Color, MoveList, Position};
 
 use crate::egt_file::{BatchReader, load_existing_file};
+use crate::stats::format_timing;
 use crate::storage::Location;
 use crate::table_id::TableId;
 use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, resolve_selectors};
@@ -57,15 +58,25 @@ impl EgtVerifier {
 
     /// Verifies the sorted, deduplicated union of selectors without adding twins.
     pub fn verify_selected(&self, selectors: &[&str]) -> EgtResult<()> {
+        let start = std::time::Instant::now();
         let ids = resolve_selectors(selectors)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
             .build()
             .map_err(|_| EgtError::Internal("failed to build verification thread pool"))?;
-        pool.install(|| self.verify_tables_in_pool(&ids))
+        let (unique_positions, index_range) = pool.install(|| self.verify_tables_in_pool(&ids))?;
+        println!(
+            "Verified {} tables: {} unique positions in {}.",
+            ids.len(),
+            unique_positions,
+            format_timing(start.elapsed(), index_range, pool.current_num_threads())
+        );
+        Ok(())
     }
 
-    fn verify_tables_in_pool(&self, ids: &[TableId]) -> EgtResult<()> {
+    fn verify_tables_in_pool(&self, ids: &[TableId]) -> EgtResult<(usize, usize)> {
+        let mut unique_positions = 0;
+        let mut index_range = 0;
         for id in ids {
             let name = id.tablename();
             let source = load_existing_file(&self.base_path, self.input_path.as_ref(), name)?;
@@ -83,18 +94,20 @@ impl EgtVerifier {
                 reader.resident_bytes()
             );
             reader.load()?;
-            verify_egt(&reader, name, reader.file(name)?.egt())?;
+            let egt = reader.file(name)?.egt();
+            unique_positions += verify_egt(&reader, name, egt)?;
+            index_range += egt.index_range();
             println!(
                 "Successfully verified internal consistency of table {}.",
                 name
             );
         }
-        Ok(())
+        Ok((unique_positions, index_range))
     }
 }
 
-/// Verifies independent blocks of one table using table-local indices.
-pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<()> {
+/// Verifies independent blocks and returns the number of valid, unique positions.
+pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize> {
     let tablename = egt.tablename();
     let local_range = egt.index_range();
 
@@ -113,18 +126,21 @@ pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtR
                 .map(move |start| (start, (start + block_size).min(frame_end)))
         })
         .collect();
-    blocks.into_par_iter().try_for_each(|(start, end)| {
-        verify_block(reader, endgame, egt, start, end)?;
-        let previous = completed.fetch_add(end - start, AtomicOrdering::Relaxed);
-        let done = previous + end - start;
-        if done / 10_000_000 != previous / 10_000_000 {
-            println!(
-                "{}: verified {}/{} indices...",
-                tablename, done, local_range
-            );
-        }
-        Ok(())
-    })
+    blocks
+        .into_par_iter()
+        .map(|(start, end)| {
+            let unique_positions = verify_block(reader, endgame, egt, start, end)?;
+            let previous = completed.fetch_add(end - start, AtomicOrdering::Relaxed);
+            let done = previous + end - start;
+            if done / 10_000_000 != previous / 10_000_000 {
+                println!(
+                    "{}: verified {}/{} indices...",
+                    tablename, done, local_range
+                );
+            }
+            Ok(unique_positions)
+        })
+        .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
 fn verify_block(
@@ -133,7 +149,7 @@ fn verify_block(
     egt: &Egt,
     start: usize,
     end: usize,
-) -> EgtResult<()> {
+) -> EgtResult<usize> {
     let tablename = egt.tablename();
     let outcomes = reader.read_chunk(endgame, start, end)?;
     // Keep the table identity and local index in verification diagnostics.
@@ -143,6 +159,7 @@ fn verify_block(
         reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
     };
 
+    let mut unique_positions = 0;
     for (relative_idx, outcome_maybe) in outcomes.iter().copied().enumerate() {
         let local_idx = start + relative_idx;
         let index = local_idx;
@@ -162,6 +179,13 @@ fn verify_block(
             return Err(fail(local_idx, "index is valid but outcome is invalid"));
         }
 
+        // Verify redundant slots too, but count unique positions as generation does.
+        if !egt
+            .diagonal_symmetric(local_idx)
+            .is_some_and(|other| local_idx > other)
+        {
+            unique_positions += 1;
+        }
         let position = position_opt.ok_or(EgtError::Internal(
             "position_opt should be Some after the None check",
         ))?;
@@ -191,7 +215,7 @@ fn verify_block(
         }
     }
 
-    Ok(())
+    Ok(unique_positions)
 }
 
 /// Computes the best outcome reachable from `position` by playing one of
@@ -257,6 +281,25 @@ fn describe_mismatch(
 mod tests {
     use super::*;
     use crate::TestDir;
+
+    #[test]
+    fn verification_counts_only_source_positions() {
+        let dir = TestDir::new("verify_position_counts");
+        let mut generator = crate::EgtGenerator::new(&dir.0).unwrap();
+        generator.set_threads(2);
+        generator.set_verify(false);
+        generator.generate("K_K").unwrap();
+        let stats = generator.generate("KQ_K").unwrap();
+        let source = stats
+            .iter()
+            .find(|stats| stats.tablename == "KQ_K")
+            .unwrap();
+        let verifier = EgtVerifier::new(&dir.0).unwrap();
+        let counts = verifier
+            .verify_tables_in_pool(&resolve_selectors(&["KQ_K"]).unwrap())
+            .unwrap();
+        assert_eq!(counts, (source.unique_positions, source.index_range));
+    }
 
     #[test]
     fn verification_rejects_invalid_outcomes_and_recovers() {

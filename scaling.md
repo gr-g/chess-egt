@@ -50,14 +50,19 @@ All six-piece jobs fit below 25 GB of working arrays.
 Historical complete generation-only runs on an AMD Ryzen 7 5700G, with two
 threads and verification disabled (`--threads=2 --noverify`):
 
-| Pieces | Index positions | Wall time | Allocated core-hours | Core time / index position |
+| Pieces | Index positions | Wall time | Allocated core-hours | Allocated core-µs/index |
 |---|---:|---:|---:|---:|
 | 3 | 416,640 | < 1 s | — | — |
 | 4 | 155,965,898 | 1 m 37 s | 0.0539 | 1.24 µs |
 | 5 | 35,268,305,340 | 6 h 17 m 06 s | 12.57 | 1.28 µs |
 
-Allocated core-hours are wall time multiplied by the two worker threads, not
-measured CPU utilization.
+Allocated core-hours are wall time multiplied by worker threads. Performance
+is allocated core-µs/index: `wall_seconds × worker_threads × 1e6 /
+sum(index_range)`.
+
+Generation timing includes dependency loading, table publishing, and optional
+verification. The scaling baselines here are generation-only runs with
+`--noverify`, so verification is excluded.
 
 From four to five pieces, index positions grow 226× and generation time grows
 233×: the cost per index position rises only 1.03×.
@@ -97,7 +102,7 @@ Here `c` is in seconds. Applying the 70% efficiency allowance gives:
 | Set | Reference-equivalent core-hours | Central scenario |
 |---|---:|---:|
 | 6-piece | 2,800–5,200 | 4,000 |
-| 7-piece | 350,000–1,100,000 | 725,000 |
+| 7-piece | 350,000–1,100,000 | 675,000 |
 
 The measured five-piece total is 12.57 core-hours before this additional
 large-machine efficiency allowance.
