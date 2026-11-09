@@ -17,10 +17,9 @@
   elegant code, then perhaps it should not be done.
 - Adding one or two focused and compact tests to check functionality is ok.
   Adding hundreds and hundreds of lines of tests is not ok.
-- Update the documentation after a change if appropriate, but always leave
-  AGENTS.md untouched. Do no use documentation as a diary of every change that
-  happened, normally documentation should not mention what the code was doing
-  in the past.
+- Always leave AGENTS.md untouched.
+- Do no use documentation as a diary, it should reflect current status and not
+  mention what the code was doing in the past.
 
 See the design specifications in `README.md` for more information.
 
@@ -32,13 +31,13 @@ Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
 ```
 ```
 == All 4 pieces, 2 threads ==
-Generated 176 tables: 125132316 unique positions, 13.29 MiB in 00h01m37s.
-Average compression: 0.89 bits/pos. Lowest compression (KQ_KR): 3.61 bits/pos.
+Generated 176 tables: 125132316 unique positions, 12.42 MiB in 00h01m34s.
+Average compression: 0.83 bits/pos. Lowest compression (KR_KQ): 3.48 bits/pos.
 ```
 ```
 == All 5 pieces, 2 threads ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 06h17m06s.
-Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
+Generated 1496 tables: 25880730473 unique positions, 3368.41 MiB in 06h05m45s.
+Average compression: 1.09 bits/pos. Lowest compression (KBB_KQ): 4.20 bits/pos.
 ```
 ```
 == All 5 pieces, 32 threads on AMD EPYC-Genoa ==
@@ -49,10 +48,8 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 ## TODO
 - `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
-- Internal module layout; visibility and public interface.
+- Visibility and public interface.
 - Experiment with approach using capture/promotion unmoves for initialization.
-  Perhaps reconsider concurrency in `SharedFileCache` if only useful for
-  validation (collect all dependencies during init?).
 - Frontend, cloning https://syzygy-tables.info/
 - Explore possibility of generating tables that store together DTC and DTM for
   the same index, not only DTC.
@@ -61,14 +58,8 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
   of the update sink. Bounded streaming buffers. Per-phase barriers.
   Checkpoints to object storage.
 - Further optimization ideas:
-  - Align frame size to permutation blocks?
-    (frame_size = (64-n+1) * (64-n+2) * (64-n+3), or twice that)
-    Small experiment between two close sizes (60 * 61 * 62)=226920 vs 229376
-    shows 226920 is a bit better (~1%) even if smaller.
-  - Align summary block size to permutation blocks
-    (block_size = (64-n+1) * (64-n+2)) and fast-forward initialization
-    if after placing n-2 pieces of the first position there is an
-    unblockable check.
+  - Fast-forward initialization if after placing n-2 pieces of the first
+    position in a block there is an unblockable check?
   - Pawn-rank slicing: solve slices of pawnful `Egt`s in dependency order.
     Inject successors in already solved slices at the matching ply.
   - A generation-specific index layout.

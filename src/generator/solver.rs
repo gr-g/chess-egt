@@ -165,9 +165,6 @@ impl WorkingPair {
 }
 
 
-/// Number of positions per summary block.
-const SUMMARY_BLOCK_SIZE: usize = 4096;
-
 #[derive(Clone, Copy)]
 enum SummaryKind {
     Loss,
@@ -194,16 +191,17 @@ struct BlockSummary {
 /// Conservative per-block ply bounds, separated by source kind.
 struct PlySummary {
     size: usize,
+    block_size: usize,
     blocks: Vec<BlockSummary>,
 }
 
 impl PlySummary {
-    fn new(size: usize) -> Self {
-        Self { size, blocks: (0..size.div_ceil(SUMMARY_BLOCK_SIZE)).map(|_| BlockSummary::default()).collect() }
+    fn new(size: usize, block_size: usize) -> Self {
+        Self { size, block_size, blocks: (0..size.div_ceil(block_size)).map(|_| BlockSummary::default()).collect() }
     }
 
     fn record(&self, local_index: usize, kind: SummaryKind, plies: u16) {
-        let last = &self.blocks[local_index / SUMMARY_BLOCK_SIZE].ply_bounds[kind.index()];
+        let last = &self.blocks[local_index / self.block_size].ply_bounds[kind.index()];
         let ply_bound = plies + 1;
         if last.load(Ordering::Relaxed) < ply_bound {
             last.fetch_max(ply_bound, Ordering::Relaxed);
@@ -216,8 +214,8 @@ impl PlySummary {
         self.blocks.iter().enumerate()
             .filter(|(_, block)| block.ply_bounds[kind].load(Ordering::Relaxed) >= ply_bound)
             .map(|(b, _)| {
-                let start = b * SUMMARY_BLOCK_SIZE;
-                (start, (start + SUMMARY_BLOCK_SIZE).min(self.size))
+                let start = b * self.block_size;
+                (start, (start + self.block_size).min(self.size))
             })
             .collect()
     }
@@ -508,11 +506,11 @@ fn initialize_table(
     let (size, pawnless) = (egt.index_range(), egt.is_pawnless());
     debug_assert_eq!(values.len(), size);
     debug_assert_eq!(summary.size, size);
-    values.par_chunks_mut(SUMMARY_BLOCK_SIZE).enumerate().map(|(block, chunk)| {
+    values.par_chunks_mut(summary.block_size).enumerate().map(|(block, chunk)| {
         let mut counts = InitCounts::default();
         let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
-            let idx = block * SUMMARY_BLOCK_SIZE + offset;
+            let idx = block * summary.block_size + offset;
             let position = match egt.position_from_index_with_reason(idx, Color::White)? {
                 Ok(position) => position,
                 Err(reason) => {
@@ -607,7 +605,7 @@ struct TableState {
 impl TableState {
     fn new(egt: Egt) -> Self {
         Self {
-            summary: PlySummary::new(egt.index_range()),
+            summary: PlySummary::new(egt.index_range(), egt.summary_block_size()),
             egt,
             invalid: InvalidCounts::default(),
             previous: Found::default(),
@@ -1242,8 +1240,8 @@ mod tests {
 
     #[test]
     fn pair_local_ply_summary_clips_tails_and_keeps_maximum() {
-        let block = SUMMARY_BLOCK_SIZE;
-        let summary = PlySummary::new(2 * block + 3);
+        let block = 10;
+        let summary = PlySummary::new(2 * block + 3, block);
         let loss = SummaryKind::Loss;
         let capture = SummaryKind::Win(ConversionType::Capture);
         assert_eq!(summary.num_blocks(), 3);
@@ -1261,7 +1259,7 @@ mod tests {
         assert_eq!(summary.blocks_with(loss, 0), vec![(0, block)]);
         assert!(summary.blocks_with(SummaryKind::Win(ConversionType::Checkmate), 0).is_empty());
         assert!(summary.blocks_with(SummaryKind::Win(ConversionType::Promotion), 0).is_empty());
-        let empty = PlySummary::new(0);
+        let empty = PlySummary::new(0, block);
         assert_eq!(empty.num_blocks(), 0);
         assert!(empty.blocks_with(loss, 0).is_empty());
     }
@@ -1276,7 +1274,7 @@ mod tests {
         for name in ["K_KQ", "KQ_K"] {
             let egt = table(name);
             let mut values = atomic_values(vec![PackedOutcome::INVALID; egt.index_range()]);
-            let summary = PlySummary::new(values.len());
+            let summary = PlySummary::new(values.len(), egt.summary_block_size());
             let counts = initialize_table(&egt, &mut values, &summary, &reader).unwrap();
             assert_eq!(counts.checkmates > 0, name == "K_KQ");
             let invalid = values.iter().enumerate()
@@ -1289,10 +1287,10 @@ mod tests {
                 opposite_check: invalid,
                 ..InvalidCounts::default()
             });
-            let expected: Vec<_> = values.chunks(SUMMARY_BLOCK_SIZE).enumerate()
+            let expected: Vec<_> = values.chunks(egt.summary_block_size()).enumerate()
                 .filter(|(_, chunk)| chunk.iter().any(|cell| PackedOutcome::from_u16(cell.load(Ordering::Relaxed)).is_loss()))
                 .map(|(block, chunk)| {
-                    let start = block * SUMMARY_BLOCK_SIZE;
+                    let start = block * egt.summary_block_size();
                     (start, start + chunk.len())
                 }).collect();
             assert_eq!(summary.blocks_with(SummaryKind::Loss, 0), expected);
@@ -1381,8 +1379,8 @@ mod tests {
 
     #[test]
     fn step4_concurrent_summary_max_and_clipped_tail() {
-        let block = SUMMARY_BLOCK_SIZE;
-        let summary = PlySummary::new(2 * block + 3);
+        let block = 10;
+        let summary = PlySummary::new(2 * block + 3, block);
         let barrier = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
             for worker in 0..4 {
@@ -1469,7 +1467,8 @@ mod tests {
     fn step4_multiblock_self_twin_scan_visits_sources_once() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         pool.install(|| {
-            let size = 3 * SUMMARY_BLOCK_SIZE + 6;
+            let block = 10;
+            let size = 3 * block + 6;
             let plies = 7;
             for source_is_loss in [true, false] {
                 let source = if source_is_loss {
@@ -1483,15 +1482,15 @@ mod tests {
                     }).collect())],
                 };
                 let visits: Vec<_> = (0..size).map(|_| AtomicU16::new(0)).collect();
-                let summary = PlySummary::new(size);
+                let summary = PlySummary::new(size, block);
                 let kind = if source_is_loss { SummaryKind::Loss } else { SummaryKind::Win(ConversionType::Capture) };
-                for idx in (0..size).step_by(SUMMARY_BLOCK_SIZE) {
+                for idx in (0..size).step_by(block) {
                     summary.record(idx, kind, plies - 1);
                 }
 
                 let blocks = summary.blocks_with(kind, plies - 1);
                 assert_eq!(blocks.len(), 4);
-                assert_eq!(blocks.last(), Some(&(3 * SUMMARY_BLOCK_SIZE, size)));
+                assert_eq!(blocks.last(), Some(&(3 * block, size)));
                 let found = scan_table(&working, 0, &blocks,
                     |v| v == source && v.plies() == plies - 1,
                     |working, idx, v, local| {
@@ -1499,7 +1498,7 @@ mod tests {
                         visits[idx].fetch_add(1, Ordering::Relaxed);
                         // A bijection from even sources to odd destinations,
                         // shifted across blocks within the same working array.
-                        let target = (idx + 2 * SUMMARY_BLOCK_SIZE) % size + 1;
+                        let target = (idx + 2 * block) % size + 1;
                         if source_is_loss {
                             if working.mark_win(0, target, ConversionType::Capture, plies) == WinUpdate::NewlyResolved {
                                 local.wins += 1;

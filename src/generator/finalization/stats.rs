@@ -8,7 +8,6 @@ use crate::PackedOutcome;
 use crate::egt::Egt;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
-use crate::storage::FRAME_SIZE;
 
 /// Statistics for a contiguous batch; candidate indices are local to its table.
 #[derive(Default)]
@@ -103,8 +102,8 @@ impl TableStats {
             bytes,
             sha256,
             index_range: egt.index_range(),
-            frame_size: FRAME_SIZE,
-            num_frames: egt.index_range().div_ceil(FRAME_SIZE),
+            frame_size: egt.frame_size(),
+            num_frames: egt.index_range().div_ceil(egt.frame_size()),
             unique_positions: self.win + self.draw + self.loss,
             win: self.win,
             draw: self.draw,
@@ -194,6 +193,8 @@ mod tests {
         assert!(totals.histograms.iter().all(BTreeMap::is_empty));
         assert!(totals.candidates.iter().all(Vec::is_empty));
         let stats = totals.build(&egt, [0, 0], invalid, 0, String::new());
+        assert_eq!(stats.frame_size, egt.frame_size());
+        assert_eq!(stats.num_frames, egt.index_range().div_ceil(egt.frame_size()));
         assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
         assert_eq!(
             stats.invalid_ep_squares_occupied,

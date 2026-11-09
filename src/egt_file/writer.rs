@@ -149,21 +149,19 @@ pub(crate) fn write_fixture(
     name: &str,
     outcome: impl Fn(usize) -> PackedOutcome,
 ) -> crate::egt_file::EgtFileReader {
-    use crate::storage::FRAME_SIZE;
-
     let location = Location::parse(base).unwrap();
     let id = TableId::parse(name).unwrap();
-    let length = crate::Egt::from_elements(id.parse_elements())
-        .unwrap()
-        .index_range();
+    let egt = crate::Egt::from_elements(id.parse_elements()).unwrap();
+    let length = egt.index_range();
+    let frame_size = egt.frame_size();
     location.ensure_format().unwrap();
     let mut data = Vec::new();
     let mut encoder = zeekstd::EncodeOptions::new()
         .compression_level(COMPRESSION_LEVEL)
         .into_encoder(&mut data)
         .unwrap();
-    for start in (0..length).step_by(FRAME_SIZE) {
-        let values: Vec<_> = (start..length.min(start + FRAME_SIZE))
+    for start in (0..length).step_by(frame_size) {
+        let values: Vec<_> = (start..length.min(start + frame_size))
             .map(&outcome)
             .collect();
         encoder.compress(&transpose_frame(&values)).unwrap();
@@ -181,16 +179,19 @@ pub(crate) fn write_fixture(
 mod tests {
     use super::*;
     use crate::egt_file::EgtFileReader;
-    use crate::storage::FRAME_SIZE;
     use object_store::ObjectStoreExt;
     use std::{fs, path::Path};
 
     fn writer(base: &Path, name: &str) -> EgtFileWriter {
         let id = TableId::parse(name).unwrap();
-        let length = crate::Egt::from_elements(id.parse_elements())
-            .unwrap()
-            .index_range();
-        EgtFileWriter::new(&Location::parse(base).unwrap(), &id, length, FRAME_SIZE).unwrap()
+        let egt = crate::Egt::from_elements(id.parse_elements()).unwrap();
+        EgtFileWriter::new(
+            &Location::parse(base).unwrap(),
+            &id,
+            egt.index_range(),
+            egt.frame_size(),
+        )
+        .unwrap()
     }
 
     #[test]

@@ -19,6 +19,22 @@ impl Egt {
         &self.elements
     }
 
+    /// The number of physical pieces, including pawns and kings.
+    pub(crate) fn n_pieces(&self) -> usize {
+        self.indexer.n_pieces
+    }
+
+    /// Positions per generation summary block, following permutation geometry.
+    pub(crate) fn summary_block_size(&self) -> usize {
+        let n = self.n_pieces();
+        (65 - n) * (66 - n)
+    }
+
+    /// Positions per compressed frame; identical-piece groups may cross boundaries.
+    pub(crate) fn frame_size(&self) -> usize {
+        self.summary_block_size() * (67 - self.n_pieces()) * 2
+    }
+
     /// The number of pawns in this table's material.
     pub fn n_pawns(&self) -> usize {
         self.indexer.n_pawns
@@ -348,6 +364,23 @@ mod tests {
             8
         );
         assert_eq!(egt.tablename(), "KNNNNNN_K");
+    }
+
+    #[test]
+    fn table_specific_block_sizes() {
+        for (name, pieces, summary, frame) in [
+            ("K_K", 2, 4032, 524160),
+            ("KQ_K", 3, 3906, 499968),
+            ("KQ_KR", 4, 3782, 476532),
+            ("KBBB_K", 5, 3660, 453840),
+            ("KPaPa_KPb", 5, 3660, 453840),
+            ("KNNNNNN_K", 8, 3306, 390108),
+        ] {
+            let egt = Egt::from_tablename(name).unwrap();
+            assert_eq!(egt.n_pieces(), pieces);
+            assert_eq!(egt.summary_block_size(), summary);
+            assert_eq!(egt.frame_size(), frame);
+        }
     }
 
     #[test]

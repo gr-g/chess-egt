@@ -14,7 +14,7 @@ use crate::egt_file::writer::{COMPRESSION_LEVEL, CompressedSegment, EgtFileWrite
 use crate::error::{EgtError, EgtResult};
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, write_stats};
-use crate::storage::{FRAME_SIZE, Location};
+use crate::storage::Location;
 use crate::table_id::TableId;
 
 fn finalize_batch(
@@ -77,15 +77,16 @@ pub(super) fn finalize_table(
     if values.len() != egt.index_range() {
         return Err(EgtError::Internal("completed table has wrong length"));
     }
-    let writer = EgtFileWriter::new(location, id, egt.index_range(), FRAME_SIZE)?;
-    let frames = values.len().div_ceil(FRAME_SIZE);
-    let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * FRAME_SIZE;
+    let frame_size = egt.frame_size();
+    let writer = EgtFileWriter::new(location, id, egt.index_range(), frame_size)?;
+    let frames = values.len().div_ceil(frame_size);
+    let batch_size = frames.div_ceil(rayon::current_num_threads()).max(1) * frame_size;
     // Contiguous batches reuse one encoder each. Indexed collection preserves
     // frame and example order, independently of worker completion order.
     let batches: Vec<_> = values
         .par_chunks_mut(batch_size)
         .enumerate()
-        .map(|(idx, batch)| finalize_batch(batch, idx * batch_size, egt, FRAME_SIZE, maxima))
+        .map(|(idx, batch)| finalize_batch(batch, idx * batch_size, egt, frame_size, maxima))
         .collect();
     drop(values);
     let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;

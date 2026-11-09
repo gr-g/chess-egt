@@ -26,7 +26,7 @@ class StatsCsvTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.root = self.base / "tables"
         self.root.mkdir()
-        self.put_json(self.root / "format.json", {"format": "ggegt-v0.11"})
+        self.put_json(self.root / "format.json", {"format": "ggegt-v0.12"})
 
     def put_json(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,8 +221,8 @@ class StatsCsvTests(unittest.TestCase):
 
     def test_format_validation_requires_exact_supported_object(self):
         self.assertEqual(stats_csv.validate_root(self.root), self.root.resolve())
-        for value in ({"format": "ggegt-v0.10"}, {}, {"format": None},
-                      {"format": "ggegt-v0.11", "extra": True}, [], "ggegt-v0.11"):
+        for value in ({"format": "ggegt-v0.11"}, {}, {"format": None},
+                      {"format": "ggegt-v0.12", "extra": True}, [], "ggegt-v0.12"):
             with self.subTest(value=value):
                 self.put_json(self.root / "format.json", value)
                 with self.assertRaises(ValueError):
@@ -391,7 +391,7 @@ class StatsCsvTests(unittest.TestCase):
                     self.assertEqual(rows[1]["estimated_final_size_gib"], "0.262500")
 
     def test_cli_reports_invalid_format_without_creating_output(self):
-        self.put_json(self.root / "format.json", {"format": "unsupported"})
+        self.put_json(self.root / "format.json", {"format": "ggegt-v0.11"})
         for script in ("export_table_stats.py", "export_summary_stats.py"):
             with self.subTest(script=script):
                 output = self.base / (script + ".csv")

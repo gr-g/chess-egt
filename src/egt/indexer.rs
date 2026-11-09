@@ -272,7 +272,7 @@ type PidxBuf = ArrayVec<usize, MAX_PIECES>;
 #[derive(Clone, Debug)]
 pub(super) struct Indexer {
     // The number of pieces in the endgame.
-    n_pieces: usize,
+    pub(super) n_pieces: usize,
 
     // The number of pawns in the endgame.
     pub(super) n_pawns: usize,

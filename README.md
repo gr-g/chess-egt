@@ -308,7 +308,7 @@ side piece counts in descending order, `K` counts mutually opposing pawn pairs
 ```
 
 A simple JSON file named `format.json` at the root contains a format
-descriptor. Currently this is: `{"format":"ggegt-v0.11"}`.
+descriptor. Currently this is: `{"format":"ggegt-v0.12"}`.
 
 The hierarchical layout described above is designed to expose useful facts
 about the dependencies between groups of tables and facilitate grouping tables
@@ -528,9 +528,10 @@ type of a loss deterministic (the last one to decrement its counter, i.e.
 Promotion > Capture > Checkmate).
 
 To make the scanning more efficient, a record is kept of the highest ply
-resolved in each 4096-position block (`PlySummary`) and of the type of
-resolution. In this way, blocks can be skipped if the record indicates that no
-positions were resolved at that ply for the given resolution.
+resolved in each block of `(65 - n) * (66 - n)` positions (`PlySummary`) and of
+the type of resolution, where `n` counts all pieces, including pawns and kings.
+In this way, blocks can be skipped if the record indicates that no positions
+were resolved at that ply for the given resolution.
 
 #### Alternative approach for initialization
 
@@ -552,9 +553,10 @@ reflect the board to files a–d to canonicalize.
 Each canonical table is one seekable Zstd object (via `zeekstd`).
 
 The format of the compressed tables (`.ggegt`) has the following characteristics:
-- The uncompressed data is split into frames of `256 * 1024`
-  positions, which are compressed independently, allowing seekable random
-  access.
+- The uncompressed data is split into frames of
+  `2 * (65 - n) * (66 - n) * (67 - n)` positions, where `n` counts all pieces,
+  including pawns and kings. Frames are compressed independently, allowing
+  seekable random access; the final frame may contain fewer positions.
 - A seek table (without checksum) of `17 + 8 * num_frames` bytes is appended
   in the footer frame. The footer frame count is checked before parsing to
   bound allocation; compressed and decompressed lengths are also validated.

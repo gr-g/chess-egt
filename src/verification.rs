@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use shakmaty::{Chess, Color, MoveList, Position};
 
 use crate::egt_file::{BatchReader, load_existing_file};
-use crate::storage::{FRAME_SIZE, Location};
+use crate::storage::Location;
 use crate::table_id::TableId;
 use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, resolve_selectors};
 
@@ -78,7 +78,7 @@ impl EgtVerifier {
                 BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
             reader.insert(source);
             println!(
-                "{}: loading {} bytes of resident table data...",
+                "{}: loading {} bytes of dependencies...",
                 name,
                 reader.resident_bytes()
             );
@@ -102,11 +102,12 @@ pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtR
 
     let completed = AtomicUsize::new(0);
     // Keep each borrowed block within a single frame.
-    let block_size = 4096.min(FRAME_SIZE);
+    let frame_size = egt.frame_size();
+    let block_size = 4096.min(frame_size);
     let blocks: Vec<_> = (0..local_range)
-        .step_by(FRAME_SIZE)
+        .step_by(frame_size)
         .flat_map(|frame_start| {
-            let frame_end = (frame_start + FRAME_SIZE).min(local_range);
+            let frame_end = (frame_start + frame_size).min(local_range);
             (frame_start..frame_end)
                 .step_by(block_size)
                 .map(move |start| (start, (start + block_size).min(frame_end)))

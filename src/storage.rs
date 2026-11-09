@@ -18,8 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-const TABLEBASE_FORMAT: &str = "ggegt-v0.11";
-pub(crate) const FRAME_SIZE: usize = 256 * 1024;
+const TABLEBASE_FORMAT: &str = "ggegt-v0.12";
 
 /// Root metadata is immutable and independent of optional per-table statistics.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

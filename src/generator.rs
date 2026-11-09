@@ -97,15 +97,9 @@ impl EgtGenerator {
                 dependencies.dedup();
                 let mut reader =
                     BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
-                let working_bytes: u128 = std::iter::once(&pair.table)
-                    .chain(pair.twin.iter())
-                    .try_fold(0, |bytes, id| {
-                        let egt = crate::Egt::from_elements(id.parse_elements())?;
-                        Ok::<_, EgtError>(bytes + egt.index_range() as u128 * 2)
-                    })?;
                 println!(
-                    "{}: loading dependencies; {} bytes of working and dependency table data...",
-                    pair.table.tablename(), working_bytes + reader.resident_bytes(),
+                    "{}: loading {} bytes of dependencies...",
+                    pair.table.tablename(), reader.resident_bytes(),
                 );
                 reader.load()?;
                 let dependency_time = start.elapsed();

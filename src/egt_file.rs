@@ -7,7 +7,7 @@ pub(crate) use cache::SharedFileCache;
 
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
-use crate::storage::{FRAME_SIZE, Location, block_on};
+use crate::storage::{Location, block_on};
 use crate::table_id::{TableId, position_table_name};
 use crate::PackedOutcome;
 #[cfg(test)]
@@ -65,8 +65,8 @@ impl EgtFileReader {
         let index_range = egt.index_range();
         let key = location.key(&id.relative_path("ggegt"));
         location.validate_format()?;
-        let seek_table = Self::read_seek_table(location, &key, index_range)?;
-        let frames = vec![None; index_range.div_ceil(FRAME_SIZE)];
+        let seek_table = Self::read_seek_table(location, &key, index_range, egt.frame_size())?;
+        let frames = vec![None; index_range.div_ceil(egt.frame_size())];
         Ok(Self {
             key,
             egt,
@@ -80,9 +80,10 @@ impl EgtFileReader {
         location: &Location,
         key: &ObjectPath,
         index_range: usize,
+        frame_size: usize,
     ) -> EgtResult<zeekstd::SeekTable> {
         // Our checksum-free seek tables have 8-byte entries and 17 bytes of framing.
-        let num_frames = index_range.div_ceil(FRAME_SIZE);
+        let num_frames = index_range.div_ceil(frame_size);
         let table_size = 17 + 8 * num_frames as u64;
         let options = GetOptions::new().with_range(Some(GetRange::Suffix(table_size)));
         let result = block_on(location.store.get_opts(key, options))
@@ -104,7 +105,7 @@ impl EgtFileReader {
             return Err(location.invalid_data(key, "invalid tablebase compressed length"));
         }
         for index in 0..num_frames {
-            let len = FRAME_SIZE.min(index_range - index * FRAME_SIZE);
+            let len = frame_size.min(index_range - index * frame_size);
             let decompressed = table
                 .frame_size_decomp(index as u32)
                 .map_err(|error| location.invalid_data(key, error))?;
@@ -245,11 +246,13 @@ impl EgtFileReader {
     }
 
     fn locate_frame(&self, index: usize) -> (usize, usize) {
-        (index / FRAME_SIZE, index % FRAME_SIZE)
+        let frame_size = self.egt.frame_size();
+        (index / frame_size, index % frame_size)
     }
 
     fn frame_len(&self, frame_idx: usize) -> usize {
-        FRAME_SIZE.min(self.egt.index_range() - frame_idx * FRAME_SIZE)
+        let frame_size = self.egt.frame_size();
+        frame_size.min(self.egt.index_range() - frame_idx * frame_size)
     }
 
     fn frame_bytes(&self, frame_idx: usize) -> usize {
@@ -265,8 +268,8 @@ impl EgtFileReader {
             location: format!(
                 "{} (frame {frame}, indices {}..{})",
                 self.location.describe(&self.key),
-                frame * FRAME_SIZE,
-                frame * FRAME_SIZE + self.frame_len(frame)
+                frame * self.egt.frame_size(),
+                frame * self.egt.frame_size() + self.frame_len(frame)
             ),
             source: source.into(),
         }
@@ -667,7 +670,7 @@ mod tests {
         let mut reader = write_fixture(&dir.0, "KPa_K", outcome);
         assert_eq!(
             reader.num_frames(),
-            reader.egt.index_range().div_ceil(FRAME_SIZE)
+            reader.egt.index_range().div_ceil(reader.egt.frame_size())
         );
         for _ in 0..2 {
             for idx in 0..reader.egt.index_range() {
@@ -686,8 +689,10 @@ mod tests {
     #[test]
     fn full_frames_short_tail_and_table_boundaries() {
         let dir = crate::TestDir::new("frame_boundaries");
-        let length = Egt::from_tablename("KQ_KR").unwrap().index_range();
-        let indexes = [0, FRAME_SIZE - 1, FRAME_SIZE, FRAME_SIZE + 1, length - 1];
+        let egt = Egt::from_tablename("KQ_KR").unwrap();
+        let length = egt.index_range();
+        let frame_size = egt.frame_size();
+        let indexes = [0, frame_size - 1, frame_size, frame_size + 1, length - 1];
         let mut reader = write_fixture(&dir.0, "KQ_KR", |idx| {
             indexes
                 .iter()
@@ -697,8 +702,9 @@ mod tests {
                 })
         });
         assert!(reader.num_frames() > 1);
-        assert_eq!(reader.frame_len(reader.num_frames() - 1), 174420);
-        assert!(reader.frame_chunk(FRAME_SIZE - 1, FRAME_SIZE + 1).is_err());
+        assert_ne!(length % frame_size, 0);
+        assert_eq!(reader.frame_len(reader.num_frames() - 1), length % frame_size);
+        assert!(reader.frame_chunk(frame_size - 1, frame_size + 1).is_err());
         for (n, &idx) in indexes.iter().enumerate() {
             assert_eq!(
                 reader.read_from_index(idx).unwrap(),
@@ -718,7 +724,8 @@ mod tests {
     fn rejects_invalid_frame_layout() {
         let dir = crate::TestDir::new("invalid_frame_layout");
         let file = write_fixture(&dir.0, "K_K", |_| PackedOutcome::INVALID);
-        for bytes in [0, 3, 922, 926, FRAME_SIZE * 2, FRAME_SIZE * 2 + 2] {
+        let frame_size = file.egt.frame_size();
+        for bytes in [0, 3, 922, 926, frame_size * 2, frame_size * 2 + 2] {
             let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
             encoder.compress(&vec![0; bytes]).unwrap();

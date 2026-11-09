@@ -30,7 +30,7 @@ def count(record, key, path, positive=False):
 
 def validate_root(root):
     root = root.resolve(strict=True)
-    if read_json(root / "format.json") != {"format": "ggegt-v0.11"}:
+    if read_json(root / "format.json") != {"format": "ggegt-v0.12"}:
         raise ValueError(f"{root}: unsupported tablebase format")
     return root
 

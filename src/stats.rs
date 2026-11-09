@@ -10,7 +10,7 @@ use std::ops::Add;
 use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{FRAME_SIZE, Location, block_on};
+use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
 use crate::{Egt, EgtError, EgtResult};
 
@@ -415,12 +415,13 @@ pub(crate) fn read_stats(location: &Location, id: &TableId) -> EgtResult<EgtStat
 
 impl EgtStats {
     fn validate(&self, id: &TableId) -> EgtResult<()> {
+        let frame_size = Egt::from_elements(id.parse_elements())?.frame_size();
         if self.tablename != id.tablename()
             || self.sha256.len() != 64
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.bytes == 0
             || self.index_range == 0
-            || self.frame_size != FRAME_SIZE
+            || self.frame_size != frame_size
             || self.num_frames != self.index_range.div_ceil(self.frame_size)
         {
             return Err(invalid_data(
@@ -509,7 +510,9 @@ mod tests {
             bytes: 100,
             sha256: "ab".repeat(32),
             index_range: 16,
-            frame_size: FRAME_SIZE,
+            frame_size: Egt::from_elements(TableId::parse("KQ_K").unwrap().parse_elements())
+                .unwrap()
+                .frame_size(),
             num_frames: 1,
             unique_positions: 6,
             win: 3,
@@ -644,6 +647,21 @@ mod tests {
                 if !["selected_tables", "available_tables", "index_range"].contains(&key.as_str()) {
                     assert!(value.is_null(), "{key}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn validates_table_specific_frame_size_with_synthetic_index_range() {
+        for name in ["K_K", "KQ_K", "KQ_KR", "KPao_KPao"] {
+            let id = TableId::parse(name).unwrap();
+            let mut stats = stats();
+            stats.tablename = name.into();
+            stats.frame_size = Egt::from_elements(id.parse_elements()).unwrap().frame_size();
+            stats.validate(&id).unwrap();
+            for frame_size in [0, 256 * 1024, stats.frame_size + 1] {
+                stats.frame_size = frame_size;
+                assert!(stats.validate(&id).is_err(), "{name}: {frame_size}");
             }
         }
     }
