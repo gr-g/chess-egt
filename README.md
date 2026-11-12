@@ -26,7 +26,11 @@ The library API, command-line interface, and file format are not yet finalized.
 
 This tablebase is intended as a resource for online lookup. Is is not intended
 for use in chess engines, where the DTZ metric is most suitable and where
-there compact win/draw/loss representations are needed.
+compact win/draw/loss representations are needed.
+
+If you are looking for the most complete and optimized chess tablebase,
+including multiple metrics and perfect accounting of the 50-move rule, see
+[ChessTB](https://huggingface.co/chesstb) by Bojun Guo (aka noobpwnftw).
 
 ## Usage
 
@@ -158,15 +162,13 @@ The JSON response to a position query is similar to the
 
 ### Scope
 The tablebase supports valid positions with at most eight pieces and no
-castling rights.
+castling rights. The depth-to-conversion (DTC) metric is computed without
+taking into account the the 50-move rule.
 
 (According to traditional terminology, we should say _8 [men](https://en.wikipedia.org/wiki/Chess_piece#Definitions)_
 instead of _8 pieces_ to make it clear that pawns are counted among the 8
 pieces, but we do not make this distinction here and just use _pieces_
 everywhere.)
-
-As usual for the DTC metric, threefold repetition, the fifty-move rule, and
-the seventy-five-move rule are ignored.
 
 A position is considered _valid_ if it fulfills
 [`shakmaty`'s validity requirements](https://docs.rs/shakmaty/latest/shakmaty/struct.PositionErrorKinds.html),
@@ -292,7 +294,7 @@ its twin (the table with the STM and SNTM swapped).
 
 This partitioning lets the generator solve each table pair once its
 dependencies are available. It also allows generation of tables with specific
-configurations, such as the tables with _opposing pawns_ (as in the
+configurations, such as the tables with _opposing pawn pairs_ (as in the
 [op1](https://lichess.org/@/lichess/blog/op1-partial-8-piece-tablebase-available/1ptPBDpC)
 project).
 
