@@ -49,7 +49,6 @@ Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
 - `--list-one-side` and `--stats-one-side`?
 - `--generate` does not replace existing table.
 - Visibility and public interface.
-- Experiment with approach using capture/promotion unmoves for initialization.
 - Frontend, cloning https://syzygy-tables.info/
 - Explore possibility of generating tables that store together DTC and DTM for
   the same index, not only DTC.

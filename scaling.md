@@ -15,7 +15,7 @@ invalid and redundant slots. All resources scale with the index positions, so
 the table below shows how the work increases as the number of pieces grows.
 
 | Pieces | Tables | Twin-pair jobs | Index positions |
-|---|---:|---:|---:|---:|---:|
+|---|---:|---:|---:|
 | 3 | 16 | 8 | 416,640 |
 | 4 | 176 | 96 | 155,965,898 |
 | 5 | 1,496 | 748 | 35,268,305,340 |
@@ -29,38 +29,53 @@ than half the number of tables.
 
 ## 2. Memory requirements
 
-For **table generation**, our model assumes that the table pair is allocated
-in memory during the entire process, while the required dependencies are read
-only once sequentially during initialization, therefore they do not add any
-significant memory allocation cost [not yet implemented]. As a result, memory
-requirements for generation can be approximated by the size in memory of the
-table-pair: 2 bytes per positions times the number of positions).
+For **table generation**, a theoretical efficient model foresees that only the
+table pair being generated is allocated in memory during the entire process,
+while the required dependencies are read only once sequentially during
+initialization, without adding significant memory allocation cost. In this
+model, memory requirements for generation can be approximated by the size in
+memory of the table-pair (with our encoding: 2 bytes per positions times the
+number of positions).
 
-For **table verification**, the model is reversed: the required dependencies
-are allocated in memory during the entire process, while the table to verify
-is read sequentially. Dependent tables reached by capture have one less piece,
-so they are much smaller than the table being verified. Dependent tables
-reached by promotion have comparable size, but only a fraction of positions
-are needed, so the part to be kept in memory is also relatively small [not yet
-implemented]. Therefore, the memory requirements for verification are
-dominated by the cost of keeping in memory the "twin" of the table being
-verified (the only "big" table), meaning that memory requirements for
-verification are consistently lower than generation.
+Note that this theoretical model can be implemented by scanning the
+dependencies sequentially and playing reverse capture/promotion moves from the
+dependecies into the tables being generated. This approach is more complex and
+more computationally intensive compared to the alternative: simply playing the
+forward capture/promotion moves during initialization and looking up their
+outcomes in the dependency tables.
+
+This simpler approach is the one currently applied in this project, at the cost
+of increased memory requirements. The worst case occurs when large 1-pawn
+tables are being generated, which have large promotion dependencies. With our
+encoding (2 bytes per position for the tables being generated, but ~1 byte per
+position for the tables already generated), this results in approximately
+double requirements compared to the size in memory of the table-pair. Complex
+schemes could be devised to re-encode and keep in memory only the relevant
+parts of the promotion dependencies, since only a small percentage of the
+positions stored in those dependencies are actually reachable by a promotion
+move, but this is currently not planned.
+
+For **table verification**, the theoretical model is reversed: the required
+dependencies are allocated in memory during the entire process, while the table
+to verify could be read sequentially. As a result, our memory requirements for
+generation (i.e. "double the size in memory of the table-pair") are generally
+suitable for verification, too (and are in fact more difficult to reduce
+compared to generation).
 
 The table below shows the worst-case requirements for table-pair generation.
 
-| Pieces | Index positions | Worst-case memory |
-|---|---:|---:|
-| 3 | 416,640 | 0.11 MB |
-| 4 | 155,965,898 | 6.99 MB |
-| 5 | 35,268,305,340 | 0.42 GB |
-| 6 | 5,606,162,736,600 | 24.7 GB |
-| 7 | 679,345,381,690,216 | 1.44 TB |
+| Pieces | Index positions | Largest table-pair | Worst-case memory estimate |
+|---|---:|---:|---:|
+| 3 | 416,640 | 0.11 MB | <1 GB |
+| 4 | 155,965,898 | 6.99 MB | <1 GB |
+| 5 | 35,268,305,340 | 0.42 GB | ~1 GB |
+| 6 | 5,606,162,736,600 | 24.7 GB | ~50 GB |
+| 7 | 679,345,381,690,216 | 1.44 TB | ~3 TB |
 
-All 6-piece jobs fit below 25 GB of working memory. Seven-piece jobs have a
-heavy-tailed size distribution: the median job needs about 1 GB of working
-memory, but jobs for large pawnless tables can require 700+ GB of memory per
-each side.
+All 6-piece jobs fit confortably on a server with 64 GB of memory. Seven-piece
+jobs have a heavy-tailed size distribution: the median job needs about 2 GB of
+working memory, but jobs for large tables can require 1+ TB of memory for the
+table-pair plus a comparable amount of memory to store dependencies.
 
 ## 3. Compute requirements
 
