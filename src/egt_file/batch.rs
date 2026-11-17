@@ -56,11 +56,12 @@ impl BatchReader {
         })
     }
 
-    /// Outcome storage only; metadata, working arrays and temporary buffers are extra.
+    /// Retained palettes and indices; metadata, working arrays and temporary buffers are extra.
     pub(crate) fn resident_bytes(&self) -> u128 {
         self.files
             .values()
-            .map(|file| file.egt().index_range() as u128 * 2)
+            .flat_map(|file| file.frames.iter().flatten())
+            .map(|frame| frame.bytes() as u128)
             .sum()
     }
 
@@ -94,7 +95,7 @@ impl BatchReader {
         name: &str,
         start: usize,
         end: usize,
-    ) -> EgtResult<&[PackedOutcome]> {
+    ) -> EgtResult<Vec<PackedOutcome>> {
         self.file(name)?
             .frame_chunk_cached(start, end)?
             .ok_or(EgtError::Internal("cold frame in prepared dependencies"))

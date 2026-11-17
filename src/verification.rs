@@ -88,12 +88,12 @@ impl EgtVerifier {
             let mut reader =
                 BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
             reader.insert(source);
+            reader.load()?;
             println!(
-                "{}: loading {} bytes of dependencies...",
+                "{}: loaded {} bytes of dependencies.",
                 name,
                 reader.resident_bytes()
             );
-            reader.load()?;
             let egt = reader.file(name)?.egt();
             unique_positions += verify_egt(&reader, name, egt)?;
             index_range += egt.index_range();
@@ -114,7 +114,7 @@ pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtR
     println!("{}: verifying {} indices...", tablename, local_range);
 
     let completed = AtomicUsize::new(0);
-    // Keep each borrowed block within a single frame.
+    // Keep each expanded block within a single frame.
     let frame_size = egt.frame_size();
     let block_size = 4096.min(frame_size);
     let blocks: Vec<_> = (0..local_range)

@@ -4,7 +4,7 @@ A comparison of the current generation algorithms and storage architectures in:
 - **chess-egt** (our Rust project)
 - **Syzygy `tb`** by Ronald de Man (`https://github.com/syzygy1/tb`)
 - **Prophet TB** (`https://github.com/markus7800/prophet_tb_gen_and_probe`)
-- **chesstb** (`https://github.com/noobpwnftw/chesstb`)
+- **chesstb** by Bojun Guo (`https://github.com/noobpwnftw/chesstb`)
 
 Quantitative scale, measured performance, and resource/cost estimates are covered in
 [`scaling.md`](scaling.md). Our implementation is described in
@@ -25,7 +25,7 @@ The comparisons below are based on source inspection, not cross-engine benchmark
 | **Parallelization** | Rayon; atomic CAS updates; sequential pair jobs share a pool/cache | Pthreads / C11 threads; atomic byte updates | OpenMP | Custom thread pool and shared chunk scheduling |
 | **Dependencies** | Forward capture/promotion probes during initialization | Reverse marking for non-pawn captures; forward pawn capture/promotion probes | Forward probes, plus a reverse noncapture-promotion pass for six-piece generation | Forward probes and topologically ordered pawn slices |
 | **Indexing Approach** | Compact mixed-radix / combinatorial groups; occupied-square compaction; pawn-file/order partitions; same working/file order | Regular king-pair / square-field working layout; pawn-pivot partitions; separate compact combinatorial file encoding | King-pair + fixed-order combinatorial groups; separate en passant region; same working/file order | Pawn slice × king slice × mixed-radix nonpawn classes; combinatorial ranking within classes; permutable file dimensions |
-| **Final Compression** | Seekable Zstd with byte transposition | Recursive pair substitution + Huffman coding | Independent Zstd blocks, normally 32K positions | Packed WDL + LZ4-HC; ranked distance streams + LZMA |
+| **Final Compression** | Seekable Zstd level 19 with per-frame frequency-ordered palettes and byte-plane indices | Recursive pair substitution + Huffman coding | Independent Zstd blocks, normally 32K positions | Packed WDL + LZ4-HC; ranked distance streams + LZMA |
 | **Compression-Driven Index Permutations** | No | Heuristic search using compression estimates | None found in the reviewed paths | All allowed nonpawn-class permutations, evaluated on samples |
 
 Memory figures describe working entries, not total process RSS. Index ranges differ
@@ -159,11 +159,16 @@ the parent can incorporate their results.
 **Final codecs and value transforms:**
 
 - **chess-egt:** each exact canonical table is a seekable Zstd object, with
-  independent frames of 262,144 positions. The fixed transform writes low bytes
-  first, then high bytes only for decisive outcomes, padding the remaining tail
-  with zeros. This is **byte transposition**, not bit-plane transposition or an
-  index permutation. Files retain the generation index order and exact DTC and
-  conversion-type values.
+  independent frames using the dimension-aligned `Egt` frame size. Each frame
+  stores a little-endian `u16` palette count and raw `u16` outcome entries ordered
+  by descending frequency, breaking ties by ascending numeric raw value. Constant
+  frames need no indices; palettes of 2–256 entries use `u8` indices; larger
+  palettes store all low index bytes followed by all high index bytes. The entire
+  count, palette and index payload is compressed together with Zstd level 19.
+  Cached frames retain this decompressed serialized representation rather than
+  full outcome arrays. Frame position counts and boundaries, the generation index
+  order, and exact DTC and conversion-type values are unchanged; palette ranking
+  is not a position-index permutation.
 - **Syzygy:** final WDL/DTZ payloads use recursive pair substitution and Huffman
   coding, with indexed blocks, don't-care handling and DTZ value remapping.
   LZ4/Zstd in the generator compress **temporary files**, not the final probe
@@ -211,7 +216,7 @@ but simplify scans and unmoves. A file layout can differ from both.
 
 | Project | Working Index | File Index / Compression Ordering |
 | :--- | :--- | :--- |
-| **chess-egt** | Compact mixed-radix groups, with occupied-square compaction and combinatorial ranking of identical pieces; pawn-file/order partitioning | Same index order; fixed byte transform, no compression-driven permutation search |
+| **chess-egt** | Compact mixed-radix groups, with occupied-square compaction and combinatorial ranking of identical pieces; pawn-file/order partitioning | Same index order; per-frame frequency-ranked palette indices, no compression-driven position permutation search |
 | **Syzygy** | Regular pawnless king-pair index plus six-bit square fields; pawn-pivot/file partitions for pawnful generation | Separate compact combinatorial encoding; searches piece-type/factor order using estimated compressed size |
 | **Prophet** | King-pair index plus fixed-order combinatorial piece groups; extra en passant region | Same order as the working arrays; no permutation search found in the reviewed indexing/compression paths |
 | **chesstb** | Pawn slice × king slice × mixed-radix nonpawn classes; identical pieces ranked within each class | Keeps slice geometry but searches permutations of nonpawn-class dimensions, per output/color |

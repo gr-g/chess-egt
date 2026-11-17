@@ -7,7 +7,7 @@ use object_store::{buffered::BufWriter, path::Path as ObjectPath};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::transpose_frame;
+use super::frame;
 use crate::PackedOutcome;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
@@ -19,6 +19,8 @@ pub(crate) const COMPRESSION_LEVEL: i32 = 19;
 pub(crate) struct CompressedSegment {
     pub(crate) data: Bytes,
     pub(crate) seek_table: zeekstd::SeekTable,
+    // Serialized palette lengths no longer identify the number of positions.
+    pub(crate) frame_lengths: Vec<usize>,
 }
 
 pub(crate) struct EgtFileWriter {
@@ -35,7 +37,7 @@ impl EgtFileWriter {
         length: usize,
         frame_size: usize,
     ) -> EgtResult<Self> {
-        if frame_size == 0 || frame_size > (u32::MAX as usize) / 2 {
+        if frame_size == 0 || frame::max_length(frame_size) > u32::MAX as usize {
             return Err(EgtError::Internal("invalid writer frame size"));
         }
         location.ensure_format()?;
@@ -56,6 +58,11 @@ impl EgtFileWriter {
         let mut remaining = length;
         for segment in &segments {
             let num_frames = segment.seek_table.num_frames();
+            if segment.frame_lengths.len() != num_frames as usize {
+                return Err(EgtError::Internal(
+                    "compressed segment has wrong position counts",
+                ));
+            }
             if num_frames == 0 && !(length == 0 && segments.len() == 1 && segment.data.is_empty()) {
                 return Err(EgtError::Internal("compressed segment has no frames"));
             }
@@ -64,7 +71,9 @@ impl EgtFileWriter {
                 let compressed = segment.seek_table.frame_size_comp(index)?;
                 let decompressed = segment.seek_table.frame_size_decomp(index)?;
                 let frame_length = remaining.min(self.frame_size);
-                if compressed == 0 || frame_length == 0 || decompressed != (frame_length * 2) as u64
+                if segment.frame_lengths[index as usize] != frame_length
+                    || compressed == 0
+                    || !frame::valid_length(decompressed, frame_length)
                 {
                     return Err(EgtError::Internal(
                         "compressed segment has invalid frame lengths",
@@ -137,7 +146,7 @@ pub(crate) fn encode_frame<W: Write>(
     encoder: &mut zeekstd::Encoder<'_, W>,
     values: &[PackedOutcome],
 ) -> EgtResult<()> {
-    encoder.compress(&transpose_frame(values))?;
+    encoder.compress(&frame::encode(values)?)?;
     encoder.end_frame()?;
     Ok(())
 }
@@ -164,7 +173,7 @@ pub(crate) fn write_fixture(
         let values: Vec<_> = (start..length.min(start + frame_size))
             .map(&outcome)
             .collect();
-        encoder.compress(&transpose_frame(&values)).unwrap();
+        encoder.compress(&frame::encode(&values).unwrap()).unwrap();
         if start + values.len() < length {
             encoder.end_frame().unwrap();
         }
@@ -206,7 +215,7 @@ mod tests {
         let mut expected = Vec::new();
         let mut serial = options().into_encoder(&mut expected).unwrap();
         for frame in values.chunks(writer.frame_size) {
-            serial.compress(&transpose_frame(frame)).unwrap();
+            serial.compress(&frame::encode(frame).unwrap()).unwrap();
             serial.end_frame().unwrap();
         }
         serial.flush().unwrap();
@@ -225,6 +234,7 @@ mod tests {
             segments.push(CompressedSegment {
                 data: data.into(),
                 seek_table,
+                frame_lengths: batch.chunks(writer.frame_size).map(<[_]>::len).collect(),
             });
         }
         let (bytes, sha256) = writer.publish(segments).unwrap();
@@ -283,11 +293,7 @@ mod tests {
         assert!(writer.length % writer.frame_size != 0);
         let values: Vec<_> = (0..writer.length)
             .map(|index| {
-                if index % 2 == 0 {
-                    PackedOutcome::DRAW
-                } else {
-                    PackedOutcome::INVALID
-                }
+                PackedOutcome::new_win(crate::ConversionType::Capture, (index % 257) as u16)
             })
             .collect();
         let mut expected = Vec::new();
@@ -303,6 +309,7 @@ mod tests {
         let segment = CompressedSegment {
             data: expected.clone().into(),
             seek_table: seek_table.clone(),
+            frame_lengths: values.chunks(writer.frame_size).map(<[_]>::len).collect(),
         };
         seek_table
             .into_serializer()
@@ -322,7 +329,16 @@ mod tests {
         let mut reader = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
         for index in [0, frame_size - 1, frame_size, length - 1] {
             assert_eq!(reader.read_from_index(index).unwrap(), values[index]);
+            let frame = index / frame_size;
+            assert_eq!(
+                reader.frame_bytes(frame),
+                2 + 2 * 257 + 2 * reader.frame_len(frame)
+            );
         }
+        assert_eq!(
+            reader.frame_chunk(length - 3, length).unwrap(),
+            values[length - 3..]
+        );
     }
 
     #[test]
@@ -330,12 +346,9 @@ mod tests {
         let dir = crate::TestDir::new("writer_rejections");
         assert!(writer(&dir.0, "KPa_K").publish(Vec::new()).is_err());
         let length = writer(&dir.0, "KPa_K").length;
-        for (compressed, decompressed) in [
-            (0, length * 2),
-            (1, 0),
-            (1, length * 2 - 2),
-            (1, length * 2 + 2),
-        ] {
+        for (compressed, decompressed) in
+            [(0, 4), (1, 0), (1, 3), (1, frame::max_length(length) + 1)]
+        {
             let mut seek_table = zeekstd::SeekTable::new();
             seek_table
                 .log_frame(compressed, decompressed as u32)
@@ -345,6 +358,7 @@ mod tests {
                     .publish(vec![CompressedSegment {
                         data: Bytes::from_static(&[0]),
                         seek_table,
+                        frame_lengths: vec![length],
                     }])
                     .is_err()
             );
@@ -357,6 +371,42 @@ mod tests {
     }
 
     #[test]
+    fn palette_length_collision_preserves_destination() {
+        let dir = crate::TestDir::new("writer_palette_geometry");
+        let writer = writer(&dir.0, "K_K");
+        let length = writer.length;
+        let values: Vec<_> = (0..length - 2)
+            .map(|i| PackedOutcome::from_u16((i % 3) as u16))
+            .collect();
+        let mut data = Vec::new();
+        let mut encoder = zeekstd::EncodeOptions::new()
+            .into_encoder(&mut data)
+            .unwrap();
+        encode_frame(&mut encoder, &values).unwrap();
+        encoder.flush().unwrap();
+        let seek_table = encoder.into_seek_table();
+        assert!(frame::valid_length(
+            seek_table.frame_size_decomp(0).unwrap(),
+            length
+        ));
+        let destination = dir
+            .0
+            .join(TableId::parse("K_K").unwrap().relative_path("ggegt"));
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"existing destination").unwrap();
+        assert!(
+            writer
+                .publish(vec![CompressedSegment {
+                    data: data.into(),
+                    seek_table,
+                    frame_lengths: vec![values.len()],
+                }])
+                .is_err()
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"existing destination");
+    }
+
+    #[test]
     fn invalid_publication_preserves_destination_without_temporary_files() {
         let dir = crate::TestDir::new("writer_cleanup");
         let writer = writer(&dir.0, "K_K");
@@ -365,13 +415,15 @@ mod tests {
             .join(TableId::parse("K_K").unwrap().relative_path("ggegt"));
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::write(&destination, b"existing destination").unwrap();
+        let length = writer.length;
         let mut table = zeekstd::SeekTable::new();
-        table.log_frame(1, (writer.length * 2) as u32).unwrap();
+        table.log_frame(1, (length * 2) as u32).unwrap();
         assert!(
             writer
                 .publish(vec![CompressedSegment {
                     data: Bytes::new(),
                     seek_table: table,
+                    frame_lengths: vec![length],
                 }])
                 .is_err()
         );

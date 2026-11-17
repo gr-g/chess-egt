@@ -33,10 +33,11 @@
 //! Probers and verifiers support input-first overlays with fallback only for
 //! missing files. Probers accept optional frame-cache budgets, including zero
 //! to retain no frames. Generation and verification eagerly load the required
-//! tables for each job. Statistics describe one root, do not use the frame cache, and do not
-//! support overlays. Do not rebuild metadata concurrently with generation or
-//! another rebuild. Malformed stored artifacts return [`EgtError::InvalidData`]
-//! with their location and source error; backend failures return [`EgtError::Storage`].
+//! tables for each job, retaining palette-coded frames. Statistics describe one
+//! root, do not use the frame cache, and do not support overlays. Do not rebuild
+//! metadata concurrently with generation or another rebuild. Malformed stored
+//! artifacts return [`EgtError::InvalidData`] with their location and source error;
+//! backend failures return [`EgtError::Storage`].
 //! Unsupported root format versions return [`EgtError::InvalidStorageLocation`].
 //!
 //! All storage operations block the calling thread, including remote reads and

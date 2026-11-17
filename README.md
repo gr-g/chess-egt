@@ -231,8 +231,8 @@ At equal distances, wins prefer checkmate, then capture, then promotion;
 losses prefer promotion, then capture, then checkmate. A capturing promotion
 is classified as a capture.
 
-The public `DtcOutcome` enum represents a win, draw, or loss. During generation
-and storage, outcomes use a packed 16-bit representation, `PackedOutcome`,
+The public `DtcOutcome` enum represents a win, draw, or loss. During generation,
+outcomes use a packed 16-bit representation, `PackedOutcome`,
 which also represents invalid or unresolved entries. It is structured as
 follows:
 - **Bits 0-2 (WDL and Conversion Type)**:
@@ -249,9 +249,9 @@ follows:
     This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 As a result, the working outcome array for a table with _n_ indexed locations
-requires _2n_ bytes. Loaded dependency outcomes also require two bytes per
-index slot. Additional memory overhead comes from block summaries, scan buffers,
-and compression buffers.
+requires _2n_ bytes. Loaded dependencies retain per-frame palettes and indices
+rather than expanded outcome arrays. Additional memory overhead comes from block
+summaries, scan buffers, and compression buffers.
 
 ### Tablebase organization and naming conventions
 
@@ -314,7 +314,8 @@ side piece counts in descending order, `K` counts mutually opposing pawn pairs
 ```
 
 A simple JSON file named `format.json` at the root contains a format
-descriptor. Currently this is: `{"format":"ggegt-v0.12"}`.
+descriptor. Currently this is: `{"format":"ggegt-v0.13"}`. Readers and
+generators reject roots with older descriptors.
 
 The hierarchical layout described above is designed to expose useful facts
 about the dependencies between groups of tables and facilitate grouping tables
@@ -568,14 +569,19 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
   bound allocation; compressed and decompressed lengths are also validated.
 - Readers cache the seek table. To load a frame not already cached, they fetch
   its compressed byte range and decompress it.
-- Before applying Zstd compression to a frame of _N_ positions, the 16-bit
-  `PackedOutcome` values are transposed to maximize compressibility. They are
-  reshaped as a sequence of bytes by taking:
-  1. First: the low byte of all _N_ outcomes (_N_ bytes).
-  2. Second: the high byte of all _N_ outcomes, skipping the (unused) high
-     byte for invalid and drawn positions (max _N_ bytes).
-  The transposed buffer is always exactly _2*N_ bytes: after the values are
-  transposed, the unused tail remains zero.
+- Each frame of _N_ positions has its own palette of _d_ distinct raw
+  `PackedOutcome` values, ordered by descending frequency, with ties broken by
+  ascending numeric raw value. Its uncompressed serialized layout is:
+  1. The palette count _d_ as a little-endian `u16` (1–65,535).
+  2. The _d_ palette entries, each a little-endian `u16`.
+  3. Zero-based palette indices in the unchanged position order:
+     - _d_ = 1: no indices; the whole frame has the single palette value.
+     - 2 ≤ _d_ ≤ 256: one `u8` index per position (_N_ bytes).
+     - _d_ > 256: all _N_ low index bytes, followed by all _N_ high index
+       bytes (_2N_ bytes).
+  The complete palette-and-indices payload, including the count, is compressed
+  together with Zstd level 19. Palette encoding does not change frame position
+  counts or boundaries.
 
 Frames are compressed in parallel and the results are collected. An
 `EgtFileWriter` validates their completeness and geometry before a consuming

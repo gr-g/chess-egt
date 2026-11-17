@@ -30,6 +30,7 @@ fn finalize_batch(
         .into_encoder(&mut data)?;
     let mut plain = Vec::with_capacity(frame_size.min(values.len()));
     let mut stats = TableStats::default();
+    let mut frame_lengths = Vec::new();
     for (frame_idx, chunk) in values.chunks_mut(frame_size).enumerate() {
         plain.clear();
         for (offset, cell) in chunk.iter_mut().enumerate() {
@@ -50,6 +51,7 @@ fn finalize_batch(
             plain.push(outcome);
         }
         encode_frame(&mut encoder, &plain)?;
+        frame_lengths.push(plain.len());
     }
     // into_seek_table does not flush, and finish would append a per-batch footer.
     encoder.flush()?;
@@ -58,6 +60,7 @@ fn finalize_batch(
         CompressedSegment {
             data: data.into(),
             seek_table,
+            frame_lengths,
         },
         stats,
     ))

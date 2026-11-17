@@ -1,9 +1,11 @@
 mod batch;
 mod cache;
+mod frame;
 pub(crate) mod writer;
 
 pub(crate) use batch::BatchReader;
 pub(crate) use cache::SharedFileCache;
+use frame::Frame;
 
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
@@ -43,7 +45,7 @@ pub struct EgtFileReader {
     key: ObjectPath,
     seek_table: zeekstd::SeekTable,
     /// `None` means the frame has not been loaded or has been evicted.
-    frames: Vec<Option<Vec<PackedOutcome>>>,
+    frames: Vec<Option<Frame>>,
 }
 
 impl EgtFileReader {
@@ -112,7 +114,7 @@ impl EgtFileReader {
             let compressed = table
                 .frame_size_comp(index as u32)
                 .map_err(|error| location.invalid_data(key, error))?;
-            if decompressed != (len * 2) as u64 || compressed == 0 {
+            if !frame::valid_length(decompressed, len) || compressed == 0 {
                 return Err(location.invalid_data(key, format!("invalid frame {index} length")));
             }
         }
@@ -146,23 +148,22 @@ impl EgtFileReader {
         let (frame_idx, offset) = self.locate_frame(index);
         Ok(self.frames[frame_idx]
             .as_ref()
-            .map(|uncompressed| uncompressed[offset]))
+            .map(|uncompressed| uncompressed.get(offset)))
     }
 
-    /// Get uncompressed data for the frame at `frame_index`.
-    fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&[PackedOutcome]> {
+    /// Gets the resident palette and indices, loading the frame if needed.
+    fn get_frame_data(&mut self, frame_idx: usize) -> EgtResult<&Frame> {
         self.ensure_uncompressed_frames(&[frame_idx])?;
 
         self.frames[frame_idx]
-            .as_deref()
+            .as_ref()
             .ok_or(EgtError::Internal("expected resident frame after loading"))
     }
 
-    /// Returns the in-memory outcomes for the table-local indices `[start, end)`,
-    /// loading and decompressing the frame if needed. The range must lie
-    /// within a single frame. This gives table scans direct slice access,
-    /// avoiding the per-element overhead of `read_from_index`.
-    pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<&[PackedOutcome]> {
+    /// Expands the table-local indices `[start, end)` into owned outcomes, loading
+    /// the frame if needed. The range must lie within a single frame; the cache
+    /// retains its palette and indices rather than the expanded outcomes.
+    pub fn frame_chunk(&mut self, start: usize, end: usize) -> EgtResult<Vec<PackedOutcome>> {
         if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
@@ -170,7 +171,7 @@ impl EgtFileReader {
             });
         }
         if start == end {
-            return Ok(&[]);
+            return Ok(Vec::new());
         }
         let (frame_idx, offset) = self.locate_frame(start);
         if end - start > self.frame_len(frame_idx) - offset {
@@ -179,14 +180,14 @@ impl EgtFileReader {
             ));
         }
         let data = self.get_frame_data(frame_idx)?;
-        Ok(&data[offset..offset + (end - start)])
+        data.expand(offset..offset + (end - start))
     }
 
     fn frame_chunk_cached(
         &self,
         start: usize,
         end: usize,
-    ) -> EgtResult<Option<&[PackedOutcome]>> {
+    ) -> EgtResult<Option<Vec<PackedOutcome>>> {
         if start > end || end > self.egt.index_range() {
             return Err(EgtError::IndexOutOfRange {
                 index: end,
@@ -194,7 +195,7 @@ impl EgtFileReader {
             });
         }
         if start == end {
-            return Ok(Some(&[]));
+            return Ok(Some(Vec::new()));
         }
         let (frame_idx, offset) = self.locate_frame(start);
         if end - start > self.frame_len(frame_idx) - offset {
@@ -202,9 +203,10 @@ impl EgtFileReader {
                 "frame_chunk range crosses a frame boundary",
             ));
         }
-        Ok(self.frames[frame_idx]
+        self.frames[frame_idx]
             .as_ref()
-            .map(|uncompressed| &uncompressed[offset..offset + end - start]))
+            .map(|uncompressed| uncompressed.expand(offset..offset + end - start))
+            .transpose()
     }
 
     /// Maps a position to the corresponding index. This is used when probing
@@ -256,7 +258,7 @@ impl EgtFileReader {
     }
 
     fn frame_bytes(&self, frame_idx: usize) -> usize {
-        self.frame_len(frame_idx) * std::mem::size_of::<PackedOutcome>()
+        self.frames[frame_idx].as_ref().map_or(0, Frame::bytes)
     }
 
     fn invalid_frame(
@@ -287,7 +289,7 @@ impl EgtFileReader {
         let (frame_idx, offset) = self.locate_frame(index);
 
         let data = self.get_frame_data(frame_idx)?;
-        Ok(data[offset])
+        Ok(data.get(offset))
     }
 
     fn read_indices_cached(&self, indices: &[usize]) -> EgtResult<Option<Vec<PackedOutcome>>> {
@@ -323,7 +325,7 @@ impl EgtFileReader {
         Ok(())
     }
 
-    fn read_frames(&self, missing: &[usize]) -> EgtResult<Vec<Vec<PackedOutcome>>> {
+    fn read_frames(&self, missing: &[usize]) -> EgtResult<Vec<Frame>> {
         let table = &self.seek_table;
         let ranges = missing
             .iter()
@@ -355,7 +357,8 @@ impl EgtFileReader {
             if bytes.len() as u64 != range.end - range.start {
                 return Err(self.invalid_frame(frame, "truncated tablebase range"));
             }
-            decode_frame(&bytes, self.frame_len(frame)).map_err(|error| match error {
+            let encoded_len = table.frame_size_decomp(frame as u32)? as usize;
+            decode_frame(&bytes, self.frame_len(frame), encoded_len).map_err(|error| match error {
                 EgtError::WorkingMemoryAllocation { .. } => error,
                 other => self.invalid_frame(frame, other),
             })
@@ -363,18 +366,18 @@ impl EgtFileReader {
     }
 }
 
-fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<PackedOutcome>> {
-    let mut transposed = Vec::new();
-    transposed.try_reserve_exact(len * 2)
+fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<Frame> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(encoded_len)
         .map_err(|error| EgtError::WorkingMemoryAllocation {
             context: "frame decompression buffer".to_owned(),
-            bytes: len as u128 * 2,
+            bytes: encoded_len as u128,
             reason: error.to_string(),
         })?;
-    transposed.resize(len * 2, 0);
+    data.resize(encoded_len, 0);
     // One-shot decoding is bounded by both slices and rejects truncated input.
     // zeekstd's streaming decoder can otherwise loop at premature EOF.
-    let decoded = zstd_safe::decompress(&mut transposed[..], compressed).map_err(|code| {
+    let decoded = zstd_safe::decompress(&mut data[..], compressed).map_err(|code| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -383,65 +386,16 @@ fn decode_frame(compressed: &[u8], len: usize) -> EgtResult<Vec<PackedOutcome>> 
             ),
         )
     })?;
-    if decoded != transposed.len() {
+    if decoded != data.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "decompressed tablebase frame has wrong length",
         )
         .into());
     }
-    detranspose_frame(&transposed, len)
+    Frame::decode(data, len)
 }
 
-/// Transposes (bit-slices) a frame of `PackedOutcome` values using an 8-8
-/// pattern: the low bytes (bits 0-7) are written first, then the high bytes
-/// (bits 8-15).
-fn transpose_frame(uncompressed: &[PackedOutcome]) -> Vec<u8> {
-    let n = uncompressed.len();
-    let mut output = vec![0u8; n * 2];
-
-    // Slice 0 (bits 0-7) -> n bytes
-    // Slice 1 (bits 8-15) -> n bytes
-    let mut j = n;
-    for i in 0..n {
-        let val = uncompressed[i].to_u16();
-        if val == 0b000 || val == 0b001 {
-            output[i] = val as u8;
-        } else {
-            output[i] = (val & 0xFF) as u8;
-            output[j] = (val >> 8) as u8;
-            j += 1;
-        }
-    }
-
-    output
-}
-
-/// Reverses the transposition (un-bit-slices) of a frame produced by
-/// `transpose_frame` using the 8-8 pattern.
-fn detranspose_frame(transposed: &[u8], n: usize) -> EgtResult<Vec<PackedOutcome>> {
-    let mut output = Vec::new();
-    output.try_reserve_exact(n)
-        .map_err(|error| EgtError::WorkingMemoryAllocation {
-            context: "decompressed frame outcomes".to_owned(),
-            bytes: n as u128 * 2,
-            reason: error.to_string(),
-        })?;
-    output.resize(n, PackedOutcome::INVALID);
-
-    let mut j = n;
-    for i in 0..n {
-        if transposed[i] == 0b000 || transposed[i] == 0b001 {
-            let val = transposed[i] as u16;
-            output[i] = PackedOutcome::from_u16(val);
-        } else {
-            let val = u16::from_le_bytes([transposed[i], transposed[j]]);
-            output[i] = PackedOutcome::from_u16(val);
-            j += 1;
-        }
-    }
-    Ok(output)
-}
 
 /// Mirrors a chess position horizontally for independent indexing checks.
 #[cfg(test)]
@@ -606,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_detranspose_roundtrip() {
+    fn test_palette_frame_roundtrip() {
         // Use a frame size that is a multiple of 8 (as in production).
         let n = 16;
         let mut inputs = vec![PackedOutcome::INVALID; n];
@@ -618,8 +572,8 @@ mod tests {
         inputs[11] = PackedOutcome::new_win(ConversionType::Capture, 1);
         inputs[12] = PackedOutcome::DRAW;
         inputs[13] = PackedOutcome::new_loss(ConversionType::Promotion, 1200);
-        let transposed = transpose_frame(&inputs);
-        let recovered = detranspose_frame(&transposed, n).unwrap();
+        let encoded = frame::encode(&inputs).unwrap();
+        let recovered = Frame::decode(encoded, n).unwrap().expand(0..n).unwrap();
         for i in 0..n {
             assert_eq!(
                 inputs[i].to_u16(),
@@ -730,12 +684,13 @@ mod tests {
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
             encoder.compress(&vec![0; bytes]).unwrap();
             encoder.finish().unwrap();
-            assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());
+            assert!(EgtFileReader::new_from_file(&dir.0, "K_K")
+                .and_then(|mut reader| reader.read_from_index(0)).is_err());
         }
         // A correct payload with an extra empty frame has the wrong frame count.
         let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
         let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
-        encoder.compress(&vec![0; file.egt.index_range() * 2]).unwrap();
+        encoder.compress(&frame::encode(&vec![PackedOutcome::INVALID; file.egt.index_range()]).unwrap()).unwrap();
         encoder.end_frame().unwrap();
         encoder.finish().unwrap();
         assert!(EgtFileReader::new_from_file(&dir.0, "K_K").is_err());

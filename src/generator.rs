@@ -99,12 +99,12 @@ impl EgtGenerator {
                 dependencies.dedup();
                 let mut reader =
                     BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
+                reader.load()?;
                 println!(
-                    "{}: loading {} bytes of dependencies...",
+                    "{}: loaded {} bytes of dependencies.",
                     pair.table.tablename(),
                     reader.resident_bytes(),
                 );
-                reader.load()?;
                 let dependency_time = start.elapsed();
                 let pair_stats =
                     solver::generate_pair(&self.base_path, &pair, &reader, dependency_time)?;

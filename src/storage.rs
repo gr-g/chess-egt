@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::{EgtError, EgtResult};
 
-const TABLEBASE_FORMAT: &str = "ggegt-v0.12";
+const TABLEBASE_FORMAT: &str = "ggegt-v0.13";
 
 /// Root metadata is immutable and independent of optional per-table statistics.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +277,25 @@ mod tests {
             Err(EgtError::InvalidData { .. })
         ));
         assert!(fresh.format_validated.get().is_none());
+    }
+
+    #[test]
+    fn previous_format_is_rejected_without_modification() {
+        let location = Location::parse("memory:///tables").unwrap();
+        let key = location.prefix.clone().join("format.json");
+        let bytes = br#"{"format":"ggegt-v0.12"}"#.to_vec();
+        block_on(location.store.put(&key, bytes.clone().into())).unwrap();
+        assert!(matches!(
+            location.validate_format(),
+            Err(EgtError::InvalidStorageLocation(_))
+        ));
+        assert!(matches!(
+            location.ensure_format(),
+            Err(EgtError::InvalidStorageLocation(_))
+        ));
+        let result = block_on(location.store.get(&key)).unwrap();
+        assert_eq!(block_on(result.bytes()).unwrap().as_ref(), bytes.as_slice());
+        assert!(location.format_validated.get().is_none());
     }
 
     #[test]

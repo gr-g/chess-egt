@@ -214,9 +214,8 @@ impl SharedFileCache {
             .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
         let index = reader.map_routed_position_to_index(position, reflected)?;
         let frame = reader.locate_frame(index).0;
-        let bytes = reader.frame_bytes(frame);
         let (outcome, over_limit) = if let Some(outcome) = reader.read_from_index_cached(index)? {
-            let over_limit = self.record_access(&file, frame, bytes)?;
+            let over_limit = self.record_access(&file, frame, reader.frame_bytes(frame))?;
             drop(reader);
             (outcome, over_limit)
         } else {
@@ -227,7 +226,7 @@ impl SharedFileCache {
                 .write()
                 .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
             let outcome = writer.read_from_index(index)?;
-            (outcome, self.record_access(&file, frame, bytes)?)
+            (outcome, self.record_access(&file, frame, writer.frame_bytes(frame))?)
         };
         if over_limit {
             self.enforce_limit()?;
@@ -450,10 +449,11 @@ mod tests {
         ];
         let mut frame_bytes = None;
         for (name, _) in positions {
-            let file = write_fixture(&dir.0, name, |_| PackedOutcome::DRAW);
+            let mut file = write_fixture(&dir.0, name, |_| PackedOutcome::DRAW);
             assert_eq!(file.num_frames(), 1);
+            file.read_from_index(0).unwrap();
             let bytes = file.frame_bytes(0);
-            assert_eq!(bytes, file.egt.index_range() * 2);
+            assert_eq!(bytes, 4);
             assert_eq!(frame_bytes.get_or_insert(bytes), &bytes);
         }
         let frame_bytes = frame_bytes.unwrap();
