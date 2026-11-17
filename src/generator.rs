@@ -125,7 +125,9 @@ impl EgtGenerator {
                         verification::verify_egt(&reader, name, &egt)?;
                     }
                 }
-                print_pair_stats(&pair_stats[0], pair_stats.get(1), start.elapsed());
+                for stats in &pair_stats {
+                    print_table_stats(stats);
+                }
                 results.extend(pair_stats);
             }
             Ok(())
@@ -173,16 +175,16 @@ fn generation_summary(
         0.0
     };
     let mut summary = format!(
-        "Generated {} tables: {} unique positions, {:.2} MiB in {}.\nAverage compression: {:.2} bits/pos.",
+        "Generated {} tables: {} unique positions in {}.\nCompressed size: {:.2} MiB ({:.2} bits/pos).",
         total.available_tables,
         unique_positions,
-        bytes as f64 / (1024.0 * 1024.0),
         format_timing(elapsed, total.index_range, threads),
+        bytes as f64 / (1024.0 * 1024.0),
         average_compression,
     );
     if let Some((tablename, bits_per_pos)) = lowest_compression {
         summary.push_str(&format!(
-            " Lowest compression ({tablename}): {bits_per_pos:.2} bits/pos."
+            " Lowest compression: {tablename} ({bits_per_pos:.2} bits/pos)."
         ));
     }
     summary
@@ -205,7 +207,7 @@ mod tests {
         };
         assert_eq!(
             generation_summary(&total, Duration::from_secs(65), 2, Some(("KQ_K", 3.0))),
-            "Generated 2 tables: 4194304 unique positions, 1.00 MiB in 00h:01m:05s (26.00 μs/index on 2 threads).\nAverage compression: 2.00 bits/pos. Lowest compression (KQ_K): 3.00 bits/pos."
+            "Generated 2 tables: 4194304 unique positions in 00h:01m:05s (26.00 μs/index on 2 threads).\nCompressed size: 1.00 MiB (2.00 bits/pos). Lowest compression: KQ_K (3.00 bits/pos)."
         );
         assert_eq!(
             format_timing(Duration::from_millis(1250), 1_000_000, 1),

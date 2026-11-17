@@ -779,13 +779,17 @@ pub(super) fn generate_pair(
         println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
         stats.push(super::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
     }
+    let finalize_time = finalize_start.elapsed();
+    let total_time = dependency_time + result.init_time + result.propagation_time + finalize_time;
+    let names = ids().map(|id| id.tablename()).collect::<Vec<_>>().join(", ");
     println!(
-        "{}: phase timings: dependencies {:.3}s, init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s",
-        pair.table.tablename(),
+        "{}: phase timings: dependencies {:.3}s, init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s, total {:.3}s.",
+        names,
         dependency_time.as_secs_f64(),
         result.init_time.as_secs_f64(),
         result.propagation_time.as_secs_f64(),
-        finalize_start.elapsed().as_secs_f64(),
+        finalize_time.as_secs_f64(),
+        total_time.as_secs_f64(),
     );
     Ok(stats)
 }
