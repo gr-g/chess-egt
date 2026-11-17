@@ -16,13 +16,13 @@ from stats_csv import (
 # Reference values from scaling.md.
 REFERENCE_PIECES = 5
 CORE_US_PER_INDEX = 1.28
-COMPUTE_GROWTH_PER_PIECE = 1.4
+COMPUTE_GROWTH_PER_PIECE = 1.125
 PARALLEL_EFFICIENCY = 0.70
 
 # Unlike the actual table CSV compression, these rates use INDEX positions.
 # Use the measured five-piece rate and the six/seven-piece range midpoints.
 COMPRESSION_BITS_PER_INDEX = 0.849
-COMPRESSION_BITS_PER_INDEX_6 = 1.05
+COMPRESSION_BITS_PER_INDEX_6 = 1.00
 COMPRESSION_GROWTH_PER_PIECE = 0.20  # 7 pieces: 1.25; extrapolate beyond seven.
 
 # Approximate peak memory as twice the largest pair: two arrays at 2 bytes/index
