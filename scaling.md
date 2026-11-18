@@ -111,7 +111,7 @@ format, including both sides of each table pair. We start from the measured
 compression for tables up to 5 pieces.
 
 | Pieces | Compressed size | Bits / index position | Bits / unique position |
-|---|---:|---:|---|
+|---|---:|---:|--:|
 | 3 | 0.04 MiB | 0.74 | 0.84 |
 | 4 | 12.19 MiB | 0.66 | 0.82 |
 | 5 | 3.289 GiB | 0.78 | 1.07 |
