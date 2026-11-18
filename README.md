@@ -536,20 +536,6 @@ the type of resolution, where `n` counts all pieces, including pawns and kings.
 In this way, blocks can be skipped if the record indicates that no positions
 were resolved at that ply for the given resolution.
 
-#### Alternative approach for initialization
-
-An alternative to forward dependency probing would be to scan simpler endgames
-and generate reverse capture/promotion moves to update their predecessors.
-These unmove functions are not part of the current implementation.
-
-If this approach were used, special care would be needed for unmoves
-from a pawnless successor (which has 8-way symmetry) to a predecessor with
-pawns (which has 2-way horizontal symmetry). The process would be to
-reconstruct the 4 rotations of the canonical pawnless board, then call the
-retrograde unmove function on each of the 4 rotations. For each resulting
-predecessor board, if the newly placed pawn lands on files e–h, horizontally
-reflect the board to files a–d to canonicalize.
-
 ### Storage and memory layer
 
 #### File format and compression
