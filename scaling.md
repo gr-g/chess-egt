@@ -56,11 +56,11 @@ positions stored in those dependencies are actually reachable by a promotion
 move, but this is currently not planned.
 
 For **table verification**, the theoretical model is reversed: the required
-dependencies are allocated in memory during the entire process, while the table
-to verify could be read sequentially. As a result, our memory requirements for
-generation (i.e. "double the size in memory of the table-pair") are generally
-suitable for verification, too (and are in fact more difficult to reduce
-compared to generation).
+dependencies - including the "twin" table - are allocated in memory during the
+entire process, while the table to verify could be read sequentially. As a
+result, our memory requirements for generation (i.e. "double the size in memory
+of the table-pair") are generally suitable for verification, too (and are in
+fact more difficult to reduce compared to generation).
 
 The table below shows the worst-case requirements for table-pair generation.
 
@@ -82,23 +82,23 @@ table-pair plus a comparable amount of memory to store dependencies.
 The following measurements are based on runs executed on an AMD Ryzen 7 5700G,
 with 2 threads and without including verification.
 
-| Pieces | Index positions | Elapsed time (on 2 threads) | Allocated core-hours | Allocated core-hours per billion indices |
+| Pieces | Index positions | Elapsed time (on 2 threads) | Allocated core-hours | μs per index position |
 |---|---:|---:|---:|---:|
 | 3 | 416,640 | < 1 s | — | — |
-| 4 | 155,965,898 | 1 m 37 s | 0.0539 | 0.346 |
-| 5 | 35,268,305,340 | 6 h 17 m 06 s | 12.57 | 0.356 |
+| 4 | 155,965,898 | 1 m 33 s | 0.05 | 1.20 |
+| 5 | 35,268,305,340 | 5 h 57 m 53 s | 11.93 | 1.22 |
 
 From four to five pieces, index positions grow 226× and generation time grows
-233×: the cost per index position rises only 1.03×.
+230×: the cost per index position rises only marginally.
 
-Assuming a value of `0.4` for required core-hours per billion indices, and
-assuming a cost for cloud compute resources in the range $0.03-$0.05 per
-core-hour (as of end-2026), we have the following estimates.
+Assuming a value of `1.30` μs per index position for larger sets, and assuming a
+cost for cloud compute resources in the range $0.03-$0.05 per core-hour (as of
+end-2026), we have the following estimates.
 
-| Pieces | Core-hours per billion indices | Allocated core-hours | Cost |
+| Pieces | μs per index position | Allocated core-hours | Cost |
 |---|---:|---:|---:|
-| 6 (estimated) | 0.4 | 2,242 | $67-$112 |
-| 7 (estimated) | 0.4 | 271,738 | $8,150-$13,600 |
+| 6 (estimated) | 1.30 | 2,025 | $60-$102 |
+| 7 (estimated) | 1.30 | 245,319 | $7,350-$12,270 |
 
 In terms of **time**, these estimates imply generation of all 6-piece tables in
 approximately 3 days on a single server with 32 vCPUs, and generation of all
@@ -112,16 +112,16 @@ compression for tables up to 5 pieces.
 
 | Pieces | Compressed size | Bits / index position | Bits / unique position |
 |---|---:|---:|---|
-| 3 | 0.04 MiB | 0.68 | 0.84 |
-| 4 | 13.29 MiB | 0.71 | 0.89 |
-| 5 | 3.495 GiB | 0.85 | 1.16 |
+| 3 | 0.04 MiB | 0.74 | 0.84 |
+| 4 | 12.19 MiB | 0.66 | 0.82 |
+| 5 | 3.289 GiB | 0.78 | 1.07 |
 
-Let's assume `1.00` bits per index position at 6 pieces and `1.20` bits per
+Let's assume `0.90` bits per index position at 6 pieces and `1.00` bits per
 index position at 7 pieces. Let's also assume a cost for cloud storage in the
 range $0.01–$0.02 per GiB-month (as of end-2026). We have these estimates.
 
 | Pieces | Bits / index position | Compressed size | Monthly storage cost |
 |---|---:|---:|---:|
-| 5 (measured) | 0.85 | 3.495 GiB | $0.03–$0.07 |
-| 6 (estimated) | 1.00 | 0.64 TiB | $6–$13 |
-| 7 (estimated) | 1.20 | 93 TiB | $950–$1,900 |
+| 5 (measured) | 0.78 | 3.289 GiB | $0.03–$0.07 |
+| 6 (estimated) | 0.90 | 0.57 TiB | $5–$12 |
+| 7 (estimated) | 1.00 | 77 TiB | $790–$1,600 |

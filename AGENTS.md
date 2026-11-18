@@ -13,36 +13,27 @@
 - The exact library interface to expose and the command line interface are
   still to be finalized.
 - Keeping code simple, short and elegant has priority over finding a way to
-  implement all desired features. If it cannot be done with simple, short and
-  elegant code, then perhaps it should not be done.
-- Adding one or two focused and compact tests to check functionality is ok.
-  Adding hundreds and hundreds of lines of tests is not ok.
+  implement each requirement to the last bit. If it cannot be done with simple,
+  short and elegant code, then perhaps it should not be done.
 - Always leave AGENTS.md untouched.
-- Do no use documentation as a diary, it should reflect current status and not
-  mention what the code was doing in the past.
 
 See the design specifications in `README.md` for more information.
 
 Current tablebase generation results (with --noverify):
 ```
 == All 3 pieces, 2 threads ==
-Generated 16 tables: 367868 unique positions, 0.04 MiB in 00h00m01s.
-Average compression: 0.84 bits/pos. Lowest compression (KQ_K): 2.04 bits/pos.
+Generated 16 tables: 367868 unique positions in 00h:00m:01s (4.84 μs/index on 2 threads).
+Compressed size: 0.04 MiB (0.84 bits/pos). Lowest compression: KQ_K (2.05 bits/pos).
 ```
 ```
 == All 4 pieces, 2 threads ==
-Generated 176 tables: 125132316 unique positions, 12.42 MiB in 00h01m34s.
-Average compression: 0.83 bits/pos. Lowest compression (KR_KQ): 3.48 bits/pos.
+Generated 176 tables: 125132316 unique positions in 00h:01m:33s (1.20 μs/index on 2 threads).
+Compressed size: 12.19 MiB (0.82 bits/pos). Lowest compression: KB_KQ (3.42 bits/pos).
 ```
 ```
 == All 5 pieces, 2 threads ==
-Generated 1496 tables: 25880730473 unique positions, 3368.41 MiB in 06h05m45s.
-Average compression: 1.09 bits/pos. Lowest compression (KBB_KQ): 4.20 bits/pos.
-```
-```
-== All 5 pieces, 32 threads on AMD EPYC-Genoa ==
-Generated 1496 tables: 25880730473 unique positions, 3578.66 MiB in 00h32m47s.
-Average compression: 1.16 bits/pos. Lowest compression (KBB_KQ): 4.23 bits/pos.
+Generated 1496 tables: 25880730473 unique positions in 05h:57m:53s (1.22 μs/index on 2 threads).
+Compressed size: 3289.07 MiB (1.07 bits/pos). Lowest compression: KBB_KQ (3.80 bits/pos).
 ```
 
 ## TODO
