@@ -2,9 +2,9 @@
 """Sequential Linux generation benchmarks, using only the Python standard library.
 
 Use a fresh output directory and existing dependencies in --input-path.
-Each selector is benchmarked separately, including its quiet-move twins, with
-internal verification disabled. Hashing hierarchical artifacts happens after
-timing; no comparison against a reference generation is performed.
+Each selector is benchmarked separately, including its quiet-move twins.
+Hashing hierarchical artifacts happens after timing; no comparison against a
+reference generation is performed.
 """
 
 import argparse
@@ -129,7 +129,7 @@ def main():
                 tables = run / "tables"
                 command = [str(binary), "--path", str(tables), "--input-path",
                            str(input_path), "--generate", selector,
-                           "--threads", str(threads), "--noverify"]
+                           "--threads", str(threads)]
                 print(f"Running {selector}, {threads} thread(s), repeat {repeat}", flush=True)
                 timing = measure(command, run / "generation.log", args.timeout)
                 artifacts = sorted(p for p in tables.rglob("*") if p.is_file())

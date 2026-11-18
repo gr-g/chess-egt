@@ -7,17 +7,13 @@ use crate::AggregateStats;
 use crate::egt_file::BatchReader;
 use crate::stats::format_timing;
 use crate::storage::Location;
-use crate::{
-    EgtError, EgtFileReader, EgtResult, EgtStats, GenerationPlan, resolve_selectors, verification,
-};
+use crate::{EgtError, EgtResult, EgtStats, GenerationPlan, resolve_selectors};
 
 /// Generates one pair at a time with eagerly loaded conversion dependencies.
-/// Working arrays and all decompressed dependencies must fit in memory together;
-/// dependencies are retained through optional verification, then released.
+/// Working arrays and all decompressed dependencies must fit in memory together.
 pub struct EgtGenerator {
     base_path: Location,
     input_path: Option<Location>,
-    verify: bool,
     threads: usize,
 }
 
@@ -35,12 +31,11 @@ impl EgtGenerator {
         Self {
             base_path: location,
             input_path: None,
-            verify: true,
             threads: 0,
         }
     }
 
-    /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
+    /// Sets generation workers. Zero (the default) uses Rayon's default.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
@@ -57,12 +52,6 @@ impl EgtGenerator {
         Ok(())
     }
 
-    /// Enables or disables the internal consistency check performed after
-    /// generation. Enabled by default.
-    pub fn set_verify(&mut self, verify: bool) {
-        self.verify = verify;
-    }
-
     /// Generates a logical selector and its quiet-move twins.
     /// Capture/promotion dependencies must already exist or be explicitly selected.
     pub fn generate(&self, selector: &str) -> EgtResult<Vec<EgtStats>> {
@@ -70,10 +59,8 @@ impl EgtGenerator {
     }
 
     /// Deduplicates selectors into twin-pair jobs, ordered by pieces then pawns.
-    /// Reuses one Rayon pool and loaded dependencies with verification.
-    /// All enumerated dependencies must exist before initialization starts.
-    /// Completed pairs are published and optionally verified before releasing
-    /// their loaded tables and starting the next job.
+    /// Reuses one Rayon pool across jobs. Each pair's dependencies must exist
+    /// before initialization and are released before starting the next job.
     pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let start = std::time::Instant::now();
         let plan = GenerationPlan::new(resolve_selectors(selectors)?);
@@ -108,23 +95,6 @@ impl EgtGenerator {
                 let dependency_time = start.elapsed();
                 let pair_stats =
                     solver::generate_pair(&self.base_path, &pair, &reader, dependency_time)?;
-                if self.verify {
-                    let names: Vec<_> = pair_stats
-                        .iter()
-                        .map(|stats| stats.tablename.clone())
-                        .collect();
-                    let mut verification = Vec::new();
-                    // Load explicit outputs so input artifacts cannot shadow either one.
-                    for name in &names {
-                        let file = EgtFileReader::open_in(&self.base_path, name)?;
-                        verification.push(file.egt().clone());
-                        reader.insert(file);
-                    }
-                    reader.load()?;
-                    for (name, egt) in names.iter().zip(verification) {
-                        verification::verify_egt(&reader, name, &egt)?;
-                    }
-                }
                 for stats in &pair_stats {
                     print_table_stats(stats);
                 }

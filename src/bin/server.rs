@@ -460,7 +460,6 @@ mod tests {
         let prober = tokio::task::spawn_blocking(move || {
             let mut generator = EgtGenerator::new(&path).unwrap();
             generator.set_threads(2);
-            generator.set_verify(false);
             generator
                 .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
                 .unwrap();

@@ -46,10 +46,6 @@ struct Cli {
     #[arg(long, value_name = "SELECTOR", num_args = 1..)]
     list: Vec<String>,
 
-    /// Skip the internal consistency check performed after generation.
-    #[arg(long, requires = "generate", conflicts_with_all = ["verify", "stats", "cache_stats", "list", "position"])]
-    noverify: bool,
-
     /// Probe a quoted FEN position (mutually exclusive with selector actions).
     #[arg(value_name = "FEN")]
     position: Option<String>,
@@ -73,7 +69,10 @@ fn run() -> Result<(), EgtError> {
     } else if !cli.generate.is_empty() {
         let selectors: Vec<_> = cli.generate.iter().map(String::as_str).collect();
         let mut generator = EgtGenerator::new(&cli.path)?;
-        configure_generator(&mut generator, &cli)?;
+        generator.set_threads(usize::from(cli.threads));
+        if let Some(ref input) = cli.input_path {
+            generator.set_input_path(input)?;
+        }
         generator.generate_selected(&selectors)?;
     } else if !cli.verify.is_empty() {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
@@ -132,15 +131,6 @@ fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
         prober.set_input_path(input)?;
     }
     Ok(prober)
-}
-
-fn configure_generator(generator: &mut EgtGenerator, cli: &Cli) -> Result<(), EgtError> {
-    generator.set_threads(usize::from(cli.threads));
-    if let Some(ref input) = cli.input_path {
-        generator.set_input_path(input)?;
-    }
-    generator.set_verify(!cli.noverify);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -220,7 +210,6 @@ mod tests {
             let error = Cli::try_parse_from(["chess-egt", action, "3", "--input-path", "other"])
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-            assert!(Cli::try_parse_from(["chess-egt", action, "3", "--noverify"]).is_err());
         }
     }
 
@@ -237,17 +226,16 @@ mod tests {
             "in",
             "--threads",
             "2",
-            "--noverify",
         ])
         .unwrap();
         assert_eq!(cli.generate, ["KQ_K", "KR_K"]);
         assert_eq!(cli.path, PathBuf::from("out"));
         assert_eq!(cli.input_path, Some(PathBuf::from("in")));
         assert_eq!(cli.threads, 2);
-        assert!(cli.noverify);
+
         let cli = Cli::try_parse_from(["chess-egt", FEN]).unwrap();
         assert_eq!(cli.position.as_deref(), Some(FEN));
-        assert!(Cli::try_parse_from(["chess-egt", "--verify", "KQ_K", "--noverify"]).is_err());
+
         for flag in ["--generate-all-3", "--generate-all-4", "--generate-all-5"] {
             assert!(Cli::try_parse_from(["chess-egt", flag]).is_err());
         }

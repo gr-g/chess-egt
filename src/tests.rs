@@ -4,10 +4,9 @@ use shakmaty::{Chess, Color, Position};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-fn unverified_generator(path: impl AsRef<Path>) -> EgtGenerator {
+fn test_generator(path: impl AsRef<Path>) -> EgtGenerator {
     let mut generator = EgtGenerator::new(path).unwrap();
     generator.set_threads(2);
-    generator.set_verify(false);
     generator
 }
 
@@ -31,7 +30,7 @@ fn aggregate(tables: &[EgtStats]) -> AggregateStats {
 
 fn verify_internal_consistency(selector: &str) {
     let dir = TestDir::new(&format!("verify_internal_consistency_{selector}"));
-    let generator = unverified_generator(&dir.0);
+    let generator = test_generator(&dir.0);
     generator.generate_selected(&["K_K", selector]).unwrap();
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
     verifier.set_threads(2);
@@ -54,7 +53,7 @@ fn test_verify_internal_consistency_kr_k() {
 #[test]
 fn test_verify_internal_consistency_kp_k() {
     let dir = TestDir::new("verify_internal_consistency_KP_K");
-    let generator = unverified_generator(&dir.0);
+    let generator = test_generator(&dir.0);
     let tables = generator
         .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
@@ -99,7 +98,6 @@ fn default_and_zero_threads_generate_and_verify() {
     for threads in [None, Some(0)] {
         let dir = TestDir::new(&format!("default_threads_{threads:?}"));
         let mut generator = EgtGenerator::new(&dir.0).unwrap();
-        generator.set_verify(false);
         let mut verifier = EgtVerifier::new(&dir.0).unwrap();
         if let Some(threads) = threads {
             generator.set_threads(threads);
@@ -129,17 +127,6 @@ fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
     let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(cache_bytes).unwrap();
 
-    let reference = TestDir::new("bounded_cache_size_reference");
-    unverified_generator(&reference.0)
-        .generate_selected(&["K_K", "KQ_K"])
-        .unwrap();
-    for stats in &tables {
-        assert_eq!(
-            std::fs::read(table_path(&dir.0, &stats.tablename, "ggegt")).unwrap(),
-            std::fs::read(table_path(&reference.0, &stats.tablename, "ggegt")).unwrap()
-        );
-    }
-
     let egt = Egt::from_tablename("KQ_K").unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
@@ -152,7 +139,7 @@ fn probe_with_moves_matches_scalar_probes() {
     use shakmaty::{CastlingMode, fen::Fen};
 
     let dir = TestDir::new("probe_with_moves");
-    unverified_generator(&dir.0)
+    test_generator(&dir.0)
         .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
@@ -237,14 +224,13 @@ fn zero_cache_size_supports_probing_generated_and_verified_tables() {
 }
 
 #[test]
-fn generator_publishes_finalized_stats_and_verifies_both_outputs_not_input() {
+fn generator_publishes_finalized_stats_with_shadowed_outputs() {
     use sha2::{Digest, Sha256};
 
     let output = TestDir::new("generator_stats_output");
     let input = TestDir::new("generator_stats_input");
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
-    // Valid input metadata makes these malformed artifacts effective: only
-    // pinning both output orientations can keep verification from opening them.
+    // Output identities in the input overlay must not be read during generation.
     for name in ["KQ_K", "K_KQ"] {
         write_artifact(&input.0, name, "ggegt", &[0xff; 64]);
     }
@@ -290,7 +276,6 @@ fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
     let location = Location::parse("memory:///nested/tables").unwrap();
     let mut generator = EgtGenerator::from_location(location.clone());
     generator.set_threads(2);
-    generator.set_verify(false);
     generator.generate("K_K").unwrap();
     let tables = generator.generate("KQ_K").unwrap();
     assert_eq!(tables.len(), 2);
@@ -315,7 +300,7 @@ fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
 fn input_lookup_falls_back_only_for_missing_files() {
     let output = TestDir::new("input_fallback_output");
     let input = TestDir::new("input_fallback_input");
-    unverified_generator(&output.0).generate("K_K").unwrap();
+    test_generator(&output.0).generate("K_K").unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
 
     let probe = || {
@@ -337,7 +322,7 @@ fn input_lookup_falls_back_only_for_missing_files() {
 fn changing_input_path_invalidates_warmed_lookup_precedence() {
     let output = TestDir::new("changed_input_output");
     let input = TestDir::new("changed_input_input");
-    unverified_generator(&output.0).generate("K_K").unwrap();
+    test_generator(&output.0).generate("K_K").unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
     let egt = Egt::from_tablename("K_K").unwrap();
@@ -355,7 +340,6 @@ fn generation_replaces_placeholders_and_invalidates_hierarchy_summaries() {
     let location = Location::parse("memory:///stats-publication").unwrap();
     let mut generator = EgtGenerator::from_location(location.clone());
     generator.set_threads(2);
-    generator.set_verify(false);
     let statistics = EgtStatistics::from_location(location.clone());
     let missing = statistics.cache_stats(&["2"]).unwrap();
     assert_eq!(missing.selected_tables, 1);

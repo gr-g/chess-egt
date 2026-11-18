@@ -1566,7 +1566,6 @@ mod tests {
         let location = Location::parse(&test_dir.0).unwrap();
         let mut generator = EgtGenerator::new(&test_dir.0).unwrap();
         generator.set_threads(2);
-        generator.set_verify(false);
         if endgame != "K_K" {
             generator.generate("K_K").unwrap();
         }

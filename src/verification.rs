@@ -107,7 +107,7 @@ impl EgtVerifier {
 }
 
 /// Verifies independent blocks and returns the number of valid, unique positions.
-pub(crate) fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize> {
+fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize> {
     let tablename = egt.tablename();
     let local_range = egt.index_range();
 
@@ -287,7 +287,6 @@ mod tests {
         let dir = TestDir::new("verify_position_counts");
         let mut generator = crate::EgtGenerator::new(&dir.0).unwrap();
         generator.set_threads(2);
-        generator.set_verify(false);
         generator.generate("K_K").unwrap();
         let stats = generator.generate("KQ_K").unwrap();
         let source = stats

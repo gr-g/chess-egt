@@ -39,7 +39,7 @@ timeout --signal=TERM --kill-after=15s 600s \
   --callgrind-out-file=target/profile-kq-kr.callgrind \
   target/profiling/chess-egt \
   --path target/profile-kq-kr-tables --input-path ~/ggegt \
-  --generate KQ_KR --threads 1 --noverify
+  --generate KQ_KR --threads 1
 callgrind_annotate --auto=no --threshold=100 target/profile-kq-kr.callgrind
 callgrind_annotate --auto=no --inclusive=yes --tree=calling --threshold=100 \
   target/profile-kq-kr.callgrind
