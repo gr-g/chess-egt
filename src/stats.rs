@@ -1,7 +1,6 @@
 //! Per-table metadata and deterministic summaries of selected tables.
 
 mod cache;
-pub use cache::EgtStatistics;
 
 use std::collections::BTreeMap;
 use std::io;

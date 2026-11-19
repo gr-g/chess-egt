@@ -578,7 +578,7 @@ failure is reported as an error. Finalization processes one table at a time in
 parallel frame batches. Batches use the same Rayon pool as generation, with at
 most one encoder per configured thread.
 
-Probing (`EgtProber`) uses a shared cache that keeps track of frames already
-available in memory, evicting the least recently used stored frames to keep
-retained frame data within the configured cache budget (the server's
+Probing (`Tablebase::probe`) uses a shared cache that keeps track of frames
+already available in memory, evicting the least recently used stored frames to
+keep retained frame data within the configured cache budget (the server's
 `--cache-size` option).

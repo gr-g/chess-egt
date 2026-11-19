@@ -5,8 +5,8 @@ use shakmaty::{Chess, Color, Position};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-fn test_generator(path: impl AsRef<Path>) -> EgtGenerator {
-    let mut generator = EgtGenerator::new(path).unwrap();
+fn test_generator(path: impl AsRef<Path>) -> Tablebase {
+    let mut generator = Tablebase::new(path).unwrap();
     generator.set_threads(2);
     generator
 }
@@ -31,14 +31,14 @@ fn aggregate(tables: &[EgtStats]) -> AggregateStats {
 
 fn verify_internal_consistency(selector: &str) {
     let dir = TestDir::new(&format!("verify_internal_consistency_{selector}"));
-    let generator = test_generator(&dir.0);
-    generator.generate_selected(&["K_K", selector]).unwrap();
-    let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.set_threads(2);
+    let mut tablebase = test_generator(&dir.0);
+    tablebase.generate(&["K_K", selector]).unwrap();
     let mut tables = resolve_selectors(&[selector]).unwrap();
     tables.extend(tables.clone().into_iter().map(|id| id.twin().0));
     let names: Vec<_> = tables.iter().map(TableId::name).collect();
-    verifier.verify_selected(&names.iter().map(|name| name.as_str()).collect::<Vec<_>>()).unwrap();
+    tablebase
+        .verify(&names.iter().map(|name| name.as_str()).collect::<Vec<_>>())
+        .unwrap();
 }
 
 #[test]
@@ -54,9 +54,9 @@ fn test_verify_internal_consistency_kr_k() {
 #[test]
 fn test_verify_internal_consistency_kp_k() {
     let dir = TestDir::new("verify_internal_consistency_KP_K");
-    let generator = test_generator(&dir.0);
-    let tables = generator
-        .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
+    let mut tablebase = test_generator(&dir.0);
+    let tables = tablebase
+        .generate(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
     let pawn_tables: BTreeSet<_> = tables
         .iter()
@@ -71,23 +71,18 @@ fn test_verify_internal_consistency_kp_k() {
         let file = TableFile::open(&Location::parse(&dir.0).unwrap(), id).unwrap();
         assert_eq!(file.egt().id(), *id);
     }
-    let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.set_threads(2);
-    verifier.verify_selected(&["KP_K", "K_KP"]).unwrap();
+    tablebase.verify(&["KP_K", "K_KP"]).unwrap();
 
     // Exact verification must not expand an identity to its material family.
-    drop(verifier);
     for id in expected
         .iter()
         .filter(|id| !["KPa_K", "K_KPa"].contains(&id.name().as_str()))
     {
         std::fs::remove_file(dir.0.join(id.relative_path("ggegt"))).unwrap();
     }
-    let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.set_threads(2);
-    verifier.verify_internal_consistency("KPa_K").unwrap();
+    tablebase.verify(&["KPa_K"]).unwrap();
     assert!(matches!(
-        verifier.verify_internal_consistency("KP_K"),
+        tablebase.verify(&["KP_K"]),
         Err(EgtError::FileNotFound(_))
     ));
 }
@@ -96,15 +91,13 @@ fn test_verify_internal_consistency_kp_k() {
 fn default_and_zero_threads_generate_and_verify() {
     for threads in [None, Some(0)] {
         let dir = TestDir::new(&format!("default_threads_{threads:?}"));
-        let mut generator = EgtGenerator::new(&dir.0).unwrap();
-        let mut verifier = EgtVerifier::new(&dir.0).unwrap();
+        let mut tablebase = Tablebase::new(&dir.0).unwrap();
         if let Some(threads) = threads {
-            generator.set_threads(threads);
-            verifier.set_threads(threads);
+            tablebase.set_threads(threads);
         }
-        let tables = generator.generate("K_K").unwrap();
+        let tables = tablebase.generate(&["K_K"]).unwrap();
         assert_eq!(tables.len(), 1);
-        verifier.verify_internal_consistency("K_K").unwrap();
+        tablebase.verify(&["K_K"]).unwrap();
     }
 }
 
@@ -113,24 +106,17 @@ fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
     let dir = TestDir::new("bounded_cache_size");
     // Fit both queen-table frames, but force eviction when K_K is also probed.
     let cache_bytes = 2 * Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap().index_range() * 2;
-    let mut generator = EgtGenerator::new(&dir.0).unwrap();
-    generator.set_threads(2);
-
-    let tables = generator.generate_selected(&["K_K", "KQ_K"]).unwrap();
+    let mut tablebase = test_generator(&dir.0);
+    let tables = tablebase.generate(&["K_K", "KQ_K"]).unwrap();
     assert_eq!(tables.len(), 3);
-
-    let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.set_threads(2);
-
-    verifier.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
-    let mut prober = EgtProber::new(&dir.0).unwrap();
-    prober.set_cache_size(cache_bytes).unwrap();
+    tablebase.verify(&["KQ_K", "K_KQ"]).unwrap();
+    tablebase.set_cache_size(cache_bytes).unwrap();
 
     let egt = Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
-    prober.probe(&position).unwrap();
+    tablebase.probe(&position).unwrap();
 }
 
 #[test]
@@ -138,10 +124,10 @@ fn probe_with_moves_matches_scalar_probes() {
     use shakmaty::{CastlingMode, fen::Fen};
 
     let dir = TestDir::new("probe_with_moves");
-    test_generator(&dir.0)
-        .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
+    let mut prober = test_generator(&dir.0);
+    prober
+        .generate(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
-    let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(0).unwrap();
     for fen in [
         "7k/8/8/8/8/8/P7/K7 w - - 0 1",
@@ -175,7 +161,7 @@ fn probing_rejects_castling_rights_before_table_lookup() {
     use shakmaty::{CastlingMode, fen::Fen};
 
     let dir = TestDir::new("probing_castling_rights");
-    let prober = EgtProber::new(&dir.0).unwrap();
+    let prober = Tablebase::new(&dir.0).unwrap();
     for (board, rights) in [
         ("4k3/8/8/8/8/8/8/4K2R", "K"),
         ("4k3/8/8/8/8/8/8/R3K3", "Q"),
@@ -204,22 +190,30 @@ fn probing_rejects_castling_rights_before_table_lookup() {
 #[test]
 fn zero_cache_size_supports_probing_generated_and_verified_tables() {
     let dir = TestDir::new("zero_cache_size");
-    let mut generator = EgtGenerator::new(&dir.0).unwrap();
-    generator.set_threads(2);
-
-    generator.generate("K_K").unwrap();
-
-    let mut verifier = EgtVerifier::new(&dir.0).unwrap();
-    verifier.set_threads(2);
-
-    verifier.verify_internal_consistency("K_K").unwrap();
-    let mut prober = EgtProber::new(&dir.0).unwrap();
-    prober.set_cache_size(0).unwrap();
+    let mut tablebase = test_generator(&dir.0);
+    tablebase.generate(&["K_K"]).unwrap();
+    tablebase.verify(&["K_K"]).unwrap();
+    tablebase.set_cache_size(0).unwrap();
     let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
-    assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
+    assert_eq!(tablebase.probe(&position).unwrap(), DtcOutcome::Draw);
+}
+
+#[test]
+fn generation_invalidates_cached_probe_data() {
+    let dir = TestDir::new("generation_invalidates_cache");
+    let win = DtcOutcome::Win(ConversionType::Checkmate, 3);
+    crate::egt_file::writer::write_fixture(&dir.0, "K_K", |_| {
+        PackedOutcome::new_win(ConversionType::Checkmate, 3)
+    });
+    let mut tablebase = test_generator(&dir.0);
+    let position = position_for("K_K");
+    assert_eq!(tablebase.probe(&position).unwrap(), win);
+
+    tablebase.generate(&["K_K"]).unwrap();
+    assert_eq!(tablebase.probe(&position).unwrap(), DtcOutcome::Draw);
 }
 
 #[test]
@@ -233,11 +227,11 @@ fn generator_publishes_finalized_stats_with_shadowed_outputs() {
     for name in ["KQ_K", "K_KQ"] {
         write_artifact(&input.0, name, "ggegt", &[0xff; 64]);
     }
-    let mut generator = EgtGenerator::new(&output.0).unwrap();
+    let mut generator = Tablebase::new(&output.0).unwrap();
     generator.set_input_path(&input.0).unwrap();
     generator.set_threads(2);
-    generator.generate("K_K").unwrap();
-    let tables = generator.generate("KQ_K").unwrap();
+    generator.generate(&["K_K"]).unwrap();
+    let tables = generator.generate(&["KQ_K"]).unwrap();
     assert_eq!(tables.len(), 2);
     assert!(table_path(&output.0, "K_K", "ggegt").exists());
     for stats in &tables {
@@ -247,25 +241,22 @@ fn generator_publishes_finalized_stats_with_shadowed_outputs() {
         let json = std::fs::read(table_path(&output.0, &stats.tablename, "json")).unwrap();
         assert_eq!(serde_json::from_slice::<EgtStats>(&json).unwrap(), *stats);
     }
-    let mut shadowed = EgtProber::new(&output.0).unwrap();
-    shadowed.set_input_path(&input.0).unwrap();
     for name in ["KQ_K", "K_KQ"] {
-        let error = shadowed.probe(&position_for(name)).unwrap_err();
+        let error = generator.probe(&position_for(name)).unwrap_err();
         assert!(!matches!(error, EgtError::FileNotFound(_)));
     }
-    let statistics = EgtStatistics::new(&output.0).unwrap();
     assert_eq!(
-        statistics.stats(&["KQ_K", "K_KQ"]).unwrap(),
+        generator.stats(&["KQ_K", "K_KQ"]).unwrap(),
         aggregate(&tables)
     );
 }
 
 #[test]
 fn read_only_output_is_rejected_before_generation() {
-    let mut generator = EgtGenerator::new("https://example.com/tables/").unwrap();
+    let mut generator = Tablebase::new("https://example.com/tables/").unwrap();
     for threads in [1, 4] {
         generator.set_threads(threads);
-        assert!(matches!(generator.generate("K_K"),
+        assert!(matches!(generator.generate(&["K_K"]),
             Err(EgtError::InvalidStorageLocation(message)) if message.contains("read-only")));
     }
 }
@@ -273,24 +264,20 @@ fn read_only_output_is_rejected_before_generation() {
 #[test]
 fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
     let location = Location::parse("memory:///nested/tables").unwrap();
-    let mut generator = EgtGenerator::from_location(location.clone());
-    generator.set_threads(2);
-    generator.generate("K_K").unwrap();
-    let tables = generator.generate("KQ_K").unwrap();
+    let mut tablebase = Tablebase::from_location(location.clone());
+    tablebase.set_threads(2);
+    tablebase.generate(&["K_K"]).unwrap();
+    let tables = tablebase.generate(&["KQ_K"]).unwrap();
     assert_eq!(tables.len(), 2);
 
-    let mut verifier = EgtVerifier::from_location(location.clone());
-    verifier.set_threads(2);
-    verifier.verify_selected(&["KQ_K", "K_KQ"]).unwrap();
-    let prober = EgtProber::from_location(location.clone());
+    tablebase.verify(&["KQ_K", "K_KQ"]).unwrap();
     assert_eq!(
-        prober.probe(&position_for("K_K")).unwrap(),
+        tablebase.probe(&position_for("K_K")).unwrap(),
         DtcOutcome::Draw
     );
     assert!(object_exists(&location, "2/1v1/op0/0pawns/K_K.ggegt"));
-    let statistics = EgtStatistics::from_location(location);
     assert_eq!(
-        statistics.stats(&["KQ_K", "K_KQ"]).unwrap(),
+        tablebase.stats(&["KQ_K", "K_KQ"]).unwrap(),
         aggregate(&tables)
     );
 }
@@ -299,11 +286,11 @@ fn in_memory_prefix_reuses_backend_for_dependencies_and_verification() {
 fn input_lookup_falls_back_only_for_missing_files() {
     let output = TestDir::new("input_fallback_output");
     let input = TestDir::new("input_fallback_input");
-    test_generator(&output.0).generate("K_K").unwrap();
+    test_generator(&output.0).generate(&["K_K"]).unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
 
     let probe = || {
-        let mut prober = EgtProber::new(&output.0).unwrap();
+        let mut prober = Tablebase::new(&output.0).unwrap();
         prober.set_input_path(&input.0).unwrap();
         prober.probe(&position_for("K_K"))
     };
@@ -321,14 +308,14 @@ fn input_lookup_falls_back_only_for_missing_files() {
 fn changing_input_path_invalidates_warmed_lookup_precedence() {
     let output = TestDir::new("changed_input_output");
     let input = TestDir::new("changed_input_input");
-    test_generator(&output.0).generate("K_K").unwrap();
+    test_generator(&output.0).generate(&["K_K"]).unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
     let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
-    let mut prober = EgtProber::new(&output.0).unwrap();
+    let mut prober = Tablebase::new(&output.0).unwrap();
     assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
     prober.set_input_path(&input.0).unwrap();
     assert!(prober.probe(&position).is_err());
@@ -337,35 +324,33 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
 #[test]
 fn generation_replaces_placeholders_and_invalidates_hierarchy_summaries() {
     let location = Location::parse("memory:///stats-publication").unwrap();
-    let mut generator = EgtGenerator::from_location(location.clone());
-    generator.set_threads(2);
-    let statistics = EgtStatistics::from_location(location.clone());
-    let missing = statistics.cache_stats(&["2"]).unwrap();
+    let mut tablebase = Tablebase::from_location(location.clone());
+    tablebase.set_threads(2);
+    let missing = tablebase.cache_stats(&["2"]).unwrap();
     assert_eq!(missing.selected_tables, 1);
     assert_eq!(missing.available_tables, 0);
     assert_eq!(missing.bytes, None);
-    assert_eq!(statistics.stats(&["2"]).unwrap(), missing);
-    let tables = generator.generate("K_K").unwrap();
+    assert_eq!(tablebase.stats(&["2"]).unwrap(), missing);
+    let tables = tablebase.generate(&["K_K"]).unwrap();
     for prefix in ["2", "2/1v1", "2/1v1/op0", "2/1v1/op0/0pawns"] {
         assert!(!object_exists(&location, &format!("{prefix}/stats.json")));
-        assert_eq!(statistics.stats(&[prefix]).unwrap(), aggregate(&tables));
+        assert_eq!(tablebase.stats(&[prefix]).unwrap(), aggregate(&tables));
     }
-    assert_eq!(statistics.cache_stats(&["2"]).unwrap(), aggregate(&tables));
-    assert_eq!(statistics.stats(&["2"]).unwrap(), aggregate(&tables));
-    assert_eq!(statistics.stats(&["K_K"]).unwrap(), aggregate(&tables));
+    assert_eq!(tablebase.cache_stats(&["2"]).unwrap(), aggregate(&tables));
+    assert_eq!(tablebase.stats(&["2"]).unwrap(), aggregate(&tables));
+    assert_eq!(tablebase.stats(&["K_K"]).unwrap(), aggregate(&tables));
 }
 
 #[test]
 fn statistics_describe_one_root_independently_of_probing_overlays() {
     let location = Location::parse("memory:///stats-overlay").unwrap();
     location.ensure_format().unwrap();
-    let mut prober = EgtProber::from_location(location.clone());
-    prober.set_input_path("memory:///stats-input").unwrap();
-    let statistics = EgtStatistics::from_location(location.clone());
-    let missing = statistics.stats(&["2"]).unwrap();
+    let mut tablebase = Tablebase::from_location(location.clone());
+    tablebase.set_input_path("memory:///stats-input").unwrap();
+    let missing = tablebase.stats(&["2"]).unwrap();
     assert_eq!((missing.selected_tables, missing.available_tables), (1, 0));
     assert!(!object_exists(&location, "2/1v1/op0/0pawns/K_K.json"));
-    assert_eq!(statistics.cache_stats(&["2"]).unwrap(), missing);
+    assert_eq!(tablebase.cache_stats(&["2"]).unwrap(), missing);
 }
 
 fn object_exists(location: &Location, path: &str) -> bool {

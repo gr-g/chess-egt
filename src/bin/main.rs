@@ -1,7 +1,4 @@
-use chess_egt::{
-    ConversionType, DtcOutcome, EgtError, EgtGenerator, EgtProber, EgtStatistics, EgtVerifier,
-    resolve_selectors,
-};
+use chess_egt::{ConversionType, DtcOutcome, EgtError, Tablebase, resolve_selectors};
 use clap::Parser;
 use shakmaty::fen::Fen;
 use shakmaty::{CastlingMode, Position, PositionError};
@@ -68,27 +65,17 @@ fn run() -> Result<(), EgtError> {
         }
     } else if !cli.generate.is_empty() {
         let selectors: Vec<_> = cli.generate.iter().map(String::as_str).collect();
-        let mut generator = EgtGenerator::new(&cli.path)?;
-        generator.set_threads(usize::from(cli.threads));
-        if let Some(ref input) = cli.input_path {
-            generator.set_input_path(input)?;
-        }
-        generator.generate_selected(&selectors)?;
+        configured_tablebase(&cli)?.generate(&selectors)?;
     } else if !cli.verify.is_empty() {
         let selectors: Vec<_> = cli.verify.iter().map(String::as_str).collect();
-        let mut verifier = EgtVerifier::new(&cli.path)?;
-        verifier.set_threads(usize::from(cli.threads));
-        if let Some(ref input) = cli.input_path {
-            verifier.set_input_path(input)?;
-        }
-        verifier.verify_selected(&selectors)?;
+        configured_tablebase(&cli)?.verify(&selectors)?;
     } else if !cli.stats.is_empty() {
         let selectors: Vec<_> = cli.stats.iter().map(String::as_str).collect();
-        let stats = EgtStatistics::new(&cli.path)?.stats(&selectors)?;
+        let stats = Tablebase::new(&cli.path)?.stats(&selectors)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else if !cli.cache_stats.is_empty() {
         let selectors: Vec<_> = cli.cache_stats.iter().map(String::as_str).collect();
-        let stats = EgtStatistics::new(&cli.path)?.cache_stats(&selectors)?;
+        let stats = Tablebase::new(&cli.path)?.cache_stats(&selectors)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else if let Some(ref fen) = cli.position {
         let fen_obj: Fen = fen
@@ -98,8 +85,7 @@ fn run() -> Result<(), EgtError> {
             .into_position(CastlingMode::Standard)
             .or_else(PositionError::ignore_impossible_check)
             .map_err(|e| EgtError::InvalidPosition(format!("invalid position: {e:?}")))?;
-        let prober = configured_prober(&cli)?;
-        let outcome = prober.probe(&position)?;
+        let outcome = configured_tablebase(&cli)?.probe(&position)?;
 
         print!("{:?}", position.board());
         println!("({} to move)", position.turn());
@@ -125,12 +111,13 @@ fn format_outcome(outcome: DtcOutcome) -> String {
     format!("{result} - {conversion}, DTC {plies} {unit}")
 }
 
-fn configured_prober(cli: &Cli) -> Result<EgtProber, EgtError> {
-    let mut prober = EgtProber::new(&cli.path)?;
+fn configured_tablebase(cli: &Cli) -> Result<Tablebase, EgtError> {
+    let mut tablebase = Tablebase::new(&cli.path)?;
+    tablebase.set_threads(usize::from(cli.threads));
     if let Some(ref input) = cli.input_path {
-        prober.set_input_path(input)?;
+        tablebase.set_input_path(input)?;
     }
-    Ok(prober)
+    Ok(tablebase)
 }
 
 #[cfg(test)]

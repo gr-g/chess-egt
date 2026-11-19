@@ -184,7 +184,7 @@ No `Option<Frame>` anywhere.
 
 ---
 
-## 3. Put the input-path fallback in one place
+## 3. Put the input-path fallback in one place (done)
 
 **Problem.** `EgtGenerator` (`generator.rs`), `EgtVerifier` (`verification.rs`)
 and `EgtProber` (`prober.rs`, through `SharedFileCache`) each carry

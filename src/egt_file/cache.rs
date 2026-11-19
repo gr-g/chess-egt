@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use shakmaty::Chess;
 
-use super::{Frame, TableFile, load_existing_file};
+use super::{Frame, Source, TableFile};
 use crate::storage::Location;
 use crate::table_id::TableId;
 use crate::{DtcOutcome, EgtResult};
@@ -64,25 +64,16 @@ impl Lru {
 #[derive(Debug)]
 pub(crate) struct SharedFileCache {
     files: RwLock<HashMap<TableId, Arc<TableFile>>>,
-    base_path: Location,
-    input_path: Option<Location>,
+    source: Source,
     frames: Mutex<Lru>,
 }
 
 impl SharedFileCache {
-    pub(crate) fn new(
-        base_path: &Location,
-        input_path: Option<&Location>,
-        cache_size: Option<usize>,
-    ) -> Self {
+    pub(crate) fn new(source: Source) -> Self {
         Self {
             files: RwLock::new(HashMap::new()),
-            base_path: base_path.clone(),
-            input_path: input_path.cloned(),
-            frames: Mutex::new(Lru {
-                assigned: cache_size,
-                ..Lru::default()
-            }),
+            source,
+            frames: Mutex::new(Lru::default()),
         }
     }
 
@@ -92,16 +83,20 @@ impl SharedFileCache {
         lru.enforce_limit();
     }
 
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
     pub(crate) fn set_input_path(&mut self, input: Option<Location>) {
         self.clear();
-        self.input_path = input;
+        self.source = self.source.with_input(input);
     }
 
     fn file(&self, id: &TableId) -> EgtResult<Arc<TableFile>> {
         if let Some(file) = self.files.read().unwrap().get(id) {
             return Ok(Arc::clone(file));
         }
-        let file = Arc::new(load_existing_file(&self.base_path, self.input_path.as_ref(), id)?);
+        let file = Arc::new(self.source.open(id)?);
         Ok(Arc::clone(self.files.write().unwrap().entry(*id).or_insert(file)))
     }
 
@@ -194,11 +189,9 @@ mod tests {
         for (path, value) in [(&base.0, PackedOutcome::DRAW), (&input.0, outcome)] {
             write_fixture(path, "KPa_K", |_| value);
         }
-        let reader = SharedFileCache::new(
-            &Location::parse(&base.0).unwrap(),
-            Some(&Location::parse(&input.0).unwrap()),
-            None,
-        );
+        let source = Source::new(Location::parse(&base.0).unwrap())
+            .with_input(Some(Location::parse(&input.0).unwrap()));
+        let reader = SharedFileCache::new(source);
         let barrier = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             for _ in 0..8 {
@@ -236,11 +229,8 @@ mod tests {
             assert_eq!(frame_bytes.get_or_insert(bytes), &bytes);
         }
         let frame_bytes = frame_bytes.unwrap();
-        let cache = SharedFileCache::new(
-            &Location::parse(&dir.0).unwrap(),
-            None,
-            Some(2 * frame_bytes),
-        );
+        let cache = SharedFileCache::new(Source::new(Location::parse(&dir.0).unwrap()));
+        cache.set_cache_size(2 * frame_bytes);
         let positions = positions.map(|(name, fen)| {
             (
                 name,
@@ -306,7 +296,7 @@ mod tests {
         write_fixture(&input.0, "KQ_K", |_| PackedOutcome::DRAW);
         let base = Location::parse(&base.0).unwrap();
         let input = Location::parse(&input.0).unwrap();
-        let mut reader = SharedFileCache::new(&base, Some(&input), None);
+        let mut reader = SharedFileCache::new(Source::new(base).with_input(Some(input.clone())));
         assert_eq!(reader.probe(&queen).unwrap(), DtcOutcome::Draw);
 
         reader.clear();
@@ -328,7 +318,7 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let reader = SharedFileCache::new(&Location::parse(&dir.0).unwrap(), None, None);
+        let reader = SharedFileCache::new(Source::new(Location::parse(&dir.0).unwrap()));
         assert!(matches!(reader.probe(&position), Err(EgtError::FileNotFound(_))));
         assert!(
             !dir.0

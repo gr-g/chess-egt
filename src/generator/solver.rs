@@ -798,7 +798,7 @@ pub(super) fn generate_pair(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use crate::{EgtError, EgtGenerator, TableId};
+    use crate::{EgtError, Tablebase, TableId};
     use crate::selection::{GenerationPlan, TableSelector};
 
     fn tables(material: &str) -> Vec<Egt> {
@@ -1271,9 +1271,10 @@ mod tests {
     #[test]
     fn initialization_populates_only_matching_summary_kinds() {
         let dir = crate::TestDir::new("initial_summary");
-        EgtGenerator::new(&dir.0).unwrap().generate("K_K").unwrap();
+        Tablebase::new(&dir.0).unwrap().generate(&["K_K"]).unwrap();
         let location = Location::parse(&dir.0).unwrap();
-        let reader = BatchReader::open(&location, None, &[TableId::parse("K_K").unwrap()]).unwrap();
+        let source = crate::egt_file::Source::new(location);
+        let reader = BatchReader::open(&source, &[TableId::parse("K_K").unwrap()]).unwrap();
         for name in ["K_KQ", "KQ_K"] {
             let egt = table(name);
             let mut values = atomic_values(vec![PackedOutcome::INVALID; egt.index_range()]);
@@ -1528,9 +1529,9 @@ mod tests {
     #[test]
     fn parallel_missing_dependency_returns_error_without_generating() {
         let dir = crate::TestDir::new("parallel_missing_dependency");
-        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        let mut generator = Tablebase::new(&dir.0).unwrap();
         generator.set_threads(4);
-        let result = generator.generate("KQ_K");
+        let result = generator.generate(&["KQ_K"]);
         assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
             if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_))));
         for name in ["K_K", "KQ_K", "K_KQ"] {
@@ -1542,9 +1543,9 @@ mod tests {
     #[test]
     fn zero_threads_uses_rayon_default() {
         let dir = crate::TestDir::new("zero_threads");
-        let mut generator = EgtGenerator::new(&dir.0).unwrap();
+        let mut generator = Tablebase::new(&dir.0).unwrap();
         generator.set_threads(0);
-        generator.generate("K_K").unwrap();
+        generator.generate(&["K_K"]).unwrap();
         assert!(dir.0.join(TableId::parse("K_K").unwrap().relative_path("ggegt")).exists());
     }
 
@@ -1563,17 +1564,17 @@ mod tests {
     ) {
         let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
         let location = Location::parse(&test_dir.0).unwrap();
-        let mut generator = EgtGenerator::new(&test_dir.0).unwrap();
+        let mut generator = Tablebase::new(&test_dir.0).unwrap();
         generator.set_threads(2);
         if endgame != "K_K" {
-            generator.generate("K_K").unwrap();
+            generator.generate(&["K_K"]).unwrap();
         }
         if endgame == "KP_K" {
             for dependency in ["KQ_K", "KR_K", "KB_K", "KN_K"] {
-                generator.generate(dependency).unwrap();
+                generator.generate(&[dependency]).unwrap();
             }
         }
-        generator.generate(endgame).unwrap();
+        generator.generate(&[endgame]).unwrap();
 
         // Check the established outcome totals by summing individual sidecars,
         // not by constructing a composite table or comparing legacy artifacts.

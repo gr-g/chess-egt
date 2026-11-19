@@ -17,20 +17,39 @@ use shakmaty::{CastlingMode, Position};
 use shakmaty::Chess;
 use rayon::prelude::*;
 
-/// Resolves an existing table with input-first, missing-only fallback.
-pub(crate) fn load_existing_file(
-    base_path: &Location,
-    input_path: Option<&Location>,
-    id: &TableId,
-) -> EgtResult<TableFile> {
-    if let Some(input) = input_path {
-        match TableFile::open(input, id) {
-            Ok(file) => return Ok(file),
-            Err(EgtError::FileNotFound(_)) => {}
-            Err(error) => return Err(error),
+/// Resolves existing tables with input-first, missing-only fallback.
+#[derive(Debug)]
+pub(crate) struct Source {
+    base: Location,
+    input: Option<Location>,
+}
+
+impl Source {
+    pub(crate) fn new(base: Location) -> Self {
+        Self { base, input: None }
+    }
+
+    pub(crate) fn with_input(&self, input: Option<Location>) -> Self {
+        Self {
+            base: self.base.clone(),
+            input,
         }
     }
-    TableFile::open(base_path, id)
+
+    pub(crate) fn base(&self) -> &Location {
+        &self.base
+    }
+
+    pub(crate) fn open(&self, id: &TableId) -> EgtResult<TableFile> {
+        if let Some(input) = &self.input {
+            match TableFile::open(input, id) {
+                Ok(file) => return Ok(file),
+                Err(EgtError::FileNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        TableFile::open(&self.base, id)
+    }
 }
 
 /// File metadata and frame I/O for one existing canonical table.
@@ -450,7 +469,7 @@ mod tests {
             let (frame, offset) = reader.locate(index);
             assert_eq!(reader.read_frames(&[frame]).unwrap()[0].get(offset), outcome);
         }
-        let prober = crate::EgtProber::new(&dir.0).unwrap();
+        let prober = crate::Tablebase::new(&dir.0).unwrap();
         assert_eq!(prober.probe(&position).unwrap(), outcome.to_outcome_at(index).unwrap());
     }
 
@@ -479,7 +498,7 @@ mod tests {
                 assert_eq!(frames[frame].get(offset), outcome(idx));
             }
         }
-        let batch = BatchReader::open(&location, None, &[id]).unwrap();
+        let batch = BatchReader::open(&Source::new(location), &[id]).unwrap();
         assert!(batch.read_chunk(&id, range, range).unwrap().is_empty());
     }
 

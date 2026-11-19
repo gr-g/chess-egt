@@ -3,8 +3,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use rayon::prelude::*;
 use shakmaty::Chess;
 
-use super::{Frame, TableFile, load_existing_file};
-use crate::storage::Location;
+use super::{Frame, Source, TableFile};
 use crate::table_id::TableId;
 use crate::{DtcOutcome, Egt, EgtError, EgtResult, PackedOutcome};
 
@@ -18,15 +17,11 @@ pub(crate) struct BatchReader {
 
 impl BatchReader {
     /// Opens all metadata first, so missing dependencies fail before bulk loading.
-    pub(crate) fn open(
-        base: &Location,
-        input: Option<&Location>,
-        ids: &[TableId],
-    ) -> EgtResult<Self> {
+    pub(crate) fn open(source: &Source, ids: &[TableId]) -> EgtResult<Self> {
         let mut files = HashMap::new();
         for &id in ids {
             if let Entry::Vacant(entry) = files.entry(id) {
-                let file = load_existing_file(base, input, &id).map_err(|source| match source {
+                let file = source.open(&id).map_err(|source| match source {
                     EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
                         dependency: id.to_string(),
                         source: Box::new(source),
@@ -111,6 +106,7 @@ impl BatchReader {
 mod tests {
     use super::*;
     use crate::egt_file::writer::write_fixture;
+    use crate::storage::Location;
     use crate::ConversionType;
     use shakmaty::{CastlingMode, fen::Fen};
 
@@ -122,12 +118,9 @@ mod tests {
         let file = write_fixture(&base.0, "KQ_K", |_| output);
         write_fixture(&input.0, "KQ_K", |_| PackedOutcome::DRAW);
         let id = file.egt().id();
-        let mut batch = BatchReader::open(
-            &Location::parse(&base.0).unwrap(),
-            Some(&Location::parse(&input.0).unwrap()),
-            &[id],
-        )
-        .unwrap();
+        let source = Source::new(Location::parse(&base.0).unwrap())
+            .with_input(Some(Location::parse(&input.0).unwrap()));
+        let mut batch = BatchReader::open(&source, &[id]).unwrap();
         let position = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
             .parse::<Fen>()
             .unwrap()

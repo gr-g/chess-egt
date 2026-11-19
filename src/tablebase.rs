@@ -2,41 +2,49 @@ use std::path::Path;
 
 use shakmaty::{Chess, Position};
 
-use crate::egt_file::SharedFileCache;
+use crate::egt_file::{SharedFileCache, Source};
 use crate::storage::Location;
-use crate::{DtcOutcome, EgtResult, ProbeWithMoves};
+use crate::{DtcOutcome, EgtError, EgtResult, ProbeWithMoves};
 
-/// Probes endgame tables using a shared frame cache.
-///
-/// [`probe`](Self::probe) returns the position's [`DtcOutcome`].
-/// [`probe_with_moves`](Self::probe_with_moves) returns a [`ProbeWithMoves`] containing:
-///
-/// - `outcome: DtcOutcome`: the root position's outcome.
-/// - `moves: Vec<(Move, DtcOutcome)>`: all legal moves in
-///   `Chess::legal_moves()` order, paired with each successor's outcome **from the
-///   successor's side to move**. Outcomes are not inverted or distance-adjusted.
-///
-/// The root and cloned, played successors are probed in one batch. Terminal
-/// positions still probe the root and return an empty move list. Lookup errors
-/// are returned directly, as with `probe`; a failed lookup fails the whole call.
-/// The API is synchronous; async callers should use `tokio::task::spawn_blocking`.
-pub struct EgtProber {
+/// Generates, verifies, and probes endgame tables and queries their statistics.
+pub struct Tablebase {
     cache: SharedFileCache,
+    threads: usize,
 }
 
-impl EgtProber {
+impl Tablebase {
     /// Resolves a local tablebase directory or object-store URL once.
     ///
     /// Returns an error for invalid locations or backend initialization failures.
-    /// This synchronous API should run in `spawn_blocking` when called from an
-    /// async application, as should subsequent probing.
     pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
         Ok(Self::from_location(Location::parse(path)?))
     }
 
     pub(crate) fn from_location(location: Location) -> Self {
-        let cache = SharedFileCache::new(&location, None, None);
-        Self { cache }
+        Self {
+            cache: SharedFileCache::new(Source::new(location)),
+            threads: 0,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &Source {
+        self.cache.source()
+    }
+
+    pub(crate) fn clear_probe_cache(&mut self) {
+        self.cache.clear();
+    }
+
+    pub(crate) fn pool(&self, error: &'static str) -> EgtResult<rayon::ThreadPool> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads)
+            .build()
+            .map_err(|_| EgtError::Internal(error))
+    }
+
+    /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
     }
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
@@ -45,13 +53,12 @@ impl EgtProber {
         Ok(())
     }
 
-    /// Resolves an additional local directory or object-store URL for table lookup.
+    /// Sets an input overlay for probing, verification, and generation dependencies.
     /// Input is searched first; the base location is tried only for missing files.
-    /// If not set, only the base location is consulted.
+    /// Generation writes and statistics always use the base location.
     ///
-    /// Returns an error if the location cannot be resolved, leaving the previous
-    /// setting unchanged. This synchronous API should run in `spawn_blocking`
-    /// when called from an async application.
+    /// Clears cached probe data on success. An invalid location leaves the previous
+    /// setting unchanged.
     pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
         self.cache.set_input_path(Some(Location::parse(path)?));
         Ok(())

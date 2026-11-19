@@ -5,7 +5,6 @@
 //! a table's ancestor summaries before publishing its per-table statistics.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 use rayon::prelude::*;
@@ -15,39 +14,22 @@ use crate::selection::{hierarchy_prefixes, resolve_selectors};
 use crate::stats::{AggregateStats, StatsRecord, read_record};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
-use crate::{EgtError, EgtResult};
+use crate::{EgtError, EgtResult, Tablebase};
 
-/// Metadata queries and hierarchy-cache rebuilding for one tablebase root.
-///
-/// Statistics do not read table frames and have no frame-cache budget or input
-/// overlay: each instance describes exactly one root. All operations, including
-/// construction, are synchronous; async callers should use `spawn_blocking`.
-pub struct EgtStatistics {
-    location: Location,
-}
-
-impl EgtStatistics {
-    /// Resolves a local tablebase directory or supported object-store URL once.
-    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
-        Ok(Self::from_location(Location::parse(path)?))
-    }
-
-    pub(crate) fn from_location(location: Location) -> Self {
-        Self { location }
-    }
-
+impl Tablebase {
     /// Reads metadata without modifying storage. Missing sidecars contribute
     /// theoretical index ranges; computed totals are null for incomplete selections.
-    /// Hierarchy selections use cached summaries when available.
+    /// Hierarchy selections use cached summaries when available. Only the base
+    /// location is consulted, even when an input overlay is configured.
     pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
-        query(&self.location, selectors)
+        query(self.source().base(), selectors)
     }
 
-    /// Creates missing placeholders and rebuilds selected hierarchy summaries.
+    /// Creates missing placeholders and rebuilds hierarchy summaries in the base location.
     /// Does not scan table contents or replace complete per-table metadata.
     /// Do not run concurrently with generation or another cache rebuild.
     pub fn cache_stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
-        cache(&self.location, selectors)
+        cache(self.source().base(), selectors)
     }
 }
 

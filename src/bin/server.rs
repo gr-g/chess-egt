@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, EgtProber, EgtStatistics};
+use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, Tablebase};
 use clap::Parser;
 use common::parse_byte_size;
 use serde::{Deserialize, Serialize};
@@ -45,8 +45,7 @@ struct Cli {
 
 #[derive(Clone)]
 struct AppState {
-    prober: Arc<EgtProber>,
-    statistics: Arc<EgtStatistics>,
+    tablebase: Arc<Tablebase>,
     operations: Arc<Semaphore>,
 }
 
@@ -79,18 +78,17 @@ impl AppState {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let (prober, statistics) = tokio::task::spawn_blocking(move || {
-        let mut prober = EgtProber::new(&cli.path)?;
-        prober.set_cache_size(cli.cache_size)?;
+    let tablebase = tokio::task::spawn_blocking(move || {
+        let mut tablebase = Tablebase::new(&cli.path)?;
+        tablebase.set_cache_size(cli.cache_size)?;
         // An empty selection validates the root format without loading any tables.
-        let statistics = EgtStatistics::new(&cli.path)?;
-        statistics.stats(&[])?;
-        Ok::<_, EgtError>((prober, statistics))
+        tablebase.stats(&[])?;
+        Ok::<_, EgtError>(tablebase)
     })
     .await??;
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
     eprintln!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(prober, statistics))
+    axum::serve(listener, router(tablebase))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
@@ -113,7 +111,7 @@ async fn shutdown_signal() {
         .expect("failed to install interrupt handler");
 }
 
-fn router(prober: EgtProber, statistics: EgtStatistics) -> Router {
+fn router(tablebase: Tablebase) -> Router {
     Router::new()
         .route("/outcome", get(outcome))
         .route("/query", get(query))
@@ -128,8 +126,7 @@ fn router(prober: EgtProber, statistics: EgtStatistics) -> Router {
         })
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
-            prober: Arc::new(prober),
-            statistics: Arc::new(statistics),
+            tablebase: Arc::new(tablebase),
             operations: Arc::new(Semaphore::new(MAX_OPERATIONS)),
         })
 }
@@ -216,7 +213,7 @@ async fn outcome(
     state
         .run(move |state| {
             let position = parse_position(&params.fen)?;
-            let outcome = state.prober.probe(&position)?;
+            let outcome = state.tablebase.probe(&position)?;
             Ok(Json(OutcomeResponse::new(&position, outcome)))
         })
         .await
@@ -246,7 +243,7 @@ async fn query(
     state
         .run(move |state| {
             let position = parse_position(&params.fen)?;
-            let mut result = state.prober.probe_with_moves(&position)?;
+            let mut result = state.tablebase.probe_with_moves(&position)?;
             // Best for the root first; response outcomes still describe successors.
             result.moves.sort_by_key(|(m, outcome)| {
                 std::cmp::Reverse(outcome.before_move(m))
@@ -287,7 +284,7 @@ async fn stats(
     state
         .run(move |state| {
             let selectors: Vec<_> = params.tables.split(',').map(str::trim).collect();
-            Ok(Json(state.statistics.stats(&selectors)?))
+            Ok(Json(state.tablebase.stats(&selectors)?))
         })
         .await
 }
@@ -390,7 +387,6 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use chess_egt::EgtGenerator;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -457,19 +453,18 @@ mod tests {
             TestDir(std::env::temp_dir().join(format!("chess-egt-server-{}", std::process::id())));
         std::fs::create_dir(&dir.0).unwrap();
         let path = dir.0.clone();
-        let prober = tokio::task::spawn_blocking(move || {
-            let mut generator = EgtGenerator::new(&path).unwrap();
-            generator.set_threads(2);
-            generator
-                .generate_selected(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
+        let tablebase = tokio::task::spawn_blocking(move || {
+            let mut tablebase = Tablebase::new(path).unwrap();
+            tablebase.set_threads(2);
+            tablebase
+                .generate(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
                 .unwrap();
-            let mut prober = EgtProber::new(path).unwrap();
-            prober.set_cache_size(0).unwrap();
-            prober
+            tablebase.set_cache_size(0).unwrap();
+            tablebase
         })
         .await
         .unwrap();
-        let app = router(prober, EgtStatistics::new(&dir.0).unwrap());
+        let app = router(tablebase);
         for (fen, expected) in [
             (
                 "8/8/8/8/8/8/3K4/k7 w - - 0 1",
@@ -608,8 +603,7 @@ mod tests {
             }
         }
         let state = AppState {
-            prober: Arc::new(EgtProber::new(&dir.0).unwrap()),
-            statistics: Arc::new(EgtStatistics::new(&dir.0).unwrap()),
+            tablebase: Arc::new(Tablebase::new(&dir.0).unwrap()),
             operations: Arc::new(Semaphore::new(0)),
         };
         assert_eq!(state.run(|_| Ok(())).await.unwrap_err().code, "server_busy");

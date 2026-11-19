@@ -1,74 +1,22 @@
 mod finalization;
 mod solver;
 
-use std::path::Path;
-
-use crate::AggregateStats;
 use crate::egt_file::BatchReader;
 use crate::stats::format_timing;
-use crate::storage::Location;
-use crate::{EgtError, EgtResult, EgtStats, GenerationPlan, resolve_selectors};
+use crate::{AggregateStats, EgtResult, EgtStats, GenerationPlan, Tablebase, resolve_selectors};
 
-/// Generates one pair at a time with eagerly loaded conversion dependencies.
-/// Working arrays and all decompressed dependencies must fit in memory together.
-pub struct EgtGenerator {
-    base_path: Location,
-    input_path: Option<Location>,
-    threads: usize,
-}
-
-impl EgtGenerator {
-    /// Resolves a local output directory or object-store URL once.
-    ///
-    /// Returns an error for invalid locations or backend initialization failures.
-    /// Read-only outputs are rejected when generation starts. This is a
-    /// synchronous API; async applications should use `spawn_blocking`.
-    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
-        Ok(Self::from_location(Location::parse(path)?))
-    }
-
-    pub(crate) fn from_location(location: Location) -> Self {
-        Self {
-            base_path: location,
-            input_path: None,
-            threads: 0,
-        }
-    }
-
-    /// Sets generation workers. Zero (the default) uses Rayon's default.
-    pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads;
-    }
-
-    /// Resolves an additional local directory or object-store URL for dependencies.
-    /// Input is searched first; output is tried only if the input file is missing.
-    /// If not set, only the output location is consulted.
-    ///
-    /// Returns an error if the location cannot be resolved, leaving the previous
-    /// setting unchanged. This synchronous API should run in `spawn_blocking`
-    /// when called from an async application.
-    pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
-        self.input_path = Some(Location::parse(path)?);
-        Ok(())
-    }
-
-    /// Generates a logical selector and its quiet-move twins.
+impl Tablebase {
+    /// Generates twin-pair jobs in the base location, ordered by pieces then pawns.
     /// Capture/promotion dependencies must already exist or be explicitly selected.
-    pub fn generate(&self, selector: &str) -> EgtResult<Vec<EgtStats>> {
-        self.generate_selected(&[selector])
-    }
-
-    /// Deduplicates selectors into twin-pair jobs, ordered by pieces then pawns.
-    /// Reuses one Rayon pool across jobs. Each pair's dependencies must exist
-    /// before initialization and are released before starting the next job.
-    pub fn generate_selected(&self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
+    /// Working arrays and each pair's eagerly loaded dependencies must fit in memory.
+    /// Clears the probe cache before any tables can be replaced.
+    pub fn generate(&mut self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let start = std::time::Instant::now();
         let plan = GenerationPlan::new(resolve_selectors(selectors)?);
-        self.base_path.ensure_format()?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads)
-            .build()
-            .map_err(|_| EgtError::Internal("failed to build generation thread pool"))?;
+        self.source().base().ensure_format()?;
+        let pool = self.pool("failed to build generation thread pool")?;
+        self.clear_probe_cache();
+        let source = self.source();
         let mut results = Vec::new();
         println!(
             "Generating {} twin-pair jobs using {} threads.",
@@ -84,8 +32,7 @@ impl EgtGenerator {
                     .collect();
                 dependencies.sort();
                 dependencies.dedup();
-                let reader =
-                    BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
+                let reader = BatchReader::open(source, &dependencies)?;
                 println!(
                     "{}: loaded {} bytes of dependencies.",
                     pair.table,
@@ -93,7 +40,7 @@ impl EgtGenerator {
                 );
                 let dependency_time = start.elapsed();
                 let pair_stats =
-                    solver::generate_pair(&self.base_path, &pair, &reader, dependency_time)?;
+                    solver::generate_pair(source.base(), &pair, &reader, dependency_time)?;
                 for stats in &pair_stats {
                     print_table_stats(stats);
                 }

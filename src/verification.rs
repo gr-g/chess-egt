@@ -1,69 +1,21 @@
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use rayon::prelude::*;
 use shakmaty::{Chess, Color, MoveList, Position};
 
-use crate::egt_file::{BatchReader, load_existing_file};
+use crate::egt_file::BatchReader;
 use crate::stats::format_timing;
-use crate::storage::Location;
 use crate::table_id::TableId;
-use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, resolve_selectors};
+use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, Tablebase, resolve_selectors};
 
-/// Checks table outcomes against legal successors using eagerly loaded tables.
-/// Each source, its quiet twin, and its direct conversion dependencies must fit
-/// in memory together; loaded tables are released after verifying each source.
-///
-/// Verification is synchronous and prints fixed progress lines. Async callers
-/// should construct, configure and use the verifier in `tokio::task::spawn_blocking`.
-/// Input overlays have the same missing-only fallback as [`crate::EgtProber`].
-pub struct EgtVerifier {
-    base_path: Location,
-    input_path: Option<Location>,
-    threads: usize,
-}
-
-impl EgtVerifier {
-    /// Resolves a local tablebase directory or supported object-store URL once.
-    pub fn new(path: impl AsRef<Path>) -> EgtResult<Self> {
-        Ok(Self::from_location(Location::parse(path)?))
-    }
-
-    pub(crate) fn from_location(location: Location) -> Self {
-        Self {
-            base_path: location,
-            input_path: None,
-            threads: 0,
-        }
-    }
-
-    /// Sets verification workers. Zero (the default) uses Rayon's default.
-    pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads;
-    }
-
-    /// Resolves an input location, searched first with missing-only fallback to
-    /// the base location. A resolution failure leaves the previous setting intact.
-    pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
-        self.input_path = Some(Location::parse(path)?);
-        Ok(())
-    }
-
-    /// Verifies exactly the tables selected, without implicitly adding twins.
-    /// The quiet twin and all conversion dependencies must be available and
-    /// are loaded before checking the selected source.
-    pub fn verify_internal_consistency(&self, selector: &str) -> EgtResult<()> {
-        self.verify_selected(&[selector])
-    }
-
-    /// Verifies the sorted, deduplicated union of selectors without adding twins.
-    pub fn verify_selected(&self, selectors: &[&str]) -> EgtResult<()> {
+impl Tablebase {
+    /// Verifies the sorted, deduplicated selection against legal successors.
+    /// Each selected table, its quiet twin, and its direct conversion dependencies
+    /// must fit in memory together. Twins are loaded but not implicitly verified.
+    pub fn verify(&self, selectors: &[&str]) -> EgtResult<()> {
         let start = std::time::Instant::now();
         let ids = resolve_selectors(selectors)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads)
-            .build()
-            .map_err(|_| EgtError::Internal("failed to build verification thread pool"))?;
+        let pool = self.pool("failed to build verification thread pool")?;
         let (unique_positions, index_range) = pool.install(|| self.verify_tables_in_pool(&ids))?;
         println!(
             "Verified {} tables: {} unique positions in {}.",
@@ -78,16 +30,15 @@ impl EgtVerifier {
         let mut unique_positions = 0;
         let mut index_range = 0;
         for id in ids {
-            let source = load_existing_file(&self.base_path, self.input_path.as_ref(), id)?;
+            let file = self.source().open(id)?;
             let mut dependencies = id.dependencies();
             dependencies.push(id.twin().0);
             dependencies.retain(|dependency| dependency != id);
             dependencies.sort();
             dependencies.dedup();
-            let mut reader =
-                BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
-            let frames = source.read_all()?;
-            reader.insert(source, frames);
+            let mut reader = BatchReader::open(self.source(), &dependencies)?;
+            let frames = file.read_all()?;
+            reader.insert(file, frames);
             println!(
                 "{}: loaded {} bytes of dependencies.",
                 id,
@@ -278,16 +229,15 @@ mod tests {
     #[test]
     fn verification_counts_only_source_positions() {
         let dir = TestDir::new("verify_position_counts");
-        let mut generator = crate::EgtGenerator::new(&dir.0).unwrap();
+        let mut generator = crate::Tablebase::new(&dir.0).unwrap();
         generator.set_threads(2);
-        generator.generate("K_K").unwrap();
-        let stats = generator.generate("KQ_K").unwrap();
+        generator.generate(&["K_K"]).unwrap();
+        let stats = generator.generate(&["KQ_K"]).unwrap();
         let source = stats
             .iter()
             .find(|stats| stats.tablename == "KQ_K")
             .unwrap();
-        let verifier = EgtVerifier::new(&dir.0).unwrap();
-        let counts = verifier
+        let counts = generator
             .verify_tables_in_pool(&resolve_selectors(&["KQ_K"]).unwrap())
             .unwrap();
         assert_eq!(counts, (source.unique_positions, source.index_range));
@@ -302,7 +252,7 @@ mod tests {
         let index = (0..egt.index_range())
             .find(|&index| egt.position_from_index(index, Color::White).is_some())
             .unwrap();
-        let mut verifier = EgtVerifier::new(&dir.0).unwrap();
+        let mut verifier = Tablebase::new(&dir.0).unwrap();
         for threads in [0, 1, 4] {
             verifier.set_threads(threads);
             for outcome in [
@@ -318,7 +268,7 @@ mod tests {
                     }
                 });
 
-                let result = verifier.verify_internal_consistency("K_K");
+                let result = verifier.verify(&["K_K"]);
                 if outcome.is_invalid() {
                     assert!(matches!(result,
                         Err(EgtError::ConsistencyCheckFailed { index: failed, .. }) if failed == index));

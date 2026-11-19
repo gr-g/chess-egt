@@ -1,43 +1,36 @@
 //! Chess endgame generation, probing, verification, and statistics through a
 //! synchronous API.
 //!
-//! The crate root exports [`EgtGenerator`] for generation, [`EgtProber`] for
-//! position lookups, [`EgtVerifier`] for consistency checks, and [`EgtStatistics`]
-//! for metadata queries and hierarchy-cache rebuilding. Constructors and
-//! `set_input_path` resolve local directories or supported object-store URLs
-//! and return [`EgtResult`].
+//! [`Tablebase`] handles generation, position lookups, consistency checks,
+//! and statistics. [`Tablebase::new`] and [`Tablebase::set_input_path`] resolve
+//! local directories or supported object-store URLs.
 //!
 //! ```no_run
-//! use chess_egt::{EgtResult, EgtStatistics, EgtVerifier};
+//! use chess_egt::{EgtResult, Tablebase};
 //!
 //! fn inspect(root: &str) -> EgtResult<()> {
-//!     let mut verifier = EgtVerifier::new(root)?;
-//!     verifier.set_threads(2);
-
-//!     verifier.verify_selected(&["KQ_K", "K_KQ"])?;
+//!     let mut tablebase = Tablebase::new(root)?;
+//!     tablebase.set_threads(2);
+//!     tablebase.verify(&["KQ_K", "K_KQ"])?;
 //!
-//!     let statistics = EgtStatistics::new(root)?;
-//!     let totals = statistics.stats(&["3/"])?;
-//!     // Explicitly create missing metadata and rebuild hierarchy summaries.
-//!     statistics.cache_stats(&["3/"])?;
+//!     let totals = tablebase.stats(&["3/"])?;
+//!     tablebase.cache_stats(&["3/"])?;
 //!     Ok(())
 //! }
 //! ```
 //!
-//! Verification workers are configured with [`EgtVerifier::set_threads`].
-//! Generation verifies by default and configures both phases with
-//! [`EgtGenerator::set_threads`]. Each canonical table is published independently
-//! after its twin pair is solved. Generation and verification print fixed
-//! progress and timing output.
+//! [`Tablebase::set_threads`] configures generation and verification workers.
+//! Each canonical table is published independently after its twin pair is solved.
+//! Generation and verification print progress and timing output.
 //!
-//! Probers and verifiers support input-first overlays with fallback only for
-//! missing files. Probers accept optional frame-cache budgets, including zero
-//! to retain no frames. Generation and verification eagerly load the required
-//! tables for each job, retaining palette-coded frames. Statistics describe one
-//! root, do not use the frame cache, and do not support overlays. Do not rebuild
-//! metadata concurrently with generation or another rebuild. Malformed stored
-//! artifacts return [`EgtError::InvalidData`] with their location and source error;
-//! backend failures return [`EgtError::Storage`].
+//! Probes, verification, and generation dependency reads use input-first lookup
+//! with fallback only for missing files. Probes can use a frame-cache budget,
+//! including zero to retain no frames. Generation and verification eagerly load
+//! the required tables for each job. Statistics describe the base root only and
+//! do not use the frame cache. Do not rebuild metadata concurrently with
+//! generation or another rebuild. Malformed artifacts return
+//! [`EgtError::InvalidData`] with their location and source error; backend
+//! failures return [`EgtError::Storage`].
 //! Unsupported root format versions return [`EgtError::InvalidStorageLocation`].
 //!
 //! All storage operations block the calling thread, including remote reads and
@@ -51,25 +44,24 @@ pub mod error;
 mod generator;
 mod outcome;
 mod position;
-mod prober;
 mod selection;
 mod stats;
 mod storage;
 mod table_id;
+mod tablebase;
 mod verification;
 
 pub use egt::Egt;
 pub use error::{EgtError, EgtResult};
-pub use generator::{EgtGenerator, print_pair_stats, print_table_stats};
+pub use generator::{print_pair_stats, print_table_stats};
 pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};
-pub use prober::EgtProber;
 pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
 use shakmaty::Move;
-pub use stats::{AggregateStats, EgtStatistics, EgtStats, LongestDtcPosition};
+pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
 #[cfg(test)]
 use std::path::PathBuf;
 pub use table_id::TableId;
-pub use verification::EgtVerifier;
+pub use tablebase::Tablebase;
 
 /// A position's outcome and its legal moves with successor-side-to-move outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
