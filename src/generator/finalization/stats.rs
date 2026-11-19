@@ -98,7 +98,7 @@ impl TableStats {
         };
         let [histogram_win, histogram_loss] = self.histograms;
         EgtStats {
-            tablename: egt.tablename().to_owned(),
+            tablename: egt.id().to_string(),
             bytes,
             sha256,
             index_range: egt.index_range(),
@@ -127,7 +127,7 @@ mod tests {
     use crate::table_id::TableId;
 
     fn table(name: &str) -> Egt {
-        Egt::from_elements(TableId::parse(name).unwrap().parse_elements()).unwrap()
+        Egt::new(&TableId::parse(name).unwrap()).unwrap()
     }
 
     #[test]

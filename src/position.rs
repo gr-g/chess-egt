@@ -138,7 +138,7 @@ mod tests {
         let mut invalid = InvalidCounts::default();
         let mut valid = 0;
         for id in crate::TableSelector::parse("KP_KP").unwrap().resolve().unwrap() {
-            let egt = crate::egt::Egt::from_elements(id.parse_elements()).unwrap();
+            let egt = crate::egt::Egt::new(&id).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
                 match egt.position_from_index_with_reason(index, Color::White).unwrap() {

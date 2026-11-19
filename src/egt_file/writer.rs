@@ -160,7 +160,7 @@ pub(crate) fn write_fixture(
 ) -> crate::egt_file::EgtFileReader {
     let location = Location::parse(base).unwrap();
     let id = TableId::parse(name).unwrap();
-    let egt = crate::Egt::from_elements(id.parse_elements()).unwrap();
+    let egt = crate::Egt::new(&id).unwrap();
     let length = egt.index_range();
     let frame_size = egt.frame_size();
     location.ensure_format().unwrap();
@@ -181,7 +181,7 @@ pub(crate) fn write_fixture(
     encoder.finish().unwrap();
     let key = location.key(&id.relative_path("ggegt"));
     publish_buffers(&location, &key, [data.into()]).unwrap();
-    crate::egt_file::EgtFileReader::open_in(&location, name).unwrap()
+    crate::egt_file::EgtFileReader::open_in(&location, &id).unwrap()
 }
 
 #[cfg(test)]
@@ -193,7 +193,7 @@ mod tests {
 
     fn writer(base: &Path, name: &str) -> EgtFileWriter {
         let id = TableId::parse(name).unwrap();
-        let egt = crate::Egt::from_elements(id.parse_elements()).unwrap();
+        let egt = crate::Egt::new(&id).unwrap();
         EgtFileWriter::new(
             &Location::parse(base).unwrap(),
             &id,

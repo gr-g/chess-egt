@@ -78,8 +78,7 @@ impl EgtVerifier {
         let mut unique_positions = 0;
         let mut index_range = 0;
         for id in ids {
-            let name = id.tablename();
-            let source = load_existing_file(&self.base_path, self.input_path.as_ref(), name)?;
+            let source = load_existing_file(&self.base_path, self.input_path.as_ref(), id)?;
             let mut dependencies = id.dependencies();
             dependencies.push(id.twin().0);
             dependencies.retain(|dependency| dependency != id);
@@ -91,15 +90,15 @@ impl EgtVerifier {
             reader.load()?;
             println!(
                 "{}: loaded {} bytes of dependencies.",
-                name,
+                id,
                 reader.resident_bytes()
             );
-            let egt = reader.file(name)?.egt();
-            unique_positions += verify_egt(&reader, name, egt)?;
+            let egt = reader.file(id)?.egt();
+            unique_positions += verify_egt(&reader, egt)?;
             index_range += egt.index_range();
             println!(
                 "Successfully verified internal consistency of table {}.",
-                name
+                id
             );
         }
         Ok((unique_positions, index_range))
@@ -107,8 +106,8 @@ impl EgtVerifier {
 }
 
 /// Verifies independent blocks and returns the number of valid, unique positions.
-fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize> {
-    let tablename = egt.tablename();
+fn verify_egt(reader: &BatchReader, egt: &Egt) -> EgtResult<usize> {
+    let tablename = egt.id();
     let local_range = egt.index_range();
 
     println!("{}: verifying {} indices...", tablename, local_range);
@@ -129,7 +128,7 @@ fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize
     blocks
         .into_par_iter()
         .map(|(start, end)| {
-            let unique_positions = verify_block(reader, endgame, egt, start, end)?;
+            let unique_positions = verify_block(reader, egt, start, end)?;
             let previous = completed.fetch_add(end - start, AtomicOrdering::Relaxed);
             let done = previous + end - start;
             if done / 10_000_000 != previous / 10_000_000 {
@@ -143,18 +142,12 @@ fn verify_egt(reader: &BatchReader, endgame: &str, egt: &Egt) -> EgtResult<usize
         .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
-fn verify_block(
-    reader: &BatchReader,
-    endgame: &str,
-    egt: &Egt,
-    start: usize,
-    end: usize,
-) -> EgtResult<usize> {
-    let tablename = egt.tablename();
-    let outcomes = reader.read_chunk(endgame, start, end)?;
+fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> EgtResult<usize> {
+    let tablename = egt.id();
+    let outcomes = reader.read_chunk(&tablename, start, end)?;
     // Keep the table identity and local index in verification diagnostics.
     let fail = |local_idx: usize, reason: &str| EgtError::ConsistencyCheckFailed {
-        endgame: endgame.to_string(),
+        endgame: tablename.to_string(),
         index: local_idx,
         reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
     };
@@ -305,7 +298,7 @@ mod tests {
         use crate::PackedOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
-        let egt = Egt::from_tablename("K_K").unwrap();
+        let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
         let index = (0..egt.index_range())
             .find(|&index| egt.position_from_index(index, Color::White).is_some())
             .unwrap();

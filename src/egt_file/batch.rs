@@ -5,7 +5,7 @@ use shakmaty::Chess;
 
 use super::{EgtFileReader, load_existing_file};
 use crate::storage::Location;
-use crate::table_id::{TableId, position_table_name};
+use crate::table_id::TableId;
 use crate::{DtcOutcome, EgtError, EgtResult, PackedOutcome};
 
 /// Job-scoped tables loaded before workers borrow them immutably.
@@ -13,7 +13,7 @@ use crate::{DtcOutcome, EgtError, EgtResult, PackedOutcome};
 /// in memory together. Probes never load data or update shared state.
 #[derive(Default)]
 pub(crate) struct BatchReader {
-    files: HashMap<String, EgtFileReader>,
+    files: HashMap<TableId, EgtFileReader>,
 }
 
 impl BatchReader {
@@ -25,12 +25,12 @@ impl BatchReader {
     ) -> EgtResult<Self> {
         let mut reader = Self::default();
         for id in ids {
-            if !reader.files.contains_key(id.tablename()) {
+            if !reader.files.contains_key(id) {
                 let file =
-                    load_existing_file(base, input, id.tablename()).map_err(
+                    load_existing_file(base, input, id).map_err(
                         |source| match source {
                             EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                                dependency: id.tablename().to_owned(),
+                                dependency: id.to_string(),
                                 source: Box::new(source),
                             },
                             other => other,
@@ -44,7 +44,7 @@ impl BatchReader {
 
     /// Also accepts explicit outputs, which must override input-overlay copies.
     pub(crate) fn insert(&mut self, file: EgtFileReader) {
-        self.files.insert(file.egt().tablename().to_owned(), file);
+        self.files.insert(file.egt().id(), file);
     }
 
     pub(crate) fn load(&mut self) -> EgtResult<()> {
@@ -65,7 +65,7 @@ impl BatchReader {
             .sum()
     }
 
-    pub(crate) fn file(&self, name: &str) -> EgtResult<&EgtFileReader> {
+    pub(crate) fn file(&self, name: &TableId) -> EgtResult<&EgtFileReader> {
         self.files.get(name).ok_or(EgtError::Internal(
             "table absent from prepared dependencies",
         ))
@@ -81,8 +81,8 @@ impl BatchReader {
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {
-        let (name, reflected) = position_table_name(position)?;
-        let file = self.file(name.as_str())?;
+        let (name, reflected) = TableId::from_position(position)?;
+        let file = self.file(&name)?;
         let index = file.map_routed_position_to_index(position, reflected)?;
         let outcome = file
             .read_from_index_cached(index)?
@@ -92,7 +92,7 @@ impl BatchReader {
 
     pub(crate) fn read_chunk(
         &self,
-        name: &str,
+        name: &TableId,
         start: usize,
         end: usize,
     ) -> EgtResult<Vec<PackedOutcome>> {

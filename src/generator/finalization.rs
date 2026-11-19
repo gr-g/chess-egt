@@ -111,7 +111,7 @@ mod tests {
         let dir = crate::TestDir::new("finalization_wrong_length");
         let location = Location::parse(&dir.0).unwrap();
         let id = TableId::parse("K_K").unwrap();
-        let egt = Egt::from_elements(id.parse_elements()).unwrap();
+        let egt = Egt::new(&id).unwrap();
         assert!(matches!(
             finalize_table(
                 &location,

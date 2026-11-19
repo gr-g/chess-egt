@@ -36,8 +36,8 @@ fn verify_internal_consistency(selector: &str) {
     verifier.set_threads(2);
     let mut tables = resolve_selectors(&[selector]).unwrap();
     tables.extend(tables.clone().into_iter().map(|id| id.twin().0));
-    let names: Vec<_> = tables.iter().map(TableId::tablename).collect();
-    verifier.verify_selected(&names).unwrap();
+    let names: Vec<_> = tables.iter().map(TableId::name).collect();
+    verifier.verify_selected(&names.iter().map(|name| name.as_str()).collect::<Vec<_>>()).unwrap();
 }
 
 #[test]
@@ -63,14 +63,12 @@ fn test_verify_internal_consistency_kp_k() {
         .map(|stats| stats.tablename.as_str())
         .collect();
     let expected = resolve_selectors(&["KP_K", "K_KP"]).unwrap();
-    assert_eq!(
-        pawn_tables,
-        expected.iter().map(TableId::tablename).collect()
-    );
+    let names: Vec<_> = expected.iter().map(TableId::name).collect();
+    assert_eq!(pawn_tables, names.iter().map(|name| name.as_str()).collect());
     assert_eq!(pawn_tables.len(), 8);
     for id in &expected {
-        let file = EgtFileReader::new_from_file(&dir.0, id.tablename()).unwrap();
-        assert_eq!(file.egt().tablename(), id.tablename());
+        let file = EgtFileReader::new_from_file(&dir.0, &id.name()).unwrap();
+        assert_eq!(file.egt().id(), *id);
     }
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();
     verifier.set_threads(2);
@@ -80,7 +78,7 @@ fn test_verify_internal_consistency_kp_k() {
     drop(verifier);
     for id in expected
         .iter()
-        .filter(|id| !["KPa_K", "K_KPa"].contains(&id.tablename()))
+        .filter(|id| !["KPa_K", "K_KPa"].contains(&id.name().as_str()))
     {
         std::fs::remove_file(dir.0.join(id.relative_path("ggegt"))).unwrap();
     }
@@ -113,7 +111,7 @@ fn default_and_zero_threads_generate_and_verify() {
 fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
     let dir = TestDir::new("bounded_cache_size");
     // Fit both queen-table frames, but force eviction when K_K is also probed.
-    let cache_bytes = 2 * Egt::from_tablename("KQ_K").unwrap().index_range() * 2;
+    let cache_bytes = 2 * Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap().index_range() * 2;
     let mut generator = EgtGenerator::new(&dir.0).unwrap();
     generator.set_threads(2);
 
@@ -127,7 +125,7 @@ fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
     let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(cache_bytes).unwrap();
 
-    let egt = Egt::from_tablename("KQ_K").unwrap();
+    let egt = Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
@@ -216,7 +214,7 @@ fn zero_cache_size_supports_probing_generated_and_verified_tables() {
     verifier.verify_internal_consistency("K_K").unwrap();
     let mut prober = EgtProber::new(&dir.0).unwrap();
     prober.set_cache_size(0).unwrap();
-    let egt = Egt::from_tablename("K_K").unwrap();
+    let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
@@ -325,7 +323,7 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
     test_generator(&output.0).generate("K_K").unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
-    let egt = Egt::from_tablename("K_K").unwrap();
+    let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap();
@@ -382,14 +380,14 @@ fn selector_union_is_sorted_deduplicated_and_preserves_orientation() {
     assert!(tables.windows(2).all(|pair| pair[0] < pair[1]));
     let exact = resolve_selectors(&["KQ_K", "KQ_K", "KR_K"]).unwrap();
     assert_eq!(
-        exact.iter().map(TableId::tablename).collect::<Vec<_>>(),
+        exact.iter().map(ToString::to_string).collect::<Vec<_>>(),
         ["KQ_K", "KR_K"]
     );
     assert!(!exact.contains(&TableId::parse("K_KQ").unwrap()));
 }
 
 fn position_for(name: &str) -> Chess {
-    let egt = Egt::from_tablename(name).unwrap();
+    let egt = Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
     (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White))
         .unwrap()

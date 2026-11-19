@@ -96,7 +96,7 @@ enum WinUpdate {
 }
 
 impl WorkingPair {
-    fn new<'a>(tables: impl IntoIterator<Item = (&'a str, usize)>) -> EgtResult<Self> {
+    fn new(tables: impl IntoIterator<Item = (impl std::fmt::Display, usize)>) -> EgtResult<Self> {
         let mut values = Vec::new();
         for (table, len) in tables {
             let context = format!("table {table} working values");
@@ -631,12 +631,12 @@ fn solve_pair(
     debug_assert!((1..=2).contains(&tables.len()));
     let init_start = std::time::Instant::now();
     let mut working = WorkingPair::new(tables.iter().map(|table| {
-        (table.egt.tablename(), table.egt.index_range())
+        (table.egt.id(), table.egt.index_range())
     }))?;
 
     for (table, values) in tables.iter_mut().zip(&mut working.values) {
         let counts = initialize_table(&table.egt, values, &table.summary, reader)?;
-        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table.egt.tablename(), counts.checkmates, counts.stalemates);
+        println!("{}: Initialized with {} checkmated positions, {} stalemated positions.", table.egt.id(), counts.checkmates, counts.stalemates);
         // Checkmates count as losses at ply 0, so that phase W(1) scans them.
         table.previous.losses = counts.checkmates;
         table.found = counts.found;
@@ -719,11 +719,11 @@ fn solve_pair(
 
         for table in tables.iter_mut() {
             if table.found.wins > 0 {
-                println!("{}: Found {} winning positions at depth {}", table.egt.tablename(), table.found.wins, plies);
+                println!("{}: Found {} winning positions at depth {}", table.egt.id(), table.found.wins, plies);
                 table.maxima[0] = plies;
             }
             if table.found.losses > 0 {
-                println!("{}: Found {} losing positions at depth {}", table.egt.tablename(), table.found.losses, plies);
+                println!("{}: Found {} losing positions at depth {}", table.egt.id(), table.found.losses, plies);
                 table.maxima[1] = plies;
             }
             table.previous = std::mem::take(&mut table.found);
@@ -738,7 +738,7 @@ fn solve_pair(
     if blocks_total > 0 {
         println!(
             "{}: scans visited {} of {} blocks ({:.1}%)",
-            tables[0].egt.tablename(),
+            tables[0].egt.id(),
             blocks_scanned,
             blocks_total,
             100.0 * blocks_scanned as f64 / blocks_total as f64,
@@ -766,7 +766,7 @@ pub(super) fn generate_pair(
     base.ensure_writable()?;
     let ids = || std::iter::once(&pair.table).chain(pair.twin.iter());
     let init_setup = std::time::Instant::now();
-    let mut tables = ids().map(|id| Egt::from_elements(id.parse_elements()).map(TableState::new))
+    let mut tables = ids().map(|id| Egt::new(id).map(TableState::new))
         .collect::<EgtResult<Vec<_>>>()?;
     let init_setup = init_setup.elapsed();
     let mut result = solve_pair(&mut tables, pair.reflected, reader)?;
@@ -776,12 +776,12 @@ pub(super) fn generate_pair(
     let mut stats = Vec::with_capacity(tables.len());
     for ((id, table), values) in ids().zip(tables).zip(result.working.values) {
         drop(table.summary);
-        println!("{}: finalizing outcomes, statistics and compression...", id.tablename());
+        println!("{id}: finalizing outcomes, statistics and compression...");
         stats.push(super::finalization::finalize_table(base, id, &table.egt, values, table.maxima, table.invalid)?);
     }
     let finalize_time = finalize_start.elapsed();
     let total_time = dependency_time + result.init_time + result.propagation_time + finalize_time;
-    let names = ids().map(|id| id.tablename()).collect::<Vec<_>>().join(", ");
+    let names = ids().map(|id| id.name()).collect::<Vec<_>>().join(", ");
     println!(
         "{}: phase timings: dependencies {:.3}s, init {:.3}s, propagation {:.3}s, finalize/publish {:.3}s, total {:.3}s.",
         names,
@@ -803,12 +803,12 @@ mod tests {
 
     fn tables(material: &str) -> Vec<Egt> {
         TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
-            .map(|id| Egt::from_elements(id.parse_elements()).unwrap())
+            .map(|id| Egt::new(&id).unwrap())
             .collect()
     }
 
     fn table(name: &str) -> Egt {
-        Egt::from_elements(TableId::parse(name).unwrap().parse_elements()).unwrap()
+        Egt::new(&TableId::parse(name).unwrap()).unwrap()
     }
 
     #[test]
@@ -924,7 +924,7 @@ mod tests {
                             checked += 1;
                         }
                     }
-                    assert!(checked > 0, "no valid samples for {}, {turn:?}", egt.tablename());
+                    assert!(checked > 0, "no valid samples for {}, {turn:?}", egt.id());
                 }
             }
         }
@@ -938,8 +938,8 @@ mod tests {
         for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe", "KPd_KPe", "KPaPa_KPh"] {
             let id = TableId::parse(name).unwrap();
             let (twin_id, mirrored) = id.twin();
-            let egt = Egt::from_elements(id.parse_elements()).unwrap();
-            let twin = Egt::from_elements(twin_id.parse_elements()).unwrap();
+            let egt = Egt::new(&id).unwrap();
+            let twin = Egt::new(&twin_id).unwrap();
             let reverse_mirrored = twin_id.twin().1;
             let stride = (egt.index_range() / 128).max(1);
             let mut samples: Vec<_> = (0..egt.index_range()).step_by(stride).collect();
@@ -1328,9 +1328,9 @@ mod tests {
         ] {
             let id = TableId::parse(name).unwrap();
             let (twin, actual_reflection) = id.twin();
-            assert_eq!(twin.tablename(), twin_name);
+            assert_eq!(twin.name().as_str(), twin_name);
             assert_eq!(actual_reflection, reflected);
-            for selected in [id.clone(), twin.clone()] {
+            for selected in [id, twin] {
                 let plan = GenerationPlan::new([selected]);
                 let pair = &plan.pairs[0];
                 let ids: Vec<_> = std::iter::once(&pair.table).chain(pair.twin.iter()).collect();

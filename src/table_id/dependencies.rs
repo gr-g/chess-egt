@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{ByRole, EgtElement, EgtSide, PawnKey, Role, TableId, format_name};
+use super::{EgtSide, NONPAWN_ROLES, PawnKey, Role, TableId, role_index, sides};
 
 // Zero is empty, one is STM, two is SNTM; indices are normalized ranks 1..8.
 type Layout = [u8; 8];
@@ -11,12 +11,9 @@ fn layouts(word: u8) -> Vec<Layout> {
         .filter(|mask| mask.count_ones() == len)
         .map(|mask| {
             let mut layout = [0; 8];
-            let mut slot = 0;
-            for rank in 0..6 {
-                if mask & (1 << rank) != 0 {
-                    layout[rank + 1] = 1 + ((word >> slot) & 1);
-                    slot += 1;
-                }
+            let ranks = (0..6).filter(|&rank| mask & (1 << rank) != 0);
+            for (rank, side) in ranks.zip(sides(word)) {
+                layout[rank + 1] = if side == EgtSide::SideToMove { 1 } else { 2 };
             }
             layout
         })
@@ -37,35 +34,25 @@ impl TableId {
     /// Sorted direct conversion successors, with exact pawn orders and rank feasibility.
     /// Every entry is required; this filters pawn geometry, not full legal reachability.
     pub(crate) fn dependencies(&self) -> Vec<TableId> {
-        let elements = self.parse_elements();
-        let key = PawnKey::from_elements(&elements);
-        let mut counts = [ByRole::new_with(|_| 0usize); 2];
-        for element in elements {
-            if let EgtElement::PieceGroup {
-                role,
-                side,
-                multiplicity,
-            } = element
-            {
-                counts[usize::from(side == EgtSide::SideNotToMove)][role] = multiplicity;
-            }
-        }
-        let victims: Vec<_> = Role::ALL
+        let key = self.pawns;
+        let counts = self.pieces;
+        let victims: Vec<_> = NONPAWN_ROLES
             .into_iter()
-            .filter(|&role| role != Role::King && role != Role::Pawn && counts[1][role] != 0)
+            .filter(|&role| {
+                role != Role::King && counts[1][role_index(role)] != 0
+            })
             .collect();
         let mut dependencies = BTreeSet::new();
         let mut emit = |key: PawnKey, captured: Option<Role>, promoted: Option<Role>| {
             let key = key.twin().canonicalized().0;
-            dependencies.insert(TableId(
-                format_name(key, |side, role| {
-                    let original_stm = side == EgtSide::SideNotToMove;
-                    counts[usize::from(!original_stm)][role]
-                        + usize::from(original_stm && promoted == Some(role))
-                        - usize::from(!original_stm && captured == Some(role))
-                })
-                .to_string(),
-            ));
+            let mut pieces = [counts[1], counts[0]];
+            if let Some(role) = captured {
+                pieces[0][role_index(role)] -= 1;
+            }
+            if let Some(role) = promoted {
+                pieces[1][role_index(role)] += 1;
+            }
+            dependencies.insert(TableId { pawns: key, pieces });
         };
 
         // A king is always available as a nonpawn attacker.

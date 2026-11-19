@@ -115,8 +115,8 @@ impl TryFrom<serde_json::Value> for StatsRecord {
 impl StatsRecord {
     pub(crate) fn missing(id: &TableId) -> EgtResult<Self> {
         Ok(Self::Missing(PlaceholderStats {
-            tablename: id.tablename().to_owned(),
-            index_range: Egt::from_elements(id.parse_elements())?.index_range(),
+            tablename: id.to_string(),
+            index_range: Egt::new(id)?.index_range(),
             ..Default::default()
         }))
     }
@@ -436,8 +436,8 @@ pub(crate) fn read_stats(location: &Location, id: &TableId) -> EgtResult<EgtStat
 
 impl EgtStats {
     fn validate(&self, id: &TableId) -> EgtResult<()> {
-        let frame_size = Egt::from_elements(id.parse_elements())?.frame_size();
-        if self.tablename != id.tablename()
+        let frame_size = Egt::new(id)?.frame_size();
+        if self.tablename != id.name().as_str()
             || self.sha256.len() != 64
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.bytes == 0
@@ -531,7 +531,7 @@ mod tests {
             bytes: 100,
             sha256: "ab".repeat(32),
             index_range: 16,
-            frame_size: Egt::from_elements(TableId::parse("KQ_K").unwrap().parse_elements())
+            frame_size: Egt::new(&TableId::parse("KQ_K").unwrap())
                 .unwrap()
                 .frame_size(),
             num_frames: 1,
@@ -678,7 +678,7 @@ mod tests {
             let id = TableId::parse(name).unwrap();
             let mut stats = stats();
             stats.tablename = name.into();
-            stats.frame_size = Egt::from_elements(id.parse_elements()).unwrap().frame_size();
+            stats.frame_size = Egt::new(&id).unwrap().frame_size();
             stats.validate(&id).unwrap();
             for frame_size in [0, 256 * 1024, stats.frame_size + 1] {
                 stats.frame_size = frame_size;

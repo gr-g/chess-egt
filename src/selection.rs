@@ -18,9 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use shakmaty::{ByRole, Role};
 
 use crate::error::{EgtError, EgtResult};
-use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES};
 use crate::table_id::{
-    PawnKey, TableId, get_file_combinations, is_canonical, pawn_order_combinations,
+    MAX_PIECES, NONPAWN_ROLES, TableId, get_file_combinations, is_canonical, pawn_order_combinations, uppercase_role,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -57,7 +56,7 @@ impl Prefix {
 struct Material {
     stm_pawns: usize,
     sntm_pawns: usize,
-    pieces: Vec<EgtElement>,
+    pieces: [[u8; 5]; 2],
     side_counts: (usize, usize),
 }
 
@@ -67,17 +66,13 @@ impl Material {
         let (stm, sntm) = name
             .split_once('_')
             .ok_or_else(|| invalid("missing '_' separator"))?;
-        let mut pieces = Vec::new();
+        let mut pieces = [[0; 5]; 2];
         let mut pawns = [0; 2];
         let mut counts = [0; 2];
-        for (idx, (text, side)) in [(stm, EgtSide::SideToMove), (sntm, EgtSide::SideNotToMove)]
-            .into_iter()
-            .enumerate()
-        {
+        for (idx, text) in [stm, sntm].into_iter().enumerate() {
             let mut roles = ByRole::new_with(|_| 0usize);
             for c in text.chars() {
-                let role = Role::from_char(c)
-                    .filter(|_| c.is_ascii_uppercase())
+                let role = uppercase_role(c)
                     .ok_or_else(|| invalid("material must contain only uppercase KQRBNP"))?;
                 roles[role] += 1;
             }
@@ -87,17 +82,11 @@ impl Material {
             let mut canonical = String::new();
             for role in Role::ALL.into_iter().rev() {
                 canonical.extend(std::iter::repeat_n(role.upper_char(), roles[role]));
-                if role != Role::Pawn && roles[role] != 0 {
-                    pieces.push(EgtElement::PieceGroup {
-                        role,
-                        side,
-                        multiplicity: roles[role],
-                    });
-                }
             }
             if canonical != text {
                 return Err(invalid("noncanonical material order; expected KQRBNP"));
             }
+            pieces[idx] = NONPAWN_ROLES.map(|role| roles[role] as u8);
             pawns[idx] = roles.pawn;
             counts[idx] = text.len();
         }
@@ -124,12 +113,11 @@ impl Material {
                 if !is_canonical(a, b) {
                     continue;
                 }
-                for mut elements in pawn_order_combinations(a, b) {
-                    if PawnKey::from_elements(&elements).canonicalized().1 {
+                for pawns in pawn_order_combinations(a, b) {
+                    if pawns.canonicalized().1 {
                         continue;
                     }
-                    elements.extend_from_slice(&self.pieces);
-                    let table = TableId::from_elements(elements)?;
+                    let table = TableId::new(pawns, self.pieces);
                     if prefix.matches(&table) {
                         tables.push(table);
                     }
@@ -237,7 +225,7 @@ impl TableSelector {
     /// table names ordered by KQRBNP, independently of I/O.
     pub fn resolve(&self) -> EgtResult<Vec<TableId>> {
         let tables = match &self.target {
-            Target::Exact(table) => vec![table.clone()],
+            Target::Exact(table) => vec![*table],
             Target::Material(material) => material.tables(&Prefix::default())?,
             Target::Hierarchy(prefix) => {
                 let mut tables = Vec::new();
@@ -349,7 +337,7 @@ impl GenerationPlan {
         let mut pairs = BTreeMap::new();
         for table in tables {
             let (twin, reflected) = table.twin();
-            let reverse = PawnKey::from_elements(&twin.parse_elements()).twin().canonicalized().1;
+            let reverse = twin.twin().1;
             let (first, second, reflected) = if table == twin {
                 (table, None, [reflected, reverse])
             } else if table < twin {
@@ -418,8 +406,8 @@ mod tests {
     fn resolve(selector: &str) -> Vec<TableId> {
         TableSelector::parse(selector).unwrap().resolve().unwrap()
     }
-    fn names(tables: &[TableId]) -> Vec<&str> {
-        tables.iter().map(TableId::tablename).collect()
+    fn names(tables: &[TableId]) -> Vec<String> {
+        tables.iter().map(ToString::to_string).collect()
     }
 
     #[test]
@@ -459,7 +447,7 @@ mod tests {
             assert!(resolve(prefix).contains(&table), "{path}");
             let exact = path.strip_suffix(".ggegt").unwrap();
             assert!(TableSelector::parse(exact).is_err());
-            assert_eq!(resolve(table.tablename()), vec![table]);
+            assert_eq!(resolve(&table.name()), vec![table]);
         }
     }
 
@@ -603,9 +591,9 @@ mod tests {
         assert_eq!(resolve("KPP_KP").len(), 180);
         let tables = resolve("KPP_KPP");
         let selected = names(&tables);
-        assert!(selected.contains(&"KPaPho_KPaPho"));
-        assert!(!selected.contains(&"KPaoPh_KPaoPh"));
-        assert!(selected.contains(&"KPaoPho_KPaoPho"));
+        assert!(selected.iter().any(|name| name == "KPaPho_KPaPho"));
+        assert!(!selected.iter().any(|name| name == "KPaoPh_KPaoPh"));
+        assert!(selected.iter().any(|name| name == "KPaoPho_KPaoPho"));
     }
 
     #[test]
@@ -638,7 +626,7 @@ mod tests {
                 let unopposed = format!("KP{file}_KP{file}");
                 let opposed = format!("KP{file}o_KP{file}o");
                 assert!(tables.windows(2).any(|pair| {
-                    pair[0].tablename() == opposed && pair[1].tablename() == unopposed
+                    pair[0].name().as_str() == opposed && pair[1].name().as_str() == unopposed
                 }));
             }
         }
@@ -647,7 +635,7 @@ mod tests {
     #[test]
     fn plan_uses_selection_order_for_pair_representatives() {
         let plan = GenerationPlan::new(resolve_selectors(&["3/", "2/"]).unwrap());
-        let representatives: Vec<_> = plan.pairs.iter().map(|pair| pair.table.clone()).collect();
+        let representatives: Vec<_> = plan.pairs.iter().map(|pair| pair.table).collect();
         assert_eq!(
             names(&representatives),
             [

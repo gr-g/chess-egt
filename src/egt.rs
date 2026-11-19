@@ -1,24 +1,17 @@
 use shakmaty::{Chess, Color};
-use crate::table_id::{compute_tablename, parse_elements};
+use crate::TableId;
 mod indexer;
 use crate::error::EgtResult;
-use crate::piece_set::EgtElement;
 use indexer::Indexer;
 
 /// An immutable indexing descriptor, in either horizontal orientation.
 #[derive(Clone, Debug)]
 pub struct Egt {
-    elements: Vec<EgtElement>,
+    id: TableId,
     indexer: Indexer,
-    tablename: String,
 }
 
 impl Egt {
-    /// The pawn-file sequences and nonpawn material groups in this table.
-    pub fn elements(&self) -> &[EgtElement] {
-        &self.elements
-    }
-
     /// The number of physical pieces, including pawns and kings.
     pub(crate) fn n_pieces(&self) -> usize {
         self.indexer.n_pieces
@@ -51,33 +44,17 @@ impl Egt {
         self.indexer.index_range
     }
 
-    /// The descriptor name, e.g. `KQ_KPa`, in this table's horizontal orientation.
-    pub fn tablename(&self) -> &str {
-        &self.tablename
+    /// The table identity in this indexer's horizontal orientation.
+    pub fn id(&self) -> TableId {
+        self.id
     }
 
-    /// Builds a table from pawn-file sequences and nonpawn material counts.
-    /// Elements are sorted canonically and validated by the indexer.
-    pub fn from_elements(mut elements: Vec<EgtElement>) -> EgtResult<Self> {
-        elements.sort();
-        let indexer = Indexer::from_elements(&elements)?;
-        let tablename = compute_tablename(&elements);
-        Ok(Egt {
-            elements,
-            indexer,
-            tablename,
+    /// Builds an indexing plan for a validated table identity.
+    pub fn new(id: &TableId) -> EgtResult<Self> {
+        Ok(Self {
+            id: *id,
+            indexer: Indexer::new(id),
         })
-    }
-
-    /// Parses a descriptor with canonical token order, in either horizontal orientation.
-    /// Unlike [`crate::TableId::parse`], this accepts horizontally noncanonical names.
-    /// Each side has `K`, then `Q`, `R`, `B`, `N`,
-    /// then pawns by ascending file. A pawn token is `Pa` through `Ph`, with
-    /// an optional trailing `o` when the next pawn towards promotion is enemy.
-    /// Within a file, STM tokens follow ascending normalized rank and SNTM
-    /// tokens descending rank. Noncanonical piece order is rejected.
-    pub fn from_tablename(tablename: &str) -> EgtResult<Self> {
-        Self::from_elements(parse_elements(tablename)?)
     }
 
     /// Encodes a no-castling position matching this table's material, pawn files,
@@ -128,38 +105,10 @@ impl Egt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shakmaty::{File, Role};
-    use crate::piece_set::EgtSide;
     use crate::error::EgtError;
+    use crate::table_id::{EgtSide, parse_oriented, test_support::{pawn_group, with_pawns}};
     use EgtSide::{SideNotToMove as Sntm, SideToMove as Stm};
-
-    fn pawn_group(file: File, order: &[EgtSide]) -> EgtElement {
-        EgtElement::PawnGroup {
-            file,
-            order: order.iter().copied().collect(),
-        }
-    }
-
-    fn piece_group(role: Role, side: EgtSide, multiplicity: usize) -> EgtElement {
-        EgtElement::PieceGroup {
-            role,
-            side,
-            multiplicity,
-        }
-    }
-
-    fn kings() -> Vec<EgtElement> {
-        vec![
-            piece_group(Role::King, Stm, 1),
-            piece_group(Role::King, Sntm, 1),
-        ]
-    }
-
-    fn table_with_order(order: &[EgtSide]) -> Egt {
-        let mut elements = kings();
-        elements.push(pawn_group(File::A, order));
-        Egt::from_elements(elements).unwrap()
-    }
+    use shakmaty::File;
 
     #[test]
     fn naming_uses_next_occupied_slot_and_side_traversal() {
@@ -172,12 +121,9 @@ mod tests {
             (vec![Sntm, Stm, Sntm], "KPao_KPaoPa"),
             (vec![Stm, Stm, Sntm, Stm, Sntm, Sntm], "KPaPaoPao_KPaPaoPao"),
         ] {
-            let egt = table_with_order(&order);
-            assert_eq!(egt.tablename(), expected, "{order:?}");
-            assert_eq!(
-                Egt::from_tablename(expected).unwrap().elements,
-                egt.elements
-            );
+            let id = with_pawns("K_K", &[pawn_group(File::A, &order)]);
+            assert_eq!(id.name().as_str(), expected, "{order:?}");
+            assert_eq!(TableId::parse(expected).unwrap(), id);
         }
     }
 
@@ -189,81 +135,30 @@ mod tests {
                 let order: Vec<_> = (0..len)
                     .map(|i| if word & (1 << i) == 0 { Stm } else { Sntm })
                     .collect();
-                let egt = table_with_order(&order);
-                assert!(
-                    names.insert(egt.tablename.clone()),
-                    "duplicate name for {order:?}"
-                );
-                let parsed = Egt::from_tablename(egt.tablename()).unwrap();
-                assert_eq!(parsed.elements, egt.elements);
-            }
-        }
-    }
-
-    #[test]
-    fn element_order_preserves_canonical_indexing_order() {
-        let mut expected = vec![
-            pawn_group(File::A, &[Stm]),
-            pawn_group(File::A, &[Stm, Sntm]),
-            pawn_group(File::A, &[Sntm]),
-            pawn_group(File::B, &[Stm]),
-        ];
-        for role in [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight] {
-            for side in [Stm, Sntm] {
-                expected.extend([piece_group(role, side, 1), piece_group(role, side, 2)]);
-            }
-        }
-        let mut shuffled = expected.clone();
-        shuffled.reverse();
-        shuffled.sort();
-        assert_eq!(shuffled, expected);
-        for (i, a) in expected.iter().enumerate() {
-            for (j, b) in expected.iter().enumerate() {
-                assert_eq!(a.cmp(b), i.cmp(&j));
-                assert_eq!(a.partial_cmp(b), Some(i.cmp(&j)));
+                let id = with_pawns("K_K", &[pawn_group(File::A, &order)]);
+                let name = id.name();
+                assert!(names.insert(name), "duplicate name for {order:?}");
+                assert_eq!(TableId::parse(&name).unwrap(), id);
             }
         }
     }
 
     #[test]
     fn naming_sorts_files_and_preserves_nonpawn_names() {
-        let mut elements = kings();
-        elements.extend([
-            pawn_group(File::H, &[Stm]),
-            piece_group(Role::Knight, Stm, 1),
-            pawn_group(File::B, &[Stm, Sntm]),
-            piece_group(Role::Queen, Stm, 1),
-        ]);
-        let egt = Egt::from_elements(elements).unwrap();
-        assert_eq!(egt.tablename(), "KQNPboPh_KPbo");
-        assert_eq!(
-            egt.elements(),
-            &[
-                pawn_group(File::B, &[Stm, Sntm]),
-                pawn_group(File::H, &[Stm]),
-                piece_group(Role::King, Stm, 1),
-                piece_group(Role::King, Sntm, 1),
-                piece_group(Role::Queen, Stm, 1),
-                piece_group(Role::Knight, Stm, 1),
-            ]
-        );
+        let id = with_pawns("KQN_K", &[pawn_group(File::H, &[Stm]), pawn_group(File::B, &[Stm, Sntm])]);
+        assert_eq!(id.name().as_str(), "KQNPboPh_KPbo");
         for name in ["K_K", "KQQ_K", "KQRBN_KR", "KPaPa_KPh"] {
-            assert_eq!(Egt::from_tablename(name).unwrap().tablename(), name);
+            assert_eq!(TableId::parse(name).unwrap().name().as_str(), name);
         }
     }
 
     #[test]
     fn naming_mixed_file_without_flags_is_explicitly_unopposed() {
-        let egt = Egt::from_tablename("KPdPe_KPePePe").unwrap();
-        assert_eq!(
-            egt.elements(),
-            &[
-                pawn_group(File::D, &[Stm]),
-                pawn_group(File::E, &[Sntm, Sntm, Sntm, Stm]),
-                piece_group(Role::King, Stm, 1),
-                piece_group(Role::King, Sntm, 1),
-            ]
-        );
+        let id = parse_oriented("KPdPe_KPePePe").unwrap();
+        assert_eq!(id, with_pawns("K_K", &[
+            pawn_group(File::D, &[Stm]),
+            pawn_group(File::E, &[Sntm, Sntm, Sntm, Stm]),
+        ]));
     }
 
     #[test]
@@ -274,6 +169,9 @@ mod tests {
             "K_K_K",
             "_K",
             "KK_K",
+            "K_KK",
+            "KQQQQQQQ_K",
+            "KPaPaPaPaPaPa_KPb",
             "K_Q",
             "Kk_K",
             "K P a_K",
@@ -298,7 +196,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Egt::from_tablename(name),
+                    TableId::parse(name),
                     Err(EgtError::InvalidEndgameName { .. })
                 ),
                 "accepted {name:?}"
@@ -307,63 +205,14 @@ mod tests {
     }
 
     #[test]
-    fn naming_rejects_invalid_elements() {
-        for extra in [
-            vec![pawn_group(File::A, &[])],
-            vec![pawn_group(File::A, &[Stm]), pawn_group(File::A, &[Sntm])],
-            vec![piece_group(Role::Pawn, Stm, 1)],
-            vec![piece_group(Role::Queen, Stm, 0)],
-            vec![
-                piece_group(Role::Queen, Stm, 1),
-                piece_group(Role::Queen, Stm, 2),
-            ],
-            vec![piece_group(Role::King, Stm, 1)],
-            vec![piece_group(Role::Queen, Stm, 7)],
-            vec![pawn_group(File::A, &[Stm; 6]), pawn_group(File::B, &[Sntm])],
-            vec![piece_group(Role::Queen, Stm, usize::MAX)],
-        ] {
-            let mut elements = kings();
-            elements.extend(extra);
-            assert!(matches!(
-                Egt::from_elements(elements),
-                Err(EgtError::UnsupportedPosition(_))
-            ));
-        }
-        for elements in [
-            vec![],
-            vec![piece_group(Role::King, Stm, 1)],
-            vec![piece_group(Role::King, Sntm, 1)],
-            vec![
-                piece_group(Role::King, Stm, 2),
-                piece_group(Role::King, Sntm, 1),
-            ],
-            vec![
-                piece_group(Role::King, Stm, 1),
-                piece_group(Role::King, Sntm, 2),
-            ],
-        ] {
-            assert!(matches!(
-                Egt::from_elements(elements),
-                Err(EgtError::UnsupportedPosition(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn elements_count_physical_pieces() {
-        assert_eq!(pawn_group(File::A, &[Stm, Sntm, Stm]).multiplicity(), 3);
-        assert_eq!(piece_group(Role::Queen, Stm, 2).multiplicity(), 2);
-        let mut elements = kings();
-        elements.push(piece_group(Role::Knight, Stm, 6));
-        let egt = Egt::from_elements(elements).unwrap();
-        assert_eq!(
-            egt.elements()
-                .iter()
-                .map(EgtElement::multiplicity)
-                .sum::<usize>(),
-            8
-        );
-        assert_eq!(egt.tablename(), "KNNNNNN_K");
+    fn table_counts_physical_pieces() {
+        let id = TableId::parse("KQQPaoPa_KPao").unwrap();
+        let egt = Egt::new(&id).unwrap();
+        assert_eq!(egt.n_pieces(), 7);
+        assert_eq!(egt.n_pawns(), 3);
+        let egt = Egt::new(&TableId::parse("KNNNNNN_K").unwrap()).unwrap();
+        assert_eq!(egt.n_pieces(), 8);
+        assert_eq!(egt.id().name().as_str(), "KNNNNNN_K");
     }
 
     #[test]
@@ -376,7 +225,7 @@ mod tests {
             ("KPaPa_KPb", 5, 3660, 453840),
             ("KNNNNNN_K", 8, 3306, 390108),
         ] {
-            let egt = Egt::from_tablename(name).unwrap();
+            let egt = Egt::new(&TableId::parse(name).unwrap()).unwrap();
             assert_eq!(egt.n_pieces(), pieces);
             assert_eq!(egt.summary_block_size(), summary);
             assert_eq!(egt.frame_size(), frame);
@@ -386,7 +235,7 @@ mod tests {
     #[test]
     fn known_valid_decoder_matches_public_decoder() {
         for name in ["K_K", "KQ_K", "KPa_K", "KPd_KPe"] {
-            let egt = Egt::from_tablename(name).unwrap();
+            let egt = Egt::new(&TableId::parse(name).unwrap()).unwrap();
             for turn in [Color::White, Color::Black] {
                 let mut accepted = 0;
                 for index in (0..egt.index_range()).step_by((egt.index_range() / 256).max(1)) {
@@ -407,7 +256,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "position index out of range")]
     fn known_valid_decoder_enforces_index_range() {
-        let egt = Egt::from_tablename("K_K").unwrap();
+        let egt = Egt::new(&TableId::parse("K_K").unwrap()).unwrap();
         egt.position_from_index_unchecked(egt.index_range(), Color::White);
     }
 
@@ -416,7 +265,7 @@ mod tests {
         use crate::egt_file::mirror_horizontally;
 
         for name in ["KPa_K", "KPd_KPe", "KPaPaPd_KPbPf", "KNN_K"] {
-            let egt = Egt::from_tablename(name).unwrap();
+            let egt = Egt::new(&TableId::parse(name).unwrap()).unwrap();
             let stride = (egt.index_range() / 256).max(1);
             let mut checked = 0;
             for turn in [Color::White, Color::Black] {
@@ -460,7 +309,7 @@ mod tests {
                 reflected.legal_ep_square(),
                 position.legal_ep_square().map(|sq| sq.flip_horizontal())
             );
-            let egt = Egt::from_tablename(name).unwrap();
+            let egt = Egt::new(&parse_oriented(name).unwrap()).unwrap();
             assert_eq!(
                 egt.reflected_position_to_index(&position),
                 egt.position_to_index(&reflected),
@@ -471,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_diagonal_symmetric() {
-        let egt = Egt::from_tablename("KR_K").unwrap();
+        let egt = Egt::new(&TableId::parse("KR_K").unwrap()).unwrap();
 
         for i in [10, 100, 2100] {
             println!("{:?}", egt.position_from_index(i, Color::White));
@@ -486,7 +335,7 @@ mod tests {
         println!("{:?}", egt.position_from_index(805, Color::White));
         assert_eq!(egt.diagonal_symmetric(805), Some(805));
 
-        let egt_p = Egt::from_tablename("KPd_K").unwrap();
+        let egt_p = Egt::new(&TableId::parse("KPd_K").unwrap()).unwrap();
         println!("{:?}", egt_p.position_from_index(0, Color::White));
         assert_eq!(egt_p.diagonal_symmetric(0), None);
     }
@@ -499,7 +348,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kpa_k() {
-        let egt = Egt::from_tablename("KPa_K").unwrap();
+        let egt = Egt::new(&TableId::parse("KPa_K").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -509,7 +358,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kb_k() {
-        let egt = Egt::from_tablename("KB_K").unwrap();
+        let egt = Egt::new(&TableId::parse("KB_K").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -519,7 +368,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kqr_kqr() {
-        let egt = Egt::from_tablename("KQ_KR").unwrap();
+        let egt = Egt::new(&TableId::parse("KQ_KR").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -529,7 +378,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kpdpe_kpepepe() {
-        let egt = Egt::from_tablename("KPdPe_KPePePe").unwrap();
+        let egt = Egt::new(&parse_oriented("KPdPe_KPePePe").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -539,7 +388,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kpdpepf_kpepe() {
-        let egt = Egt::from_tablename("KPdPePf_KPePe").unwrap();
+        let egt = Egt::new(&parse_oriented("KPdPePf_KPePe").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);
@@ -549,7 +398,7 @@ mod tests {
 
     #[test]
     fn decode_encode_kpepe_kpdpf() {
-        let egt = Egt::from_tablename("KPePe_KPdPf").unwrap();
+        let egt = Egt::new(&parse_oriented("KPePe_KPdPf").unwrap()).unwrap();
 
         for i in 0..egt.index_range() {
             assert_round_trip(&egt, i, Color::White);

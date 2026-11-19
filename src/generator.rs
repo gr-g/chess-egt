@@ -89,7 +89,7 @@ impl EgtGenerator {
                 reader.load()?;
                 println!(
                     "{}: loaded {} bytes of dependencies.",
-                    pair.table.tablename(),
+                    pair.table,
                     reader.resident_bytes(),
                 );
                 let dependency_time = start.elapsed();

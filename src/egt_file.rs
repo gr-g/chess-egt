@@ -10,7 +10,7 @@ use frame::Frame;
 use crate::egt::Egt;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
-use crate::table_id::{TableId, position_table_name};
+use crate::table_id::TableId;
 use crate::PackedOutcome;
 #[cfg(test)]
 use crate::ConversionType;
@@ -25,16 +25,16 @@ use rayon::prelude::*;
 pub(crate) fn load_existing_file(
     base_path: &Location,
     input_path: Option<&Location>,
-    endgame: &str,
+    id: &TableId,
 ) -> EgtResult<EgtFileReader> {
     if let Some(input) = input_path {
-        match EgtFileReader::open_in(input, endgame) {
+        match EgtFileReader::open_in(input, id) {
             Ok(file) => return Ok(file),
             Err(EgtError::FileNotFound(_)) => {}
             Err(error) => return Err(error),
         }
     }
-    EgtFileReader::open_in(base_path, endgame)
+    EgtFileReader::open_in(base_path, id)
 }
 
 /// Read-only storage and frame cache for one existing canonical table.
@@ -58,12 +58,11 @@ impl EgtFileReader {
     /// Objects must not be replaced while this reader is in use: reads are not
     /// pinned to an object version.
     pub fn new_from_file(base_path: &Path, tablename: &str) -> EgtResult<Self> {
-        Self::open_in(&Location::parse(base_path)?, tablename)
+        Self::open_in(&Location::parse(base_path)?, &TableId::parse(tablename)?)
     }
 
-    pub(crate) fn open_in(location: &Location, tablename: &str) -> EgtResult<Self> {
-        let id = TableId::parse(tablename)?;
-        let egt = Egt::from_elements(id.parse_elements())?;
+    pub(crate) fn open_in(location: &Location, id: &TableId) -> EgtResult<Self> {
+        let egt = Egt::new(id)?;
         let index_range = egt.index_range();
         let key = location.key(&id.relative_path("ggegt"));
         location.validate_format()?;
@@ -212,17 +211,17 @@ impl EgtFileReader {
     /// Maps a position to the corresponding index. This is used when probing
     /// for a specific position.
     pub fn map_position_to_index(&self, position: &Chess) -> EgtResult<usize> {
-        let (name, reflected) = position_table_name(position)?;
-        if name.as_str() != self.egt.tablename() {
+        let (name, reflected) = TableId::from_position(position)?;
+        if name != self.egt.id() {
             return Err(EgtError::PositionNotInTable {
-                table: self.egt.tablename().to_owned(),
+                table: self.egt.id().to_string(),
             });
         }
         self.map_routed_position_to_index(position, reflected)
     }
 
     /// Indexes a position already routed to this table. The caller must have
-    /// selected this identity and its reflection flag via position_table_name.
+    /// selected this identity and its reflection flag via `TableId::from_position`.
     pub(crate) fn map_routed_position_to_index(
         &self,
         position: &Chess,
@@ -425,9 +424,9 @@ mod tests {
     fn pawn_orders_route_to_distinct_tables_and_their_twins() {
         for name in ["KPa_KPa", "KPao_KPao", "KPaPa_KPb", "KPa_KPbPb"] {
             let id = TableId::parse(name).unwrap();
-            let egt = Egt::from_elements(id.parse_elements()).unwrap();
+            let egt = Egt::new(&id).unwrap();
             let (twin, _) = id.twin();
-            let twin_egt = Egt::from_elements(twin.parse_elements()).unwrap();
+            let twin_egt = Egt::new(&twin).unwrap();
             let stride = (egt.index_range() / 64).max(1);
             for turn in [Color::White, Color::Black] {
                 for index in (0..egt.index_range()).step_by(stride) {
@@ -472,7 +471,7 @@ mod tests {
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_err());
         assert!(!dir.0.join("format.json").exists());
         let file = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
-        assert!(table_path(&dir.0, file.egt().tablename()).exists());
+        assert!(table_path(&dir.0, &file.egt().id().name()).exists());
         assert_eq!(std::fs::read(legacy).unwrap(), b"legacy indexing");
         assert!(EgtFileReader::new_from_file(&dir.0, "KPa_K").is_ok());
         assert!(EgtFileReader::new_from_file(&dir.0, "KP_K").is_err());
@@ -503,7 +502,7 @@ mod tests {
     fn test_egt_file_creation() {
         let dir = crate::TestDir::new("single_table_creation");
         let file = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
-        assert_eq!(file.egt().tablename(), "KPa_K");
+        assert_eq!(file.egt().id().name().as_str(), "KPa_K");
         let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"
             .parse::<Fen>()
             .unwrap()
@@ -529,7 +528,7 @@ mod tests {
     }
 
     fn run_round_trip_test(tablename: &str, stride: usize) {
-        let egt = Egt::from_tablename(tablename).unwrap();
+        let egt = Egt::new(&crate::TableId::parse(tablename).unwrap()).unwrap();
         for turn in [Color::White, Color::Black] {
             for index in (0..egt.index_range()).step_by(stride) {
                 if let Some(position) = egt.position_from_index(index, turn) {
@@ -592,7 +591,7 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let egt = Egt::from_tablename("KPa_K").unwrap();
+        let egt = Egt::new(&crate::TableId::parse("KPa_K").unwrap()).unwrap();
         let index = egt.position_to_index(&position);
         let outcome = PackedOutcome::new_win(ConversionType::Checkmate, 987);
         let mut reader = write_fixture(&dir.0, "KPa_K", |i| {
@@ -643,7 +642,7 @@ mod tests {
     #[test]
     fn full_frames_short_tail_and_table_boundaries() {
         let dir = crate::TestDir::new("frame_boundaries");
-        let egt = Egt::from_tablename("KQ_KR").unwrap();
+        let egt = Egt::new(&crate::TableId::parse("KQ_KR").unwrap()).unwrap();
         let length = egt.index_range();
         let frame_size = egt.frame_size();
         let indexes = [0, frame_size - 1, frame_size, frame_size + 1, length - 1];

@@ -50,7 +50,6 @@ mod egt_file;
 pub mod error;
 mod generator;
 mod outcome;
-pub mod piece_set;
 mod position;
 mod prober;
 mod selection;

@@ -66,9 +66,8 @@
 
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
-use crate::piece_set::{EgtElement, EgtSide, MAX_PIECES, validate_elements};
+use crate::table_id::{EgtSide, MAX_PIECES, NONPAWN_ROLES, TableId, sides};
 use crate::error::EgtResult;
-use crate::table_id::PawnKey;
 use std::cmp::Reverse;
 
 
@@ -301,40 +300,34 @@ pub(super) struct Indexer {
 }
 
 impl Indexer {
-    /// Builds the indexing plan in canonical order: pawn files, kings, then
-    /// other role/side groups. The element multiplicities describe physical pieces.
-    pub(super) fn from_elements(elements: &[EgtElement]) -> EgtResult<Self> {
-        validate_elements(elements)?;
-        let mut elements = elements.to_vec();
-        elements.sort();
-        let n_pieces = elements.iter().map(EgtElement::multiplicity).sum();
-        let n_pawns = elements.iter().filter_map(|element| match element {
-            EgtElement::PawnGroup { order, .. } => Some(order.len()),
-            _ => None,
-        }).sum();
-        let symmetric_pawns = n_pawns > 0 && PawnKey::from_elements(&elements).is_symmetric();
+    /// Builds the indexing plan in file order, then KQRBN with STM before SNTM.
+    pub(super) fn new(id: &TableId) -> Self {
+        let n_pieces = id.n_pieces();
+        let n_pawns = id.n_pawns();
+        let symmetric_pawns = n_pawns > 0 && id.symmetric_pawns();
         let mut pawns = Vec::new();
         let mut nonpawns = Vec::new();
         let mut pieces_if_white_is_stm = ArrayVec::new();
-        for element in elements {
+        let piece = |role, side| Piece {
+            role, color: if side == EgtSide::SideToMove { Color::White } else { Color::Black },
+        };
+        for (file, word) in id.pawn_groups() {
+            let order: ArrayVec<_, 6> = sides(word).collect();
             let start = pieces_if_white_is_stm.len();
-            let (role, sides): (_, ArrayVec<_, MAX_PIECES>) = match element {
-                EgtElement::PawnGroup { file, order } => {
-                    let sides = order.iter().rev().copied().collect();
-                    pawns.push(IndexerPawnGroup { file, span: (start, start + order.len()), order });
-                    (Role::Pawn, sides)
-                }
-                EgtElement::PieceGroup { role, side, multiplicity } => {
-                    nonpawns.push(IndexerPieceGroup {
-                        kind: IndexerPieceKind::Pieces { role, side },
-                        span: (start, start + multiplicity), n_squares: 0, combinations: 0,
-                    });
-                    (role, std::iter::repeat_n(side, multiplicity).collect())
-                }
-            };
-            pieces_if_white_is_stm.extend(sides.into_iter().map(|side| Piece {
-                role, color: if side == EgtSide::SideToMove { Color::White } else { Color::Black },
-            }));
+            pieces_if_white_is_stm.extend(order.iter().rev().map(|&side| piece(Role::Pawn, side)));
+            pawns.push(IndexerPawnGroup { file, span: (start, start + order.len()), order });
+        }
+        for role in NONPAWN_ROLES {
+            for side in [EgtSide::SideToMove, EgtSide::SideNotToMove] {
+                let count = id.piece_count(side, role);
+                if count == 0 { continue; }
+                let start = pieces_if_white_is_stm.len();
+                pieces_if_white_is_stm.extend(std::iter::repeat_n(piece(role, side), count));
+                nonpawns.push(IndexerPieceGroup {
+                    kind: IndexerPieceKind::Pieces { role, side },
+                    span: (start, start + count), n_squares: 0, combinations: 0,
+                });
+            }
         }
         let pawn_map = (n_pawns > 0).then(|| PawnMap::new(&pawns));
         if n_pawns == 0 || symmetric_pawns {
@@ -351,9 +344,9 @@ impl Indexer {
         let nonking_combinations = if n_pawns == 0 {
             nonpawns[1..].iter().map(|p| p.combinations).product()
         } else { 0 };
-        Ok(Self { n_pieces, n_pawns, index_range, symmetric_pawns,
+        Self { n_pieces, n_pawns, index_range, symmetric_pawns,
             pieces_if_white_is_stm, repeated_piece_spans, pawns, nonpawns, pawn_map,
-            nonpawn_combinations, nonking_combinations })
+            nonpawn_combinations, nonking_combinations }
     }
 
     // Builds a `CoordBuf` pre-filled with `(0, 0)` for `n` pieces.
@@ -807,6 +800,7 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table_id::test_support::{pawn_group, with_pawns};
     use shakmaty::PositionError;
     use EgtSide::{SideNotToMove as SNTM, SideToMove as STM};
 
@@ -814,18 +808,8 @@ mod tests {
         Indexer::position_from_setup::<true>(indexer.coord_to_setup(ep_file, coord, turn))
     }
 
-    fn pawn_group(file: File, order: &[EgtSide]) -> EgtElement {
-        EgtElement::PawnGroup { file, order: order.iter().copied().collect() }
-    }
-
-    fn indexer(groups: &[EgtElement]) -> Indexer {
-        // Deliberately unsorted: the indexer must canonicalize the group order.
-        let mut elements = vec![
-            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
-        ];
-        elements.extend_from_slice(groups);
-        Indexer::from_elements(&elements).unwrap()
+    fn indexer(groups: &[(File, u8)]) -> Indexer {
+        Indexer::new(&with_pawns("K_K", groups))
     }
 
     // Independent oracle: Shakmaty's full validation plus legal EP filtering.
@@ -851,7 +835,7 @@ mod tests {
     #[test]
     fn symmetric_pawns_pack_kings_and_round_trip_reflections() {
         for name in ["KPaPh_K", "KNNPaPh_K", "KPcPf_KPdPe", "KPaoPho_KPaoPho"] {
-            let egt = crate::egt::Egt::from_tablename(name).unwrap();
+            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
             let indexer = &egt.indexer;
             assert!(indexer.symmetric_pawns, "{name}");
             let kings = &indexer.nonpawns[0];
@@ -887,7 +871,7 @@ mod tests {
     #[test]
     fn decoder_matches_checked_constructor() {
         for name in ["K_K", "KQ_K", "KPa_K", "KPd_KPe", "KPdPdoPe_KPdo", "KNNNNNN_K"] {
-            let egt = crate::egt::Egt::from_tablename(name).unwrap();
+            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
             let indexer = &egt.indexer;
             let mut accepted = 0;
             let mut rejected = 0;
@@ -936,16 +920,10 @@ mod tests {
             ("r6k/8/8/3Pp3/8/8/8/K7 w - e6 0 1", true, false),
         ] {
             let original = fen.parse::<Fen>().unwrap().into_setup();
-            let mut groups = vec![pawn_group(File::D, &[STM]), pawn_group(File::E, &[SNTM])];
-            for role in [Role::Rook, Role::Knight] {
-                for (color, side) in [(Color::White, STM), (Color::Black, SNTM)] {
-                    let multiplicity = (original.board.by_role(role) & original.board.by_color(color)).count();
-                    if multiplicity > 0 {
-                        groups.push(EgtElement::PieceGroup { role, side, multiplicity });
-                    }
-                }
-            }
-            let indexer = indexer(&groups);
+            let raw = Chess::from_setup_unchecked(original.clone(), CastlingMode::Standard);
+            let (id, reflected) = TableId::from_position(&raw).unwrap();
+            assert!(!reflected);
+            let indexer = Indexer::new(&id);
             for turn in [Color::White, Color::Black] {
                 let mut setup = original.clone();
                 if turn == Color::Black { setup.mirror(); }
@@ -1183,35 +1161,24 @@ mod tests {
     }
 
     #[test]
-    fn indexer_rejects_invalid_elements() {
-        let kings = [
-            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
-        ];
-        for extra in [
-            vec![pawn_group(File::E, &[])],
-            vec![pawn_group(File::E, &[STM]), pawn_group(File::E, &[SNTM])],
-            vec![EgtElement::PieceGroup { role: Role::Pawn, side: STM, multiplicity: 1 }],
-            vec![EgtElement::PieceGroup { role: Role::Queen, side: STM, multiplicity: 0 }],
-            vec![EgtElement::PieceGroup { role: Role::Queen, side: STM, multiplicity: usize::MAX }],
+    fn indexing_order_preserves_file_role_and_side_order() {
+        for (name, files, slots) in [
+            ("KQNPboPh_KPbo", &[File::B, File::H][..], "pPPKkQN"),
+            ("KQRB_KQRN", &[][..], "KkQqRrBn"),
+            ("KQQPao_KQPao", &[File::A][..], "pPKkQQq"),
         ] {
-            let mut elements = kings.to_vec();
-            elements.extend(extra);
-            assert!(Indexer::from_elements(&elements).is_err());
+            let id = crate::table_id::parse_oriented(name).unwrap();
+            let indexer = Indexer::new(&id);
+            assert_eq!(indexer.pawns.iter().map(|group| group.file).collect::<Vec<_>>(), files);
+            assert_eq!(indexer.pieces_if_white_is_stm.iter().map(|piece| piece.char()).collect::<String>(), slots);
         }
-        assert!(Indexer::from_elements(&kings[..1]).is_err());
     }
 
     #[test]
     fn pawnless_mapping_keeps_existing_indices() {
         use shakmaty::fen::Fen;
 
-        let elements = [
-            EgtElement::PieceGroup { role: Role::Rook, side: STM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::King, side: SNTM, multiplicity: 1 },
-            EgtElement::PieceGroup { role: Role::King, side: STM, multiplicity: 1 },
-        ];
-        let indexer = Indexer::from_elements(&elements).unwrap();
+        let indexer = Indexer::new(&TableId::parse("KR_K").unwrap());
         assert!(indexer.pawns.is_empty());
         assert!(indexer.pawn_map.is_none());
         assert_eq!(indexer.index_range, 462 * 62);

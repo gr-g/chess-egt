@@ -64,7 +64,7 @@ fn run() -> Result<(), EgtError> {
     if !cli.list.is_empty() {
         let selectors: Vec<_> = cli.list.iter().map(String::as_str).collect();
         for id in resolve_selectors(&selectors)? {
-            println!("{}", id.tablename());
+            println!("{id}");
         }
     } else if !cli.generate.is_empty() {
         let selectors: Vec<_> = cli.generate.iter().map(String::as_str).collect();
