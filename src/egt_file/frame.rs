@@ -3,7 +3,7 @@ use std::{cmp::Reverse, io, ops::Range};
 use crate::{EgtError, EgtResult, PackedOutcome};
 
 #[derive(Clone, Debug)]
-pub(super) struct Frame {
+pub(crate) struct Frame {
     data: Vec<u8>,
     len: usize,
     d: usize,

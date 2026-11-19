@@ -1273,8 +1273,7 @@ mod tests {
         let dir = crate::TestDir::new("initial_summary");
         EgtGenerator::new(&dir.0).unwrap().generate("K_K").unwrap();
         let location = Location::parse(&dir.0).unwrap();
-        let mut reader = BatchReader::open(&location, None, &[TableId::parse("K_K").unwrap()]).unwrap();
-        reader.load().unwrap();
+        let reader = BatchReader::open(&location, None, &[TableId::parse("K_K").unwrap()]).unwrap();
         for name in ["K_KQ", "KQ_K"] {
             let egt = table(name);
             let mut values = atomic_values(vec![PackedOutcome::INVALID; egt.index_range()]);

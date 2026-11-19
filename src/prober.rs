@@ -41,7 +41,8 @@ impl EgtProber {
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
     pub fn set_cache_size(&mut self, n: usize) -> EgtResult<()> {
-        self.cache.set_cache_size(n)
+        self.cache.set_cache_size(n);
+        Ok(())
     }
 
     /// Resolves an additional local directory or object-store URL for table lookup.
@@ -52,12 +53,13 @@ impl EgtProber {
     /// setting unchanged. This synchronous API should run in `spawn_blocking`
     /// when called from an async application.
     pub fn set_input_path(&mut self, path: impl AsRef<Path>) -> EgtResult<()> {
-        self.cache.set_input_path(Some(Location::parse(path)?))
+        self.cache.set_input_path(Some(Location::parse(path)?));
+        Ok(())
     }
 
     /// Probes a position using the internally synchronized shared cache.
     pub fn probe(&self, position: &Chess) -> EgtResult<DtcOutcome> {
-        self.cache.probe_direct_outcome(position)
+        self.cache.probe(position)
     }
 
     /// Probes the root and all legal successors in one batch.
@@ -75,7 +77,7 @@ impl EgtProber {
             successor.play_unchecked(*m);
             positions.push(successor);
         }
-        let outcomes = self.cache.probe_direct_outcomes(&positions)?;
+        let outcomes = self.cache.probe_outcomes(&positions)?;
         Ok(ProbeWithMoves {
             outcome: outcomes[0],
             moves: moves

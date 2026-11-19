@@ -86,14 +86,14 @@ impl EgtVerifier {
             dependencies.dedup();
             let mut reader =
                 BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
-            reader.insert(source);
-            reader.load()?;
+            let frames = source.read_all()?;
+            reader.insert(source, frames);
             println!(
                 "{}: loaded {} bytes of dependencies.",
                 id,
                 reader.resident_bytes()
             );
-            let egt = reader.file(id)?.egt();
+            let egt = reader.egt(id);
             unique_positions += verify_egt(&reader, egt)?;
             index_range += egt.index_range();
             println!(

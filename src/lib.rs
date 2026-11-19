@@ -59,7 +59,6 @@ mod table_id;
 mod verification;
 
 pub use egt::Egt;
-pub use egt_file::EgtFileReader;
 pub use error::{EgtError, EgtResult};
 pub use generator::{EgtGenerator, print_pair_stats, print_table_stats};
 pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};

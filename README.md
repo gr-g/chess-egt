@@ -199,9 +199,9 @@ The following sections describe the tablebase's main building blocks:
   range `[0, index_range)` within each table.
 - **Retrograde analysis (`solve_pair`)**: Computes outcomes by propagating
   known results backward to predecessor positions.
-- **Storage and memory layer (`EgtFileReader`, `EgtFileWriter`,
-  `SharedFileCache`)**: Reads and writes compressed tables and caches
-  decompressed frames.
+- **Storage and memory layer (`TableFile`, `EgtFileWriter`, `BatchReader`,
+  `SharedFileCache`)**: Reads and writes compressed tables, loads dependencies
+  eagerly for batch jobs, and caches decompressed frames for on-demand probes.
 
 The project focuses on the core tablebase architecture, table generation, and
 probing. Various other aspects rely on external dependencies:

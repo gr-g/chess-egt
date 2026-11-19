@@ -1,19 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use rayon::prelude::*;
 use shakmaty::Chess;
 
-use super::{EgtFileReader, load_existing_file};
+use super::{Frame, TableFile, load_existing_file};
 use crate::storage::Location;
 use crate::table_id::TableId;
-use crate::{DtcOutcome, EgtError, EgtResult, PackedOutcome};
+use crate::{DtcOutcome, Egt, EgtError, EgtResult, PackedOutcome};
 
 /// Job-scoped tables loaded before workers borrow them immutably.
 /// All enumerated dependencies must exist and their decompressed data must fit
 /// in memory together. Probes never load data or update shared state.
 #[derive(Default)]
 pub(crate) struct BatchReader {
-    files: HashMap<TableId, EgtFileReader>,
+    files: HashMap<TableId, (TableFile, Vec<Frame>)>,
 }
 
 impl BatchReader {
@@ -23,52 +23,52 @@ impl BatchReader {
         input: Option<&Location>,
         ids: &[TableId],
     ) -> EgtResult<Self> {
-        let mut reader = Self::default();
-        for id in ids {
-            if !reader.files.contains_key(id) {
-                let file =
-                    load_existing_file(base, input, id).map_err(
-                        |source| match source {
-                            EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                                dependency: id.to_string(),
-                                source: Box::new(source),
-                            },
-                            other => other,
-                        },
-                    )?;
-                reader.insert(file);
+        let mut files = HashMap::new();
+        for &id in ids {
+            if let Entry::Vacant(entry) = files.entry(id) {
+                let file = load_existing_file(base, input, &id).map_err(|source| match source {
+                    EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
+                        dependency: id.to_string(),
+                        source: Box::new(source),
+                    },
+                    other => other,
+                })?;
+                entry.insert(file);
             }
         }
-        Ok(reader)
+        let files = files
+            .into_par_iter()
+            .map(|(id, file)| {
+                let frames = file.read_all()?;
+                Ok((id, (file, frames)))
+            })
+            .collect::<EgtResult<_>>()?;
+        Ok(Self { files })
     }
 
     /// Also accepts explicit outputs, which must override input-overlay copies.
-    pub(crate) fn insert(&mut self, file: EgtFileReader) {
-        self.files.insert(file.egt().id(), file);
-    }
-
-    pub(crate) fn load(&mut self) -> EgtResult<()> {
-        self.files.par_iter_mut().try_for_each(|(_, file)| {
-            if file.frames.iter().any(Option::is_none) {
-                file.load_all()?;
-            }
-            Ok(())
-        })
+    pub(crate) fn insert(&mut self, file: TableFile, frames: Vec<Frame>) {
+        debug_assert_eq!(file.num_frames(), frames.len());
+        self.files.insert(file.egt().id(), (file, frames));
     }
 
     /// Retained palettes and indices; metadata, working arrays and temporary buffers are extra.
     pub(crate) fn resident_bytes(&self) -> u128 {
         self.files
             .values()
-            .flat_map(|file| file.frames.iter().flatten())
+            .flat_map(|(_, frames)| frames)
             .map(|frame| frame.bytes() as u128)
             .sum()
     }
 
-    pub(crate) fn file(&self, name: &TableId) -> EgtResult<&EgtFileReader> {
-        self.files.get(name).ok_or(EgtError::Internal(
-            "table absent from prepared dependencies",
-        ))
+    fn table(&self, id: &TableId) -> &(TableFile, Vec<Frame>) {
+        self.files
+            .get(id)
+            .expect("table absent from prepared dependencies")
+    }
+
+    pub(crate) fn egt(&self, id: &TableId) -> &Egt {
+        self.table(id).0.egt()
     }
 
     pub(crate) fn probe(&self, position: &Chess) -> EgtResult<PackedOutcome> {
@@ -81,23 +81,61 @@ impl BatchReader {
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {
-        let (name, reflected) = TableId::from_position(position)?;
-        let file = self.file(&name)?;
-        let index = file.map_routed_position_to_index(position, reflected)?;
-        let outcome = file
-            .read_from_index_cached(index)?
-            .ok_or(EgtError::Internal("cold frame in prepared dependencies"))?;
-        Ok((index, outcome))
+        let (id, reflected) = TableId::from_position(position)?;
+        let (file, frames) = self.table(&id);
+        let index = file.index(position, reflected)?;
+        let (frame, offset) = file.locate(index);
+        Ok((index, frames[frame].get(offset)))
     }
 
     pub(crate) fn read_chunk(
         &self,
-        name: &TableId,
+        id: &TableId,
         start: usize,
         end: usize,
     ) -> EgtResult<Vec<PackedOutcome>> {
-        self.file(name)?
-            .frame_chunk_cached(start, end)?
-            .ok_or(EgtError::Internal("cold frame in prepared dependencies"))
+        let (file, frames) = self.table(id);
+        let range = file.egt().index_range();
+        if start > end || end > range {
+            return Err(EgtError::IndexOutOfRange { index: end, range });
+        }
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let (frame, offset) = file.locate(start);
+        frames[frame].expand(offset..offset + (end - start))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egt_file::writer::write_fixture;
+    use crate::ConversionType;
+    use shakmaty::{CastlingMode, fen::Fen};
+
+    #[test]
+    fn explicit_table_replaces_loaded_overlay() {
+        let base = crate::TestDir::new("batch_output");
+        let input = crate::TestDir::new("batch_input");
+        let output = PackedOutcome::new_win(ConversionType::Checkmate, 3);
+        let file = write_fixture(&base.0, "KQ_K", |_| output);
+        write_fixture(&input.0, "KQ_K", |_| PackedOutcome::DRAW);
+        let id = file.egt().id();
+        let mut batch = BatchReader::open(
+            &Location::parse(&base.0).unwrap(),
+            Some(&Location::parse(&input.0).unwrap()),
+            &[id],
+        )
+        .unwrap();
+        let position = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        assert_eq!(batch.probe(&position).unwrap(), PackedOutcome::DRAW);
+        let frames = file.read_all().unwrap();
+        batch.insert(file, frames);
+        assert_eq!(batch.probe(&position).unwrap(), output);
     }
 }

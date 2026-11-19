@@ -84,9 +84,8 @@ impl EgtGenerator {
                     .collect();
                 dependencies.sort();
                 dependencies.dedup();
-                let mut reader =
+                let reader =
                     BatchReader::open(&self.base_path, self.input_path.as_ref(), &dependencies)?;
-                reader.load()?;
                 println!(
                     "{}: loaded {} bytes of dependencies.",
                     pair.table,

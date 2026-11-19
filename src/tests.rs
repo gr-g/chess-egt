@@ -1,4 +1,5 @@
 use super::*;
+use crate::egt_file::TableFile;
 use crate::storage::Location;
 use shakmaty::{Chess, Color, Position};
 use std::collections::BTreeSet;
@@ -67,7 +68,7 @@ fn test_verify_internal_consistency_kp_k() {
     assert_eq!(pawn_tables, names.iter().map(|name| name.as_str()).collect());
     assert_eq!(pawn_tables.len(), 8);
     for id in &expected {
-        let file = EgtFileReader::new_from_file(&dir.0, &id.name()).unwrap();
+        let file = TableFile::open(&Location::parse(&dir.0).unwrap(), id).unwrap();
         assert_eq!(file.egt().id(), *id);
     }
     let mut verifier = EgtVerifier::new(&dir.0).unwrap();

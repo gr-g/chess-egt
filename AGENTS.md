@@ -3,7 +3,7 @@
 - The goal of the project is to produce a chess endgame tablebase (EGT).
 - The project is currently functional with an implementation of the table
   indexing (`Egt` and `Indexer`), of the file input/output including
-  compression/decompression (`EgtFileReader`, `EgtFileWriter`,
+  compression/decompression (`TableFile`, `EgtFileWriter`, `BatchReader`
   `SharedFileCache`), and of multi-threaded generation of tables through
   retrograde analysis (`solve_pair`).
 - Tables for all 3-piece, 4-piece and 5-piece endgames were generated and
@@ -19,7 +19,7 @@
 
 See the design specifications in `README.md` for more information.
 
-Current tablebase generation results (with --noverify):
+Current tablebase generation results:
 ```
 == All 3 pieces, 2 threads ==
 Generated 16 tables: 367868 unique positions in 00h:00m:01s (4.84 μs/index on 2 threads).

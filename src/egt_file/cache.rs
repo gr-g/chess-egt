@@ -1,50 +1,72 @@
-//! Shared table readers and byte-bounded LRU frame caching.
-//!
-//! Registry replacement, removal, and clearing happen between joined worker
-//! phases. Accounting owns reader references until those entries are purged.
+//! Shared table metadata and byte-bounded LRU frame caching.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, RwLock};
 
 use shakmaty::Chess;
 
-use super::{EgtFileReader, load_existing_file};
+use super::{Frame, TableFile, load_existing_file};
 use crate::storage::Location;
 use crate::table_id::TableId;
-use crate::{DtcOutcome, EgtError, EgtResult, PackedOutcome};
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FrameKey {
-    file: usize,
-    frame: usize,
-}
-
-#[derive(Debug)]
-struct CachedFrame {
-    file: Arc<RwLock<EgtFileReader>>,
-    bytes: usize,
-    last_used: u64,
-}
+use crate::{DtcOutcome, EgtResult};
 
 #[derive(Debug, Default)]
-struct CacheMemory {
-    assigned: Option<usize>,
+struct Lru {
+    map: HashMap<(TableId, usize), (Arc<Frame>, u64)>,
     resident: usize,
+    assigned: Option<usize>,
     clock: u64,
-    frames: HashMap<FrameKey, CachedFrame>,
+}
+
+impl Lru {
+    fn get(&mut self, key: (TableId, usize)) -> Option<Arc<Frame>> {
+        let (frame, last_used) = self.map.get_mut(&key)?;
+        self.clock = self.clock.wrapping_add(1);
+        *last_used = self.clock;
+        Some(Arc::clone(frame))
+    }
+
+    fn insert(&mut self, key: (TableId, usize), frame: Frame) -> Arc<Frame> {
+        self.clock = self.clock.wrapping_add(1);
+        match self.map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let (frame, last_used) = entry.get_mut();
+                *last_used = self.clock;
+                Arc::clone(frame)
+            }
+            Entry::Vacant(entry) => {
+                self.resident += frame.bytes();
+                let frame = Arc::new(frame);
+                entry.insert((Arc::clone(&frame), self.clock));
+                frame
+            }
+        }
+    }
+
+    fn enforce_limit(&mut self) {
+        if self.assigned == Some(0) {
+            self.map.clear();
+            self.resident = 0;
+            return;
+        }
+        while self.assigned.is_some_and(|limit| self.resident > limit) {
+            let (&victim, _) = self.map.iter().min_by_key(|(_, (_, age))| age).unwrap();
+            let (frame, _) = self.map.remove(&victim).unwrap();
+            self.resident -= frame.bytes();
+        }
+    }
 }
 
 /// Shared files and their uncompressed frames for on-demand probing.
 ///
-/// The assigned memory bounds retained frames between operations. Concurrent
-/// cold loads, copied chunks, metadata, and decompression buffers are excluded.
+/// The assigned memory bounds retained frames. In-flight probes may hold extra
+/// frames and decompression buffers; metadata is also excluded.
 #[derive(Debug)]
 pub(crate) struct SharedFileCache {
-    files: RwLock<HashMap<TableId, Arc<RwLock<EgtFileReader>>>>,
+    files: RwLock<HashMap<TableId, Arc<TableFile>>>,
     base_path: Location,
     input_path: Option<Location>,
-    cache: Mutex<CacheMemory>,
+    frames: Mutex<Lru>,
 }
 
 impl SharedFileCache {
@@ -57,339 +79,104 @@ impl SharedFileCache {
             files: RwLock::new(HashMap::new()),
             base_path: base_path.clone(),
             input_path: input_path.cloned(),
-            cache: Mutex::new(CacheMemory {
+            frames: Mutex::new(Lru {
                 assigned: cache_size,
-                ..CacheMemory::default()
+                ..Lru::default()
             }),
         }
     }
 
-    pub(crate) fn set_cache_size(&self, assigned: usize) -> EgtResult<()> {
-        self.cache
-            .lock()
-            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?
-            .assigned = Some(assigned);
-        self.enforce_limit()
+    pub(crate) fn set_cache_size(&self, assigned: usize) {
+        let mut lru = self.frames.lock().unwrap();
+        lru.assigned = Some(assigned);
+        lru.enforce_limit();
     }
 
-    pub(crate) fn set_input_path(&mut self, input: Option<Location>) -> EgtResult<()> {
-        self.clear()?;
+    pub(crate) fn set_input_path(&mut self, input: Option<Location>) {
+        self.clear();
         self.input_path = input;
-        Ok(())
     }
 
-    fn file(&self, endgame: &TableId) -> EgtResult<Arc<RwLock<EgtFileReader>>> {
-        let cached_file = {
-            let files = self
-                .files
-                .read()
-                .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-            files.get(endgame).map(Arc::clone)
-        };
-        let file = if let Some(file) = cached_file {
-            file
-        } else {
-            let mut files = self
-                .files
-                .write()
-                .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-            // Recheck after releasing the read lock: another worker may have loaded it.
-            if !files.contains_key(endgame) {
-                // Serialize loading so racing workers never allocate duplicate files.
-                let file = load_existing_file(&self.base_path, self.input_path.as_ref(), endgame)?;
-                files.insert(*endgame, Arc::new(RwLock::new(file)));
+    fn file(&self, id: &TableId) -> EgtResult<Arc<TableFile>> {
+        if let Some(file) = self.files.read().unwrap().get(id) {
+            return Ok(Arc::clone(file));
+        }
+        let file = Arc::new(load_existing_file(&self.base_path, self.input_path.as_ref(), id)?);
+        Ok(Arc::clone(self.files.write().unwrap().entry(*id).or_insert(file)))
+    }
+
+    fn read_frames(
+        &self,
+        id: TableId,
+        file: &TableFile,
+        frames: &[usize],
+    ) -> EgtResult<HashMap<usize, Arc<Frame>>> {
+        let mut ready = HashMap::with_capacity(frames.len());
+        let mut missing = Vec::new();
+        {
+            let mut lru = self.frames.lock().unwrap();
+            for &frame in frames {
+                if let Some(data) = lru.get((id, frame)) {
+                    ready.insert(frame, data);
+                } else {
+                    missing.push(frame);
+                }
             }
-            Arc::clone(files.get(endgame).ok_or(EgtError::Internal(
-                "dependency registry entry missing after insert",
-            ))?)
-        };
-        Ok(file)
+        }
+        if !missing.is_empty() {
+            let decoded = file.read_frames(&missing)?;
+            let mut lru = self.frames.lock().unwrap();
+            for (frame, data) in missing.into_iter().zip(decoded) {
+                ready.insert(frame, lru.insert((id, frame), data));
+            }
+            lru.enforce_limit();
+        }
+        Ok(ready)
     }
 
-    #[cfg(test)]
-    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<PackedOutcome> {
-        self.probe_indexed(position).map(|(_, outcome)| outcome)
+    pub(crate) fn probe(&self, position: &Chess) -> EgtResult<DtcOutcome> {
+        Ok(self.probe_outcomes(std::slice::from_ref(position))?[0])
     }
 
-    #[cfg(test)]
-    pub(crate) fn probe_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
-        let (index, outcome) = self.probe_indexed(position)?;
-        outcome.to_outcome_at(index)
-    }
-
-    /// Probes a primary table without wrapping a missing file as a dependency error.
-    pub(crate) fn probe_direct_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
-        let (name, reflected) = TableId::from_position(position)?;
-        let (index, outcome) = self.probe_routed(position, &name, reflected)?;
-        outcome.to_outcome_at(index)
-    }
-
-    /// Groups direct probes by canonical table, preserving the input order.
-    pub(crate) fn probe_direct_outcomes(&self, positions: &[Chess]) -> EgtResult<Vec<DtcOutcome>> {
+    /// Groups probes by canonical table, preserving the input order of outcomes.
+    pub(crate) fn probe_outcomes(&self, positions: &[Chess]) -> EgtResult<Vec<DtcOutcome>> {
         let mut groups = HashMap::<TableId, Vec<(usize, bool)>>::new();
         for (slot, position) in positions.iter().enumerate() {
-            let (name, reflected) = TableId::from_position(position)?;
-            groups.entry(name).or_default().push((slot, reflected));
+            let (id, reflected) = TableId::from_position(position)?;
+            groups.entry(id).or_default().push((slot, reflected));
         }
         let mut outcomes = vec![DtcOutcome::Draw; positions.len()];
         let mut groups: Vec<_> = groups.into_iter().collect();
         groups.sort_by_cached_key(|(id, _)| id.name());
-        for (name, requests) in groups {
-            let file = self.file(&name)?;
-            let reader = file
-                .read()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
+        for (id, requests) in groups {
+            let file = self.file(&id)?;
             let indices = requests
                 .iter()
-                .map(|&(slot, reflected)| {
-                    reader.map_routed_position_to_index(&positions[slot], reflected)
-                })
+                .map(|&(slot, reflected)| file.index(&positions[slot], reflected))
                 .collect::<EgtResult<Vec<_>>>()?;
-            let mut frames: Vec<_> = indices
-                .iter()
-                .map(|&index| reader.locate_frame(index).0)
-                .collect();
+            let mut frames: Vec<_> = indices.iter().map(|&index| file.locate(index).0).collect();
             frames.sort_unstable();
             frames.dedup();
-            let values = if let Some(values) = reader.read_indices_cached(&indices)? {
-                for &frame in &frames {
-                    self.record_access(&file, frame, reader.frame_bytes(frame))?;
-                }
-                drop(reader);
-                Ok(values)
-            } else {
-                drop(reader);
-                let mut writer = file
-                    .write()
-                    .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-                // Recheck residency under the write guard: another probe may have warmed it.
-                let result = writer.ensure_uncompressed_frames(&frames).and_then(|()| {
-                    writer
-                        .read_indices_cached(&indices)?
-                        .ok_or(EgtError::Internal(
-                            "expected resident frames after batch read",
-                        ))
-                });
-                // A later decode can fail after earlier frames were installed.
-                for &frame in &frames {
-                    if writer.frames[frame].is_some() {
-                        self.record_access(&file, frame, writer.frame_bytes(frame))?;
-                    }
-                }
-                drop(writer);
-                result
-            };
-            // Copy outcomes before eviction, including when the cache budget is zero.
-            self.enforce_limit()?;
-            for ((&(slot, _), index), value) in requests.iter().zip(indices).zip(values?) {
-                outcomes[slot] = value.to_outcome_at(index)?;
+            let ready = self.read_frames(id, &file, &frames)?;
+            for ((slot, _), index) in requests.into_iter().zip(indices) {
+                let (frame, offset) = file.locate(index);
+                outcomes[slot] = ready[&frame].get(offset).to_outcome_at(index)?;
             }
         }
         Ok(outcomes)
     }
 
-    #[cfg(test)]
-    fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {
-        let (name, reflected) = TableId::from_position(position)?;
-        self.probe_routed(position, &name, reflected)
-            .map_err(|source| match source {
-                EgtError::FileNotFound(_) => EgtError::DependencyUnavailable {
-                    dependency: name.to_string(),
-                    source: Box::new(source),
-                },
-                other => other,
-            })
-    }
-
-    fn probe_routed(
-        &self,
-        position: &Chess,
-        endgame: &TableId,
-        reflected: bool,
-    ) -> EgtResult<(usize, PackedOutcome)> {
-        let file = self.file(endgame)?;
-        let reader = file
-            .read()
-            .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-        let index = reader.map_routed_position_to_index(position, reflected)?;
-        let frame = reader.locate_frame(index).0;
-        let (outcome, over_limit) = if let Some(outcome) = reader.read_from_index_cached(index)? {
-            let over_limit = self.record_access(&file, frame, reader.frame_bytes(frame))?;
-            drop(reader);
-            (outcome, over_limit)
-        } else {
-            drop(reader);
-            // Metadata is immutable: retain the index while upgrading to a write
-            // guard. read_from_index rechecks whether another worker warmed it.
-            let mut writer = file
-                .write()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            let outcome = writer.read_from_index(index)?;
-            (outcome, self.record_access(&file, frame, writer.frame_bytes(frame))?)
-        };
-        if over_limit {
-            self.enforce_limit()?;
-        }
-        Ok((index, outcome))
-    }
-
-
-    fn record_access(
-        &self,
-        file: &Arc<RwLock<EgtFileReader>>,
-        frame: usize,
-        bytes: usize,
-    ) -> EgtResult<bool> {
-        // Arc addresses are stable while registered. insert/remove/clear purge
-        // their entries, so no table-name allocation is needed on a warm probe.
-        let key = FrameKey {
-            file: Arc::as_ptr(file) as usize,
-            frame,
-        };
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-        cache.clock = cache.clock.wrapping_add(1);
-        let last_used = cache.clock;
-        let new_resident = cache
-            .resident
-            .checked_add(bytes)
-            .ok_or(EgtError::Internal("cache memory accounting overflow"))?;
-        if let Some(frame) = cache.frames.get_mut(&key) {
-            frame.last_used = last_used;
-        } else {
-            cache.resident = new_resident;
-            cache.frames.insert(
-                key,
-                CachedFrame {
-                    file: Arc::clone(file),
-                    bytes,
-                    last_used,
-                },
-            );
-        }
-        Ok(cache.assigned.is_some_and(|limit| cache.resident > limit))
-    }
-
-    fn enforce_limit(&self) -> EgtResult<()> {
-        loop {
-            let victim = {
-                let cache = self
-                    .cache
-                    .lock()
-                    .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-                if cache.assigned.is_none_or(|limit| cache.resident <= limit) {
-                    return Ok(());
-                }
-                cache
-                    .frames
-                    .iter()
-                    .min_by_key(|(_, frame)| frame.last_used)
-                    .map(|(key, frame)| (*key, frame.last_used, frame.file.clone()))
-            };
-            let Some((key, last_used, file)) = victim else {
-                return Err(EgtError::Internal(
-                    "cache accounting has no evictable frame",
-                ));
-            };
-            // Never wait for a file while holding the memory lock. Once the
-            // write guard is held, revalidate that no newer access touched it.
-            let mut file = file
-                .write()
-                .map_err(|_| EgtError::Internal("dependency file lock poisoned"))?;
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-            if cache.frames.get(&key).map(|frame| frame.last_used) != Some(last_used) {
-                continue;
-            }
-            if file.frames[key.frame].is_none() {
-                return Err(EgtError::Internal("cached frame is not resident"));
-            }
-            file.frames[key.frame] = None;
-            let frame = cache
-                .frames
-                .remove(&key)
-                .ok_or(EgtError::Internal("cache frame missing during eviction"))?;
-            cache.resident -= frame.bytes;
-        }
-    }
-
-    #[cfg(test)]
-    fn forget_file(&self, file: &Arc<RwLock<EgtFileReader>>) -> EgtResult<()> {
-        let file_id = Arc::as_ptr(file) as usize;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-        let mut released = 0;
-        cache.frames.retain(|key, frame| {
-            if key.file == file_id {
-                released += frame.bytes;
-                false
-            } else {
-                true
-            }
-        });
-        cache.resident -= released;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn insert(&self, file: EgtFileReader) -> EgtResult<()> {
-        let old = self
-            .files
-            .write()
-            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
-            .insert(file.egt.id(), Arc::new(RwLock::new(file)));
-        if let Some(old) = old {
-            self.forget_file(&old)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn remove(&self, ids: &[TableId]) -> EgtResult<()> {
-        let mut files = self
-            .files
-            .write()
-            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?;
-        for id in ids {
-            if let Some(file) = files.remove(id) {
-                self.forget_file(&file)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Releases cached tables; call only when no probes are running.
-    pub(crate) fn clear(&self) -> EgtResult<()> {
-        self.files
-            .write()
-            .map_err(|_| EgtError::Internal("dependency registry lock poisoned"))?
-            .clear();
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| EgtError::Internal("cache memory lock poisoned"))?;
-        cache.frames.clear();
-        cache.resident = 0;
-        Ok(())
-    }
-
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.files.read().unwrap().is_empty()
+    pub(crate) fn clear(&mut self) {
+        self.files.get_mut().unwrap().clear();
+        let lru = self.frames.get_mut().unwrap();
+        *lru = Lru { assigned: lru.assigned, ..Lru::default() };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConversionType, TableId};
+    use crate::{ConversionType, EgtError, PackedOutcome};
     use crate::egt_file::writer::write_fixture;
     use shakmaty::{CastlingMode, fen::Fen};
 
@@ -421,25 +208,15 @@ mod tests {
                 scope.spawn(move || {
                     barrier.wait();
                     for _ in 0..20 {
-                        assert_eq!(reader.probe(position).unwrap(), outcome);
+                        assert_eq!(reader.probe(position).unwrap(), DtcOutcome::Win(ConversionType::Promotion, 7));
                     }
                 });
             }
         });
-        // A warm probe needs only shared guards for both registry and file.
-        let registry_guard = reader.files.read().unwrap();
-        let file = Arc::clone(
-            registry_guard
-                .get(&TableId::parse("KPa_K").unwrap())
-                .unwrap(),
-        );
-        let guard = file.read().unwrap();
-        assert_eq!(reader.probe(&position).unwrap(), outcome);
-        assert_eq!(guard.probe_cached(&position).unwrap(), Some(outcome));
-        assert_eq!(
-            guard.frames.iter().filter(|frame| frame.is_some()).count(),
-            1
-        );
+        let id = TableId::parse("KPa_K").unwrap();
+        std::fs::remove_file(input.0.join(id.relative_path("ggegt"))).unwrap();
+        assert_eq!(reader.probe(&position).unwrap(), DtcOutcome::Win(ConversionType::Promotion, 7));
+        assert_eq!(reader.frames.lock().unwrap().map.len(), 1);
     }
 
     #[test]
@@ -452,10 +229,9 @@ mod tests {
         ];
         let mut frame_bytes = None;
         for (name, _) in positions {
-            let mut file = write_fixture(&dir.0, name, |_| PackedOutcome::DRAW);
+            let file = write_fixture(&dir.0, name, |_| PackedOutcome::DRAW);
             assert_eq!(file.num_frames(), 1);
-            file.read_from_index(0).unwrap();
-            let bytes = file.frame_bytes(0);
+            let bytes = file.read_frames(&[0]).unwrap()[0].bytes();
             assert_eq!(bytes, 4);
             assert_eq!(frame_bytes.get_or_insert(bytes), &bytes);
         }
@@ -475,9 +251,8 @@ mod tests {
             )
         });
         let resident = |name| {
-            let file = cache.file(&TableId::parse(name).unwrap()).unwrap();
-            let file = file.read().unwrap();
-            file.frames[0].is_some()
+            let id = TableId::parse(name).unwrap();
+            cache.frames.lock().unwrap().map.contains_key(&(id, 0))
         };
 
         cache.probe(&positions[0].1).unwrap();
@@ -487,7 +262,7 @@ mod tests {
         assert!(resident("KQ_K"));
         assert!(!resident("KR_K"));
         assert!(resident("KB_K"));
-        assert_eq!(cache.cache.lock().unwrap().resident, 2 * frame_bytes);
+        assert_eq!(cache.frames.lock().unwrap().resident, 2 * frame_bytes);
 
         cache.probe(&positions[1].1).unwrap();
         assert!(!resident("KQ_K"));
@@ -501,80 +276,48 @@ mod tests {
                 scope.spawn(move || {
                     for _ in 0..20 {
                         for (_, position) in positions {
-                            assert_eq!(cache.probe(position).unwrap(), PackedOutcome::DRAW);
+                            assert_eq!(cache.probe(position).unwrap(), DtcOutcome::Draw);
                         }
                     }
                 });
             }
         });
-        assert!(cache.cache.lock().unwrap().resident <= 2 * frame_bytes);
+        assert!(cache.frames.lock().unwrap().resident <= 2 * frame_bytes);
 
-        cache.set_cache_size(0).unwrap();
-        assert_eq!(cache.cache.lock().unwrap().resident, 0);
+        cache.set_cache_size(0);
+        assert_eq!(cache.frames.lock().unwrap().resident, 0);
         assert!(positions.iter().all(|(name, _)| !resident(name)));
-        assert_eq!(cache.probe(&positions[0].1).unwrap(), PackedOutcome::DRAW);
+        assert_eq!(cache.probe(&positions[0].1).unwrap(), DtcOutcome::Draw);
         assert!(!resident("KQ_K"));
-        assert_eq!(cache.cache.lock().unwrap().resident, 0);
+        assert_eq!(cache.frames.lock().unwrap().resident, 0);
     }
 
     #[test]
-    fn shared_dependency_insert_remove_and_clear_preserve_cache_precedence() {
+    fn shared_cache_clear_and_input_change_preserve_lookup_precedence() {
         let base = crate::TestDir::new("shared_dependency_lifecycle_base");
         let input = crate::TestDir::new("shared_dependency_lifecycle_input");
-        let pawn: Chess = "8/8/8/8/8/8/P7/K6k w - - 0 1"
-            .parse::<Fen>()
-            .unwrap()
-            .into_position(CastlingMode::Standard)
-            .unwrap();
         let queen: Chess = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
             .parse::<Fen>()
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let dependency_value = PackedOutcome::new_win(ConversionType::Promotion, 7);
-        let output_value = PackedOutcome::new_win(ConversionType::Checkmate, 3);
-        for (path, name, value) in [
-            (&input.0, "KPa_K", dependency_value),
-            (&input.0, "KQ_K", PackedOutcome::DRAW),
-            (&base.0, "KQ_K", output_value),
-        ] {
-            write_fixture(path, name, |_| value);
-        }
-        let reader = SharedFileCache::new(
-            &Location::parse(&base.0).unwrap(),
-            Some(&Location::parse(&input.0).unwrap()),
-            None,
-        );
-        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
-        let dependency =
-            Arc::downgrade(&reader.files.read().unwrap()[&TableId::parse("KPa_K").unwrap()]);
-        let old_output =
-            Arc::downgrade(&reader.files.read().unwrap()[&TableId::parse("KQ_K").unwrap()]);
+        let output = DtcOutcome::Win(ConversionType::Checkmate, 3);
+        write_fixture(&base.0, "KQ_K", |_| PackedOutcome::new_win(ConversionType::Checkmate, 3));
+        write_fixture(&input.0, "KQ_K", |_| PackedOutcome::DRAW);
+        let base = Location::parse(&base.0).unwrap();
+        let input = Location::parse(&input.0).unwrap();
+        let mut reader = SharedFileCache::new(&base, Some(&input), None);
+        assert_eq!(reader.probe(&queen).unwrap(), DtcOutcome::Draw);
 
-        reader
-            .insert(EgtFileReader::new_from_file(&base.0, "KQ_K").unwrap())
-            .unwrap();
-        assert!(old_output.upgrade().is_none());
-        assert_eq!(reader.probe(&queen).unwrap(), output_value);
-        let pinned_output =
-            Arc::downgrade(&reader.files.read().unwrap()[&TableId::parse("KQ_K").unwrap()]);
-        reader.remove(&[TableId::parse("KQ_K").unwrap()]).unwrap();
-        assert!(pinned_output.upgrade().is_none());
-        assert!(dependency.upgrade().is_some());
-        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
-        assert_eq!(reader.probe_outcome(&queen).unwrap(), DtcOutcome::Draw);
-
-        reader.clear().unwrap();
-        assert_eq!(reader.cache.lock().unwrap().resident, 0);
-        assert!(dependency.upgrade().is_none());
+        reader.clear();
+        assert_eq!(reader.frames.lock().unwrap().resident, 0);
         assert!(reader.files.read().unwrap().is_empty());
-        assert_eq!(reader.probe(&pawn).unwrap(), dependency_value);
-        assert_eq!(reader.probe(&queen).unwrap(), PackedOutcome::DRAW);
-        let file = Arc::downgrade(&reader.files.read().unwrap()[&TableId::parse("KPa_K").unwrap()]);
-        drop(reader);
-        assert!(file.upgrade().is_none());
+        assert_eq!(reader.probe(&queen).unwrap(), DtcOutcome::Draw);
+
+        reader.set_input_path(None);
+        assert_eq!(reader.probe(&queen).unwrap(), output);
+        reader.set_input_path(Some(input));
+        assert_eq!(reader.probe(&queen).unwrap(), DtcOutcome::Draw);
     }
 
     #[test]
@@ -586,16 +329,12 @@ mod tests {
             .into_position(CastlingMode::Standard)
             .unwrap();
         let reader = SharedFileCache::new(&Location::parse(&dir.0).unwrap(), None, None);
-        assert!(
-            matches!(reader.probe(&position), Err(EgtError::DependencyUnavailable {
-            dependency, source,
-        }) if dependency == "KPa_K" && matches!(*source, EgtError::FileNotFound(_)))
-        );
+        assert!(matches!(reader.probe(&position), Err(EgtError::FileNotFound(_))));
         assert!(
             !dir.0
                 .join(TableId::parse("KPa_K").unwrap().relative_path("ggegt"))
                 .exists()
         );
-        assert!(reader.is_empty());
+        assert!(reader.files.read().unwrap().is_empty());
     }
 }

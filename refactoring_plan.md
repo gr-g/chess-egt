@@ -108,7 +108,7 @@ keyed by `TableId`, and probe routing (`position_table_name`) allocates nothing.
 
 ---
 
-## 2. Split `EgtFileReader` into file I/O and a frame store
+## 2. Split `EgtFileReader` into file I/O and a frame store (done)
 
 **Problem.** `src/egt_file.rs::EgtFileReader` mixes three jobs:
 - storage I/O (seek table, range reads);

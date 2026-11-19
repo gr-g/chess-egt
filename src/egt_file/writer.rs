@@ -157,7 +157,7 @@ pub(crate) fn write_fixture(
     base: &std::path::Path,
     name: &str,
     outcome: impl Fn(usize) -> PackedOutcome,
-) -> crate::egt_file::EgtFileReader {
+) -> crate::egt_file::TableFile {
     let location = Location::parse(base).unwrap();
     let id = TableId::parse(name).unwrap();
     let egt = crate::Egt::new(&id).unwrap();
@@ -181,13 +181,13 @@ pub(crate) fn write_fixture(
     encoder.finish().unwrap();
     let key = location.key(&id.relative_path("ggegt"));
     publish_buffers(&location, &key, [data.into()]).unwrap();
-    crate::egt_file::EgtFileReader::open_in(&location, &id).unwrap()
+    crate::egt_file::TableFile::open(&location, &id).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egt_file::EgtFileReader;
+    use crate::egt_file::TableFile;
     use object_store::ObjectStoreExt;
     use std::{fs, path::Path};
 
@@ -326,17 +326,23 @@ mod tests {
         assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
         assert_eq!(fs::read(&destination).unwrap(), expected);
 
-        let mut reader = EgtFileReader::new_from_file(&dir.0, "KQ_KR").unwrap();
+        let reader = TableFile::open(
+            &Location::parse(&dir.0).unwrap(),
+            &TableId::parse("KQ_KR").unwrap(),
+        )
+        .unwrap();
+        let frames = reader.read_all().unwrap();
         for index in [0, frame_size - 1, frame_size, length - 1] {
-            assert_eq!(reader.read_from_index(index).unwrap(), values[index]);
-            let frame = index / frame_size;
+            let (frame, offset) = reader.locate(index);
+            assert_eq!(frames[frame].get(offset), values[index]);
             assert_eq!(
-                reader.frame_bytes(frame),
+                frames[frame].bytes(),
                 2 + 2 * 257 + 2 * reader.frame_len(frame)
             );
         }
+        let (tail, offset) = reader.locate(length - 3);
         assert_eq!(
-            reader.frame_chunk(length - 3, length).unwrap(),
+            frames[tail].expand(offset..offset + 3).unwrap(),
             values[length - 3..]
         );
     }
