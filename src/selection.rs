@@ -138,7 +138,7 @@ enum Target {
 /// A validated selector. Resolving enumerates theoretical identities, not files
 /// present in storage, and never constructs full Egt indexing plans.
 #[derive(Clone, Debug)]
-pub struct TableSelector {
+pub(crate) struct TableSelector {
     source: String,
     target: Target,
 }
@@ -305,27 +305,16 @@ pub(crate) fn hierarchy_prefixes(selectors: &[&str]) -> EgtResult<Option<Vec<Str
 
 /// Exact quiet-move twins and their directional horizontal reflections.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TablePair {
+pub(crate) struct TablePair {
     pub(crate) table: TableId,
     pub(crate) twin: Option<TableId>,
     /// Table-to-twin and twin-to-table, including reflected self-twins.
     pub(crate) reflected: [bool; 2],
 }
 
-impl TablePair {
-    pub fn table(&self) -> &TableId {
-        &self.table
-    }
-
-    /// Absent for a self-twin, which uses a single working array.
-    pub fn twin(&self) -> Option<&TableId> {
-        self.twin.as_ref()
-    }
-}
-
 /// Quiet-move pairs only; capture/promotion prerequisites are not auto-generated.
 #[derive(Clone, Debug)]
-pub struct GenerationPlan {
+pub(crate) struct GenerationPlan {
     /// Smaller `TableId` first; self-twins have no second table.
     /// Pairs use selection order: total pieces, then pawns, then representative
     /// name in KQRBNP order.
@@ -656,8 +645,8 @@ mod tests {
         assert_eq!(plan.pairs.len(), 6);
         assert!(plan.pairs.windows(2).all(|w| w[0].table < w[1].table));
         for pair in &plan.pairs {
-            let first = pair.table();
-            match pair.twin() {
+            let first = &pair.table;
+            match pair.twin.as_ref() {
                 Some(second) => {
                     assert!(first < second);
                     assert_eq!(first.twin().0, *second);
@@ -676,7 +665,7 @@ mod tests {
         assert_eq!(only_pawn.pairs.len(), 1);
         assert!(only_pawn.pairs.iter().all(|pair| pair.table.n_pawns() == 1));
         let self_twin = GenerationPlan::new(resolve("KPd_KPe"));
-        assert_eq!(self_twin.pairs[0].twin(), None);
+        assert_eq!(self_twin.pairs[0].twin, None);
         assert!(GenerationPlan::new(Vec::<TableId>::new()).pairs.is_empty());
         // Plans are invariant under input order, duplicates, and selecting a twin.
         let a = GenerationPlan::new(resolve("KPa_K"));

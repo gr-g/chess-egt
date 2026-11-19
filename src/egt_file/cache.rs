@@ -171,7 +171,8 @@ impl SharedFileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConversionType, EgtError, PackedOutcome};
+    use crate::outcome::PackedOutcome;
+    use crate::{ConversionType, EgtError};
     use crate::egt_file::writer::write_fixture;
     use shakmaty::{CastlingMode, fen::Fen};
 

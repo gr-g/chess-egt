@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::frame;
-use crate::PackedOutcome;
+use crate::outcome::PackedOutcome;
 use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;

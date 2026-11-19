@@ -1,6 +1,7 @@
 use std::{cmp::Reverse, io, ops::Range};
 
-use crate::{EgtError, EgtResult, PackedOutcome};
+use crate::outcome::PackedOutcome;
+use crate::{EgtError, EgtResult};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Frame {

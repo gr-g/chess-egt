@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
-use crate::PackedOutcome;
+use crate::outcome::PackedOutcome;
 use crate::egt::Egt;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};

@@ -1,10 +1,17 @@
 use std::path::Path;
 
-use shakmaty::{Chess, Position};
+use shakmaty::{Chess, Move, Position};
 
 use crate::egt_file::{SharedFileCache, Source};
 use crate::storage::Location;
-use crate::{DtcOutcome, EgtError, EgtResult, ProbeWithMoves};
+use crate::{DtcOutcome, EgtError, EgtResult};
+
+/// A position's outcome and its legal moves with successor-side-to-move outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeWithMoves {
+    pub outcome: DtcOutcome,
+    pub moves: Vec<(Move, DtcOutcome)>,
+}
 
 /// Generates, verifies, and probes endgame tables and queries their statistics.
 pub struct Tablebase {

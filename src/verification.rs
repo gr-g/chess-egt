@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn verification_rejects_invalid_outcomes_and_recovers() {
-        use crate::PackedOutcome;
+        use crate::outcome::PackedOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
         let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();

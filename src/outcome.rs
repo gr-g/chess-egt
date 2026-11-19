@@ -71,7 +71,7 @@ impl PartialOrd for DtcOutcome {
 /// or a nonzero remaining-move counter for unknown entries. Zero is invalid.
 /// Raw constructors do not validate the encoding; packed ordering is not DTC ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PackedOutcome(u16);
+pub(crate) struct PackedOutcome(u16);
 
 impl PackedOutcome {
     pub const INVALID: Self = Self(0b000);

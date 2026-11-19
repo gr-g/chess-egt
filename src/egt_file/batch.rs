@@ -5,7 +5,8 @@ use shakmaty::Chess;
 
 use super::{Frame, Source, TableFile};
 use crate::table_id::TableId;
-use crate::{DtcOutcome, Egt, EgtError, EgtResult, PackedOutcome};
+use crate::outcome::PackedOutcome;
+use crate::{DtcOutcome, Egt, EgtError, EgtResult};
 
 /// Job-scoped tables loaded before workers borrow them immutably.
 /// All enumerated dependencies must exist and their decompressed data must fit

@@ -137,7 +137,7 @@ mod tests {
     fn kpkp_invalid_counts() {
         let mut invalid = InvalidCounts::default();
         let mut valid = 0;
-        for id in crate::TableSelector::parse("KP_KP").unwrap().resolve().unwrap() {
+        for id in crate::selection::TableSelector::parse("KP_KP").unwrap().resolve().unwrap() {
             let egt = crate::egt::Egt::new(&id).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {

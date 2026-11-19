@@ -273,7 +273,8 @@ pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
 mod tests {
     use super::*;
     use crate::egt_file::writer::write_fixture;
-    use crate::{ConversionType, PackedOutcome};
+    use crate::outcome::PackedOutcome;
+    use crate::ConversionType;
     use shakmaty::Color;
     use shakmaty::fen::Fen;
     use std::path::Path;

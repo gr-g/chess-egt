@@ -70,7 +70,7 @@
 use shakmaty::{attacks, Bitboard, Color, Chess, EnPassantMode, Move, Position, Role};
 
 use crate::ConversionType;
-use crate::PackedOutcome;
+use crate::outcome::PackedOutcome;
 use crate::stats::EgtStats;
 use crate::selection::TablePair;
 use crate::error::{EgtError, EgtResult};
@@ -393,7 +393,7 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
 
 /// Emits predecessors of an index already validated for this table and White.
 /// Propagation only passes resolved entries, which initialization validated.
-pub fn quiet_unmoves<F>(
+fn quiet_unmoves<F>(
     table: &Egt,
     twin: &Egt,
     local_index: usize,

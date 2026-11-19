@@ -1,5 +1,5 @@
 //! Chess endgame generation, probing, verification, and statistics through a
-//! synchronous API.
+//! synchronous API. Use [`Egt`] for low-level position indexing.
 //!
 //! [`Tablebase`] handles generation, position lookups, consistency checks,
 //! and statistics. [`Tablebase::new`] and [`Tablebase::set_input_path`] resolve
@@ -40,7 +40,7 @@
 
 mod egt;
 mod egt_file;
-pub mod error;
+mod error;
 mod generator;
 mod outcome;
 mod position;
@@ -53,22 +53,13 @@ mod verification;
 
 pub use egt::Egt;
 pub use error::{EgtError, EgtResult};
-pub use generator::{print_pair_stats, print_table_stats};
-pub use outcome::{ConversionType, DtcOutcome, PackedOutcome};
-pub use selection::{GenerationPlan, TablePair, TableSelector, resolve_selectors};
-use shakmaty::Move;
+pub use outcome::{ConversionType, DtcOutcome};
+pub use selection::resolve_selectors;
 pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
 #[cfg(test)]
 use std::path::PathBuf;
 pub use table_id::TableId;
-pub use tablebase::Tablebase;
-
-/// A position's outcome and its legal moves with successor-side-to-move outcomes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProbeWithMoves {
-    pub outcome: DtcOutcome,
-    pub moves: Vec<(Move, DtcOutcome)>,
-}
+pub use tablebase::{ProbeWithMoves, Tablebase};
 
 /// A fresh, test-specific directory under the system temp dir. Tests running in
 /// parallel must not share output directories: they would overwrite (or read

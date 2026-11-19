@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use self::stats::TableStats;
-use crate::PackedOutcome;
+use crate::outcome::PackedOutcome;
 use crate::egt::Egt;
 use crate::egt_file::writer::{COMPRESSION_LEVEL, CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};

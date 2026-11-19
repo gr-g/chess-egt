@@ -2,8 +2,9 @@ mod finalization;
 mod solver;
 
 use crate::egt_file::BatchReader;
+use crate::selection::GenerationPlan;
 use crate::stats::format_timing;
-use crate::{AggregateStats, EgtResult, EgtStats, GenerationPlan, Tablebase, resolve_selectors};
+use crate::{AggregateStats, EgtResult, EgtStats, Tablebase, resolve_selectors};
 
 impl Tablebase {
     /// Generates twin-pair jobs in the base location, ordered by pieces then pawns.
@@ -137,7 +138,7 @@ mod tests {
 }
 
 /// Prints table-specific statistics (wins, draws, losses, compression).
-pub fn print_table_stats(stats: &EgtStats) {
+fn print_table_stats(stats: &EgtStats) {
     let unique_positions = stats.unique_positions;
     let compressed_size_mb = stats.bytes as f64 / (1024.0 * 1024.0);
     let bits_per_pos = if unique_positions > 0 {
@@ -155,25 +156,5 @@ pub fn print_table_stats(stats: &EgtStats) {
         stats.loss,
         compressed_size_mb,
         bits_per_pos
-    );
-}
-
-/// Prints detailed statistics about a pair of generated files (or a single file if symmetric).
-pub fn print_pair_stats(
-    stats_a: &EgtStats,
-    stats_b: Option<&EgtStats>,
-    duration: std::time::Duration,
-) {
-    let mut index_range = stats_a.index_range;
-    print_table_stats(stats_a);
-
-    if let Some(sb) = stats_b {
-        index_range += sb.index_range;
-        print_table_stats(sb);
-    }
-
-    println!(
-        "Time used {}.",
-        format_timing(duration, index_range, rayon::current_num_threads())
     );
 }

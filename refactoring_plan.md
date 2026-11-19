@@ -215,40 +215,36 @@ base only if missing" lives in the free function
 
 ---
 
-## 4. Shrink and clean up the public API (`src/lib.rs`)
+## 4. Shrink and clean up the public API (`src/lib.rs`) (done)
+
+Point 3 introduced `Tablebase`, consolidated generation and verification into
+one slice-based entry point each, and documented the blocking API. The
+remaining work is to narrow the exports around that API.
 
 **Implementation.**
-1. Remove the unused `print_pair_stats` (`generator.rs`).
-2. Stop exporting internals: `PackedOutcome`, `EgtFileReader`,
-   `GenerationPlan`, `TablePair`, `TableSelector`, and `print_table_stats`
-   (keep it crate-internal). Make `pub mod error` private and keep
-   `pub use error::{EgtError, EgtResult}`. Make `solver::quiet_unmoves`
-   `pub(super)` or `pub(crate)`.
-3. The public surface becomes: `EgtGenerator`, `EgtVerifier`, `EgtProber`,
-   `EgtStatistics`, `ProbeWithMoves`, `TableId`, `Egt` (decide whether it
-   needs to be public; the binaries don't use it), `DtcOutcome`,
-   `ConversionType`, `EgtStats`, `AggregateStats`, `LongestDtcPosition`,
-   `EgtError`, `EgtResult`, `resolve_selectors`.
-4. Move `ProbeWithMoves` from `lib.rs` into `prober.rs` (re-export it).
-5. Merge the single/multi duplicates: keep
-   `generate(&self, selectors: &[&str])` and
-   `verify(&self, selectors: &[&str])`, deleting `generate_selected` and
-   `verify_internal_consistency` / `verify_selected` (rename one of each).
-   Optionally accept `impl IntoIterator<Item = impl AsRef<str>>` so that
-   `src/bin/main.rs` can pass `&cli.generate` directly and drop the five
-   `.iter().map(String::as_str).collect()` calls. Update the call sites in
-   `tests.rs` and the module tests.
-6. Update the crate docs in `lib.rs`:
-   - Remove "Generation verifies by default" (no longer true).
-   - Fix the missing `//!` on line 16 of the doc example.
-   - Use the renamed methods in the example.
-   - State once that all operations block (use `spawn_blocking` from async
-     code).
-
-   Then remove the repeated `spawn_blocking` sentences from the docs of
-   individual methods (`prober.rs`, `generator.rs`, `verification.rs`,
-   `stats/cache.rs`).
-7. Check the doctest with `cargo test --doc --offline`.
+1. Remove the unused `print_pair_stats` in `src/generator.rs`. Keep
+   `print_table_stats` private and preserve its output.
+2. Remove the public re-exports of `PackedOutcome`, `GenerationPlan`,
+   `TablePair`, and `TableSelector` from `src/lib.rs`. Update internal imports
+   to use their defining modules and narrow visibility where possible. Make
+   `mod error` private but retain the `EgtError` and `EgtResult` re-exports.
+   Make `quiet_unmoves` private to `src/generator/solver.rs`; its current
+   callers are all in that module, including its tests.
+3. Move `ProbeWithMoves` next to `Tablebase::probe_with_moves` in
+   `src/tablebase.rs` and keep re-exporting it at the crate root.
+4. The intended crate-root exports are `Tablebase`, `ProbeWithMoves`,
+   `TableId`, `DtcOutcome`, `ConversionType`, `EgtStats`, `AggregateStats`,
+   `LongestDtcPosition`, `EgtError`, `EgtResult`, and `resolve_selectors`.
+   Decide separately whether to keep `Egt` public for low-level index access;
+   neither binary uses it.
+5. Optional: keep the current `&[&str]` selector signatures unless accepting
+   borrowed strings directly simplifies the API and callers. If changing them,
+   consider `generate`, `verify`, `stats`, `cache_stats`, and
+   `resolve_selectors` together: their CLI call sites all collect `Vec<&str>`.
+   Preserve selector semantics and account for empty selections, such as the
+   server's `stats(&[])` startup check.
+6. Keep the crate docs and example aligned with the final exports and run
+   `cargo test --doc --offline`.
 
 ---
 

@@ -1,3 +1,4 @@
+use crate::outcome::PackedOutcome;
 use super::*;
 use crate::egt_file::TableFile;
 use crate::storage::Location;
