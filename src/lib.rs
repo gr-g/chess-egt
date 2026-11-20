@@ -44,6 +44,7 @@ mod error;
 mod generator;
 mod outcome;
 mod position;
+pub use position::InvalidPosition;
 mod report;
 mod selection;
 mod stats;

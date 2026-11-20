@@ -115,7 +115,7 @@ fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
 
     let egt = Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White))
+        .find_map(|index| egt.position_from_index(index, Color::White).ok())
         .unwrap();
     tablebase.probe(&position).unwrap();
 }
@@ -197,7 +197,7 @@ fn zero_cache_size_supports_probing_generated_and_verified_tables() {
     tablebase.set_cache_size(0).unwrap();
     let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White))
+        .find_map(|index| egt.position_from_index(index, Color::White).ok())
         .unwrap();
     assert_eq!(tablebase.probe(&position).unwrap(), DtcOutcome::Draw);
 }
@@ -314,7 +314,7 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
     let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
     let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White))
+        .find_map(|index| egt.position_from_index(index, Color::White).ok())
         .unwrap();
     let mut prober = Tablebase::new(&output.0).unwrap();
     assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
@@ -376,6 +376,6 @@ fn selector_union_is_sorted_deduplicated_and_preserves_orientation() {
 fn position_for(name: &str) -> Chess {
     let egt = Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
     (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White))
+        .find_map(|index| egt.position_from_index(index, Color::White).ok())
         .unwrap()
 }

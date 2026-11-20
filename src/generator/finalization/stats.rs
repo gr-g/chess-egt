@@ -81,6 +81,7 @@ impl StatsAccumulator {
                 .into_iter()
                 .filter_map(|local_idx| {
                     egt.position_from_index(local_idx, Color::White)
+                        .ok()
                         .map(|pos| LongestDtcPosition {
                             epd: Epd::from_position(&pos, EnPassantMode::Legal).to_string(),
                             ply,
@@ -125,7 +126,7 @@ mod tests {
         let idx: Vec<_> = (0..egt.index_range())
             .filter(|&idx| {
                 !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
-                    && egt.position_from_index(idx, Color::White).is_some()
+                    && egt.position_from_index(idx, Color::White).is_ok()
             })
             .take(6)
             .collect();
@@ -213,7 +214,7 @@ mod tests {
         let idx = (0..egt.index_range())
             .find(|&idx| {
                 !egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
-                    && egt.position_from_index(idx, Color::White).is_some()
+                    && egt.position_from_index(idx, Color::White).is_ok()
             })
             .unwrap();
         let mut stats = StatsAccumulator::default();
@@ -241,7 +242,7 @@ mod tests {
         let idx = (0..egt.index_range())
             .find(|&idx| {
                 egt.diagonal_symmetric(idx).is_some_and(|other| idx > other)
-                    && egt.position_from_index(idx, Color::White).is_none()
+                    && egt.position_from_index(idx, Color::White).is_err()
             })
             .unwrap();
         let mut stats = StatsAccumulator::default();

@@ -1,5 +1,5 @@
 use shakmaty::{Chess, Color};
-use crate::TableId;
+use crate::{InvalidPosition, TableId};
 mod indexer;
 use crate::error::EgtResult;
 use indexer::Indexer;
@@ -71,17 +71,12 @@ impl Egt {
         self.indexer.reflected_position_to_index(position)
     }
 
-    /// Decodes an index into a symmetry-reduced position with the requested side to move.
-    /// Returns `None` for out-of-range indices or invalid positions.
+    /// Decodes a symmetry-reduced position with the requested side to move.
+    /// Returns the rejection reason for an out-of-range index or invalid position.
     /// Castling rights are absent; en passant rights are retained only when legal.
     /// Impossible checks are accepted, as in table generation.
-    pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
+    pub fn position_from_index(&self, index: usize, side_to_move: Color) -> Result<Chess, InvalidPosition> {
         self.indexer.position_from_index(index, side_to_move)
-    }
-
-    /// Decodes an in-range index, retaining its rejection reason for initialization.
-    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
-        self.indexer.position_from_index_with_reason(index, side_to_move)
     }
 
     /// Decodes an index already accepted by `position_from_index` for this table and turn.
@@ -240,15 +235,14 @@ mod tests {
                 let mut accepted = 0;
                 for index in (0..egt.index_range()).step_by((egt.index_range() / 256).max(1)) {
                     let decoded = egt.position_from_index(index, turn);
-                    assert_eq!(egt.position_from_index_with_reason(index, turn).ok(), decoded);
-                    if let Some(position) = decoded {
+                    if let Ok(position) = decoded {
                         assert_eq!(egt.position_from_index_unchecked(index, turn), position);
                         accepted += 1;
                     }
                 }
                 assert!(accepted > 0, "{name}, {turn:?}");
-                assert_eq!(egt.position_from_index(egt.index_range(), turn), None);
-                assert_eq!(egt.position_from_index(usize::MAX, turn), None);
+                assert_eq!(egt.position_from_index(egt.index_range(), turn), Err(InvalidPosition::IndexOutOfRange));
+                assert_eq!(egt.position_from_index(usize::MAX, turn), Err(InvalidPosition::IndexOutOfRange));
             }
         }
     }
@@ -270,7 +264,7 @@ mod tests {
             let mut checked = 0;
             for turn in [Color::White, Color::Black] {
                 for idx in (0..egt.index_range()).step_by(stride) {
-                    if let Some(position) = egt.position_from_index(idx, turn) {
+                    if let Ok(position) = egt.position_from_index(idx, turn) {
                         let source = mirror_horizontally(&position).unwrap();
                         let reflected = mirror_horizontally(&source).unwrap();
                         assert_eq!(
@@ -341,7 +335,7 @@ mod tests {
     }
 
     fn assert_round_trip(egt: &Egt, i: usize, side_to_move: Color) {
-        if let Some(position) = egt.position_from_index(i, side_to_move) {
+        if let Ok(position) = egt.position_from_index(i, side_to_move) {
             assert_eq!(i, egt.position_to_index(&position));
         }
     }

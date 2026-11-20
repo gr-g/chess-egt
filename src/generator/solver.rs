@@ -222,7 +222,7 @@ fn initialize_table(
         let mut ply_bounds = [0u16; 4];
         for (offset, cell) in chunk.iter_mut().enumerate() {
             let idx = block * summary.block_size + offset;
-            let position = match egt.position_from_index_with_reason(idx, Color::White) {
+            let position = match egt.position_from_index(idx, Color::White) {
                 Ok(position) => position,
                 Err(reason) => {
                     *cell.get_mut() = PackedOutcome::INVALID.to_u16();

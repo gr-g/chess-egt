@@ -64,6 +64,7 @@
 //! Decoding reverses these steps. Indices whose positions have opposite check,
 //! occupied EP path squares, or no legal EP capture are rejected during validation.
 
+use crate::position::InvalidPosition;
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
 use crate::table_id::{EgtSide, MAX_PIECES, NONPAWN_ROLES, TableId, sides};
@@ -351,13 +352,13 @@ impl Indexer {
     // Builds a `CoordBuf` pre-filled with `(0, 0)` for `n` pieces.
     #[inline]
     fn filled_coord(n: usize) -> CoordBuf {
-        (0..n).map(|_| (0, 0)).collect()
+        std::iter::repeat_n((0, 0), n).collect()
     }
 
     // Builds a `PidxBuf` pre-filled with `0` for `n` pieces.
     #[inline]
     fn filled_pidx(n: usize) -> PidxBuf {
-        (0..n).map(|_| 0).collect()
+        std::iter::repeat_n(0, n).collect()
     }
 
     fn compute_piece_squares(nonpawns: &mut [IndexerPieceGroup], n_pawns: usize) {
@@ -445,29 +446,16 @@ impl Indexer {
         pawn_index * self.nonpawn_combinations + self.cpidx_to_index(&pidx)
     }
 
-    // Decodes an index and recreates the corresponding position for this endgame (up to symmetries).
-    // If the index represents an invalid position, returns None.
-    pub(super) fn position_from_index(&self, index: usize, side_to_move: Color) -> Option<Chess> {
-        self.position_from_index_impl::<true>(index, side_to_move)
-    }
-
-    /// Decodes an index already accepted by `position_from_index` for this table and turn.
-    /// Skips all position validation, including legal en passant. Panics if out of range.
-    pub(super) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
-        self.position_from_index_impl::<false>(index, side_to_move)
-            .expect("position index out of range")
-    }
-
-    fn position_from_index_impl<const VALIDATE: bool>(&self, index: usize, side_to_move: Color) -> Option<Chess> {
+    pub(super) fn position_from_index(&self, index: usize, side_to_move: Color) -> Result<Chess, InvalidPosition> {
         if index >= self.index_range {
-            return None;
+            return Err(InvalidPosition::IndexOutOfRange);
         }
-        Self::position_from_setup::<VALIDATE>(self.setup_from_index(index, side_to_move))
+        crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
     }
 
-    /// Decode an in-range index, retaining its rejection reason for initialization.
-    pub(super) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
-        crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
+    pub(super) fn position_from_index_unchecked(&self, index: usize, side_to_move: Color) -> Chess {
+        assert!(index < self.index_range, "position index out of range");
+        Chess::from_setup_unchecked(self.setup_from_index(index, side_to_move), CastlingMode::Standard)
     }
 
     // The caller must enforce the index range before decoding.
@@ -632,14 +620,6 @@ impl Indexer {
         setup
     }
 
-    fn position_from_setup<const VALIDATE: bool>(setup: Setup) -> Option<Chess> {
-        if VALIDATE {
-            crate::position::position_from_setup(setup).ok()
-        } else {
-            Some(Chess::from_setup_unchecked(setup, CastlingMode::Standard))
-        }
-    }
-
     // For pawnless positions, this function applies symmetrical
     // transformations of the coordinates that keep the position unchanged.
     fn reduce_symmetries(&self, buffer_coord: &mut CoordBuf) {
@@ -746,15 +726,14 @@ impl Indexer {
         };
         for p in groups {
             index *= p.combinations;
-            let mut i = p.span.1;
-            for k in 1..=(p.span.1 - p.span.0) {
-                i -= 1;
+            let indices = (p.span.0..p.span.1).rev();
+            for (i, row) in indices.zip(N_CHOOSE_K.iter().skip(1)) {
                 debug_assert!(buffer_pidx[i] < p.n_squares); // valid cpidx
-                if k == 1 {
+                if i == p.span.1 - 1 {
                     index += buffer_pidx[i];
                 } else {
                     debug_assert!(buffer_pidx[i] > buffer_pidx[i+1]); // decreasing cpidx
-                    index += N_CHOOSE_K[k][buffer_pidx[i]];
+                    index += row[buffer_pidx[i]];
                 }
             }
         }
@@ -804,7 +783,7 @@ mod tests {
     use EgtSide::{SideNotToMove as SNTM, SideToMove as STM};
 
     fn coord_to_position(indexer: &Indexer, ep_file: Option<File>, coord: &CoordBuf, turn: Color) -> Option<Chess> {
-        Indexer::position_from_setup::<true>(indexer.coord_to_setup(ep_file, coord, turn))
+        crate::position::position_from_setup(indexer.coord_to_setup(ep_file, coord, turn)).ok()
     }
 
     fn indexer(groups: &[(File, u8)]) -> Indexer {
@@ -822,9 +801,7 @@ mod tests {
 
     fn assert_decoder_matches(indexer: &Indexer, index: usize, turn: Color) -> Option<Chess> {
         let expected = checked_position_from_setup(indexer.setup_from_index(index, turn));
-        assert_eq!(indexer.position_from_index(index, turn), expected, "index {index}, {turn:?}");
-        assert_eq!(indexer.position_from_index_with_reason(index, turn).is_err(), expected.is_none(),
-            "invalidity at index {index}, {turn:?}");
+        assert_eq!(indexer.position_from_index(index, turn).ok(), expected, "index {index}, {turn:?}");
         if let Some(position) = &expected {
             assert_eq!(indexer.position_from_index_unchecked(index, turn), *position);
         }
@@ -888,8 +865,8 @@ mod tests {
                         rejected += 1;
                     }
                 }
-                assert_eq!(indexer.position_from_index(indexer.index_range, turn), None);
-                assert_eq!(indexer.position_from_index(usize::MAX, turn), None);
+                assert_eq!(indexer.position_from_index(indexer.index_range, turn), Err(InvalidPosition::IndexOutOfRange));
+                assert_eq!(indexer.position_from_index(usize::MAX, turn), Err(InvalidPosition::IndexOutOfRange));
             }
             assert!(accepted > 0, "{name}");
             if name != "K_K" {
@@ -977,7 +954,7 @@ mod tests {
                 let expected = checked_position_from_setup(setup.clone());
                 assert_eq!(expected.is_none(), opposite_check, "{fen}");
                 assert_eq!(crate::position::opposite_check(&setup.board, setup.turn), opposite_check, "{fen}");
-                assert_eq!(Indexer::position_from_setup::<true>(setup), expected, "{fen}");
+                assert_eq!(crate::position::position_from_setup(setup).ok(), expected, "{fen}");
             }
         }
     }
@@ -1045,7 +1022,7 @@ mod tests {
                             assert_eq!(indexer.cpidx_to_index(&cpidx), nonpawn_index);
                             let reflected = crate::egt_file::mirror_horizontally(&position).unwrap();
                             assert_eq!(indexer.reflected_position_to_index(&reflected), index);
-                            assert_eq!(indexer.position_from_index(index, turn), Some(position));
+                            assert_eq!(indexer.position_from_index(index, turn), Ok(position));
                             legal_positions += 1;
                         }
                     }
@@ -1189,7 +1166,7 @@ mod tests {
         for fen in ["8/8/8/8/8/8/1R6/K1k5 w - - 0 1", "8/8/8/8/8/8/1r6/k1K5 b - - 0 1"] {
             let position: Chess = fen.parse::<Fen>().unwrap().into_position(CastlingMode::Standard).unwrap();
             assert_eq!(indexer.position_to_index(&position), 7);
-            assert_eq!(indexer.position_from_index(7, position.turn()), Some(position));
+            assert_eq!(indexer.position_from_index(7, position.turn()), Ok(position));
         }
         assert_eq!(indexer.diagonal_symmetric(773), Some(801));
         assert_eq!(indexer.diagonal_symmetric(801), Some(773));

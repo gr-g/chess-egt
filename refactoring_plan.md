@@ -445,7 +445,7 @@ four places:
 
 ---
 
-## 9. Smaller indexing simplifications
+## 9. Smaller indexing simplifications (done)
 
 **Implementation.**
 1. `Egt` (`src/egt.rs`) is mostly delegation to `Indexer`
@@ -461,9 +461,9 @@ four places:
 2. Reduce the three decode entry points (`position_from_index`,
    `position_from_index_with_reason`, `position_from_index_unchecked`, plus
    the `const VALIDATE: bool` generic) to two:
-   - `decode(index, turn) -> Result<Chess, InvalidPosition>` (index range
+   - `position_from_index(index, turn) -> Result<Chess, InvalidPosition>` (index range
      checked by `debug_assert` or by returning an extra variant);
-   - `decode_unchecked(index, turn) -> Chess`.
+   - `position_from_index_unchecked(index, turn) -> Chess`.
 
    The current `position_from_index(..) -> Option<Chess>` callers use
    `.ok()`. Out-of-range handling: callers that can pass an out-of-range
@@ -546,5 +546,4 @@ four places:
    50-move rule" → "the 50-move rule". After points 2, 5 and 6, update the
    README "High-level overview" and "Storage and memory layer" sections to
    the new type names (`TableFile`, `SharedFileCache`, `solve_pair`
-   location). Do not touch `AGENTS.md`, even though it mentions
-   `EgtFileReader`; tell the user instead.
+   location).

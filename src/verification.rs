@@ -107,7 +107,7 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
     for (relative_idx, outcome_maybe) in outcomes.iter().copied().enumerate() {
         let local_idx = start + relative_idx;
         let index = local_idx;
-        let Some(position) = egt.position_from_index(local_idx, Color::White) else {
+        let Ok(position) = egt.position_from_index(local_idx, Color::White) else {
             if !outcome_maybe.is_invalid() {
                 return Err(fail(
                     local_idx,
@@ -244,7 +244,7 @@ mod tests {
         let dir = TestDir::new("verify_invalid_outcome");
         let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
         let index = (0..egt.index_range())
-            .find(|&index| egt.position_from_index(index, Color::White).is_some())
+            .find(|&index| egt.position_from_index(index, Color::White).is_ok())
             .unwrap();
         let mut verifier = Tablebase::new(&dir.0).unwrap();
         for threads in [0, 1, 4] {

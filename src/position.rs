@@ -5,8 +5,10 @@
 
 use shakmaty::{Board, CastlingMode, Chess, Color, Position, Rank, Role, Setup, Square};
 
+/// Why a table-local index could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InvalidPosition {
+pub enum InvalidPosition {
+    IndexOutOfRange,
     OppositeCheck,
     EpSquaresOccupied,
     IllegalEpCapture,
@@ -23,6 +25,7 @@ pub(crate) struct InvalidCounts {
 impl InvalidCounts {
     pub(crate) fn record(&mut self, reason: InvalidPosition) {
         match reason {
+            InvalidPosition::IndexOutOfRange => unreachable!("initialization only decodes in-range indices"),
             InvalidPosition::OppositeCheck => self.opposite_check += 1,
             InvalidPosition::EpSquaresOccupied => self.ep_squares_occupied += 1,
             InvalidPosition::IllegalEpCapture => self.illegal_ep_capture += 1,
@@ -138,7 +141,7 @@ mod tests {
             let egt = crate::egt::Egt::new(&id).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
-                match egt.position_from_index_with_reason(index, Color::White) {
+                match egt.position_from_index(index, Color::White) {
                     Ok(_) => valid += 1,
                     Err(reason) => part.record(reason),
                 }

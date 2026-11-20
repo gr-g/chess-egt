@@ -686,7 +686,7 @@ mod tests {
                 let egt = Egt::new(&table).unwrap();
                 for turn in [Color::White, Color::Black] {
                     for index in (0..egt.index_range()).step_by((egt.index_range() / 16).max(1)) {
-                        let Some(position) = egt.position_from_index(index, turn) else {
+                        let Ok(position) = egt.position_from_index(index, turn) else {
                             continue;
                         };
                         assert_eq!(TableId::from_position(&position).unwrap(), (table, false));

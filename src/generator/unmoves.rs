@@ -272,7 +272,7 @@ mod tests {
                     let mut checked = 0;
                     let stride = (egt.index_range() / 512).max(1);
                     for idx in (0..egt.index_range()).step_by(stride) {
-                        if let Some(position) = egt.position_from_index(idx, turn) {
+                        if let Ok(position) = egt.position_from_index(idx, turn) {
                             assert_quiet_unmoves_match_forward_play(&position);
                             checked += 1;
                         }
@@ -371,7 +371,7 @@ mod tests {
                     let mut checked = 0;
                     let stride = (egt.index_range() / 64).max(1);
                     for idx in (0..egt.index_range()).step_by(stride) {
-                        if let Some(position) = egt.position_from_index(idx, turn) {
+                        if let Ok(position) = egt.position_from_index(idx, turn) {
                             assert_quiet_unmoves_match_forward_play(&position);
                             ep_checked += usize::from(position.legal_ep_square().is_some());
                             checked += 1;
@@ -409,7 +409,7 @@ mod tests {
             let mut checked = 0;
             for turn in [Color::White, Color::Black] {
                 for &pred_idx in &samples {
-                    let Some(position) = egt.position_from_index(pred_idx, turn) else { continue };
+                    let Ok(position) = egt.position_from_index(pred_idx, turn) else { continue };
                     assert_eq!(egt.position_to_index(&position), pred_idx);
                     ep_predecessors += usize::from(position.legal_ep_square().is_some());
                     let mut successors = HashMap::new();
@@ -425,7 +425,7 @@ mod tests {
                         *successors.entry(succ_idx).or_insert(0usize) += 1;
                     }
                     for (succ_idx, expected) in successors {
-                        assert!(twin.position_from_index(succ_idx, Color::White).is_some());
+                        assert!(twin.position_from_index(succ_idx, Color::White).is_ok());
                         let mut actual = 0;
                         quiet_unmoves(&twin, &egt, succ_idx, reverse_mirrored, |idx| {
                             if idx == pred_idx { actual += 1; }

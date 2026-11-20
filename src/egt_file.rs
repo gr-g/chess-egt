@@ -298,7 +298,7 @@ mod tests {
             let stride = (egt.index_range() / 64).max(1);
             for turn in [Color::White, Color::Black] {
                 for index in (0..egt.index_range()).step_by(stride) {
-                    let Some(position) = egt.position_from_index(index, turn) else {
+                    let Ok(position) = egt.position_from_index(index, turn) else {
                         continue;
                     };
                     assert_eq!(TableId::from_position(&position).unwrap().0, id);
@@ -383,8 +383,7 @@ mod tests {
             .unwrap();
         assert_ne!(TableId::from_position(&other_material).unwrap().0, file.egt().id());
         assert!(
-            file.egt().position_from_index(file.egt.index_range(), Color::White)
-                .is_none()
+            file.egt().position_from_index(file.egt.index_range(), Color::White).is_err()
         );
     }
 
@@ -392,7 +391,7 @@ mod tests {
         let egt = Egt::new(&crate::TableId::parse(tablename).unwrap()).unwrap();
         for turn in [Color::White, Color::Black] {
             for index in (0..egt.index_range()).step_by(stride) {
-                if let Some(position) = egt.position_from_index(index, turn) {
+                if let Ok(position) = egt.position_from_index(index, turn) {
                     assert_eq!(egt.position_to_index(&position), index);
                 }
             }
