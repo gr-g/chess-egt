@@ -56,7 +56,7 @@ pub use egt::Egt;
 pub use error::{EgtError, EgtResult};
 pub use outcome::{ConversionType, DtcOutcome};
 pub use selection::resolve_selectors;
-pub use stats::{AggregateStats, EgtStats, LongestDtcPosition};
+pub use stats::{AggregateStats, EgtStats, LongestDtcPosition, Totals};
 #[cfg(test)]
 use std::path::PathBuf;
 pub use table_id::TableId;

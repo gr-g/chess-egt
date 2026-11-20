@@ -237,7 +237,7 @@ fn generator_publishes_finalized_stats_with_shadowed_outputs() {
     assert!(table_path(&output.0, "K_K", "ggegt").exists());
     for stats in &tables {
         let data = std::fs::read(table_path(&output.0, &stats.tablename, "ggegt")).unwrap();
-        assert_eq!(stats.bytes, data.len() as u64);
+        assert_eq!(stats.totals.bytes, data.len() as u64);
         assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(&data)));
         let json = std::fs::read(table_path(&output.0, &stats.tablename, "json")).unwrap();
         assert_eq!(serde_json::from_slice::<EgtStats>(&json).unwrap(), *stats);
@@ -330,7 +330,7 @@ fn generation_replaces_placeholders_and_invalidates_hierarchy_summaries() {
     let missing = tablebase.cache_stats(&["2"]).unwrap();
     assert_eq!(missing.selected_tables, 1);
     assert_eq!(missing.available_tables, 0);
-    assert_eq!(missing.bytes, None);
+    assert_eq!(missing.totals, None);
     assert_eq!(tablebase.stats(&["2"]).unwrap(), missing);
     let tables = tablebase.generate(&["K_K"]).unwrap();
     for prefix in ["2", "2/1v1", "2/1v1/op0", "2/1v1/op0/0pawns"] {

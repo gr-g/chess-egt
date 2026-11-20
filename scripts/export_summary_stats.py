@@ -59,13 +59,16 @@ def leaf_row(root, leaf):
     ):
         raise ValueError(f"{summary_path}: sidecars disagree with summary; refresh --cache-stats")
     all_available = selected == available
-    for key in OUTCOME_FIELDS:
-        if all_available:
-            actual = count(stats, key, summary_path)
+    totals = stats.get("totals")
+    if all_available:
+        if not isinstance(totals, dict):
+            raise ValueError(f"{summary_path}: missing totals object; refresh --cache-stats")
+        for key in OUTCOME_FIELDS:
+            actual = count(totals, key, summary_path)
             if actual != sum(record[key] for record in complete):
                 raise ValueError(f"{summary_path}: {key} disagrees with sidecars; refresh --cache-stats")
-        elif key not in stats or stats[key] is not None:
-            raise ValueError(f"{summary_path}: incomplete summary must have null {key}")
+    elif "totals" not in stats or totals is not None:
+        raise ValueError(f"{summary_path}: incomplete summary must have null totals; refresh --cache-stats")
 
     row = {
         "path": path,
@@ -74,8 +77,8 @@ def leaf_row(root, leaf):
         "index_range": index_range,
     }
     if all_available:
-        row.update({key: stats[key] for key in ("unique_positions", "win", "draw", "loss")})
-        row["size_gib"] = decimal(stats["bytes"] / 2**30)
+        row.update({key: totals[key] for key in ("unique_positions", "win", "draw", "loss")})
+        row["size_gib"] = decimal(totals["bytes"] / 2**30)
     else:
         pieces = int(path.split("/")[0])
         bits_per_index = (COMPRESSION_BITS_PER_INDEX if pieces <= REFERENCE_PIECES else

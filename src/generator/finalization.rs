@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicU16;
 
 use rayon::prelude::*;
 
-use self::stats::TableStats;
+use self::stats::StatsAccumulator;
 use super::WinLoss;
 use crate::egt::Egt;
 use crate::egt_file::writer::{COMPRESSION_LEVEL, CompressedSegment, EgtFileWriter, encode_frame};
@@ -24,13 +24,13 @@ fn finalize_batch(
     egt: &Egt,
     frame_size: usize,
     maxima: WinLoss<u16>,
-) -> EgtResult<(CompressedSegment, TableStats)> {
+) -> EgtResult<(CompressedSegment, StatsAccumulator)> {
     let mut data = Vec::new();
     let mut encoder = zeekstd::EncodeOptions::new()
         .compression_level(COMPRESSION_LEVEL)
         .into_encoder(&mut data)?;
     let mut plain = Vec::with_capacity(frame_size.min(values.len()));
-    let mut stats = TableStats::default();
+    let mut stats = StatsAccumulator::default();
     let mut frame_lengths = Vec::new();
     for (frame_idx, chunk) in values.chunks_mut(frame_size).enumerate() {
         plain.clear();
@@ -94,7 +94,7 @@ pub(super) fn finalize_table(
     drop(values);
     let batches = batches.into_iter().collect::<EgtResult<Vec<_>>>()?;
     let (segments, parts): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
-    let mut stats = TableStats::default();
+    let mut stats = StatsAccumulator::default();
     stats.merge(parts);
     let (bytes, sha256) = writer.publish(segments)?;
     let stats = stats.build(egt, maxima, invalid, bytes, sha256);

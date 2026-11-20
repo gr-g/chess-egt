@@ -299,7 +299,7 @@ In addition:
 
 ---
 
-## 6. Simplify statistics
+## 6. Simplify statistics (done)
 
 **Problem.** `src/stats.rs` has five types:
 - `EgtStats`;

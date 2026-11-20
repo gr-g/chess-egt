@@ -240,7 +240,7 @@ mod tests {
         let counts = generator
             .verify_tables_in_pool(&resolve_selectors(&["KQ_K"]).unwrap())
             .unwrap();
-        assert_eq!(counts, (source.unique_positions, source.index_range));
+        assert_eq!(counts, (source.totals.unique_positions, source.index_range));
     }
 
     #[test]

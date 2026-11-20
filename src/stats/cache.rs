@@ -258,7 +258,7 @@ mod tests {
         assert_eq!((summary.selected_tables, summary.available_tables), (1, 0));
         let missing = StatsRecord::missing(&id).unwrap();
         assert_eq!(summary.index_range, missing.index_range());
-        assert_eq!(summary.bytes, None);
+        assert_eq!(summary.totals, None);
         assert!(absent(&location, &id.relative_path("json")));
         assert!(absent(&location, "2/stats.json"));
         assert!(cache(&location, &["2"]).is_err());

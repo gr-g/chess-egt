@@ -29,10 +29,9 @@ pub(crate) fn generation_summary(
     threads: usize,
     lowest_compression: Option<(&str, f64)>,
 ) -> String {
-    let unique_positions = total
-        .unique_positions
-        .expect("generation statistics are complete");
-    let bytes = total.bytes.expect("generation statistics are complete");
+    let totals = total.totals.as_ref().expect("generation statistics are complete");
+    let unique_positions = totals.unique_positions;
+    let bytes = totals.bytes;
     let average_compression = if unique_positions > 0 {
         bytes as f64 * 8.0 / unique_positions as f64
     } else {
@@ -56,10 +55,10 @@ pub(crate) fn generation_summary(
 
 /// Prints table-specific statistics (wins, draws, losses, compression).
 pub(crate) fn print_table_stats(stats: &EgtStats) {
-    let unique_positions = stats.unique_positions;
-    let compressed_size_mb = stats.bytes as f64 / (1024.0 * 1024.0);
+    let unique_positions = stats.totals.unique_positions;
+    let compressed_size_mb = stats.totals.bytes as f64 / (1024.0 * 1024.0);
     let bits_per_pos = if unique_positions > 0 {
-        (stats.bytes as f64 * 8.0) / unique_positions as f64
+        (stats.totals.bytes as f64 * 8.0) / unique_positions as f64
     } else {
         0.0
     };
@@ -68,9 +67,9 @@ pub(crate) fn print_table_stats(stats: &EgtStats) {
         "Generated endgame {} with {} unique positions: {} wins, {} draws, {} losses. Compressed size: {:.2}MiB ({:.2} bits/pos).",
         stats.tablename,
         unique_positions,
-        stats.win,
-        stats.draw,
-        stats.loss,
+        stats.totals.win,
+        stats.totals.draw,
+        stats.totals.loss,
         compressed_size_mb,
         bits_per_pos
     );
@@ -85,10 +84,12 @@ mod tests {
         let total = AggregateStats {
             selected_tables: 2,
             available_tables: 2,
-            bytes: Some(1024 * 1024),
             index_range: 5_000_000,
-            unique_positions: Some(4 * 1024 * 1024),
-            ..Default::default()
+            totals: Some(crate::Totals {
+                bytes: 1024 * 1024,
+                unique_positions: 4 * 1024 * 1024,
+                ..Default::default()
+            }),
         };
         assert_eq!(
             generation_summary(&total, Duration::from_secs(65), 2, Some(("KQ_K", 3.0))),

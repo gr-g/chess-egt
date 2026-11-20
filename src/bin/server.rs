@@ -541,7 +541,7 @@ mod tests {
         let stats: AggregateStats = serde_json::from_str(&body).unwrap();
         assert!(stats.selected_tables > 0);
         assert_eq!(stats.available_tables, 0);
-        assert_eq!(stats.unique_positions, None);
+        assert_eq!(stats.totals, None);
         for (uri, status, code) in [
             (
                 "/query".to_owned(),

@@ -4,10 +4,9 @@ mod cache;
 
 use std::collections::BTreeMap;
 use std::io;
-use std::ops::Add;
 
 use object_store::ObjectStoreExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
@@ -19,14 +18,10 @@ pub struct LongestDtcPosition {
     pub ply: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EgtStats {
-    pub tablename: String,
+pub struct Totals {
     pub bytes: u64,
-    pub sha256: String,
-    pub index_range: usize,
-    pub frame_size: usize,
     pub num_frames: usize,
     pub unique_positions: usize,
     pub win: usize,
@@ -46,68 +41,276 @@ pub struct EgtStats {
     pub longest_dtc_loss: Vec<LongestDtcPosition>,
 }
 
-/// Unit fields accept only explicit JSON nulls, keeping placeholders all-or-nothing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PlaceholderStats {
+struct TableWire {
     tablename: String,
+    #[serde(deserialize_with = "required_nullable")]
+    bytes: Option<u64>,
+    #[serde(deserialize_with = "required_nullable")]
+    sha256: Option<String>,
     index_range: usize,
-    bytes: (),
-    sha256: (),
-    frame_size: (),
-    num_frames: (),
-    unique_positions: (),
-    win: (),
-    draw: (),
-    loss: (),
-    invalid_opposite_check: (),
-    invalid_ep_squares_occupied: (),
-    invalid_illegal_ep_capture: (),
-    redundant: (),
-    histogram_win: (),
-    histogram_loss: (),
-    longest_dtc_win: (),
-    longest_dtc_loss: (),
+    #[serde(deserialize_with = "required_nullable")]
+    frame_size: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    num_frames: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    unique_positions: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    win: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    draw: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    loss: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    invalid_opposite_check: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    invalid_ep_squares_occupied: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    invalid_illegal_ep_capture: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    redundant: Option<usize>,
+    #[serde(deserialize_with = "required_nullable")]
+    histogram_win: Option<BTreeMap<u16, usize>>,
+    #[serde(deserialize_with = "required_nullable")]
+    histogram_loss: Option<BTreeMap<u16, usize>>,
+    #[serde(deserialize_with = "required_nullable")]
+    longest_dtc_win: Option<Vec<LongestDtcPosition>>,
+    #[serde(deserialize_with = "required_nullable")]
+    longest_dtc_loss: Option<Vec<LongestDtcPosition>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged, try_from = "serde_json::Value")]
+fn serialize_table<S: Serializer>(
+    serializer: S,
+    tablename: &str,
+    index_range: usize,
+    stats: Option<&EgtStats>,
+) -> Result<S::Ok, S::Error> {
+    let mut wire = serializer.serialize_struct("TableStats", 18)?;
+    wire.serialize_field("tablename", tablename)?;
+    if stats.is_none() {
+        wire.serialize_field("index_range", &index_range)?;
+    }
+    wire.serialize_field("bytes", &stats.map(|stats| &stats.totals.bytes))?;
+    wire.serialize_field("sha256", &stats.map(|stats| &stats.sha256))?;
+    if stats.is_some() {
+        wire.serialize_field("index_range", &index_range)?;
+    }
+    wire.serialize_field("frame_size", &stats.map(|stats| stats.frame_size))?;
+    wire.serialize_field("num_frames", &stats.map(|stats| &stats.totals.num_frames))?;
+    wire.serialize_field(
+        "unique_positions",
+        &stats.map(|stats| &stats.totals.unique_positions),
+    )?;
+    wire.serialize_field("win", &stats.map(|stats| &stats.totals.win))?;
+    wire.serialize_field("draw", &stats.map(|stats| &stats.totals.draw))?;
+    wire.serialize_field("loss", &stats.map(|stats| &stats.totals.loss))?;
+    wire.serialize_field(
+        "invalid_opposite_check",
+        &stats.map(|stats| &stats.totals.invalid_opposite_check),
+    )?;
+    wire.serialize_field(
+        "invalid_ep_squares_occupied",
+        &stats.map(|stats| &stats.totals.invalid_ep_squares_occupied),
+    )?;
+    wire.serialize_field(
+        "invalid_illegal_ep_capture",
+        &stats.map(|stats| &stats.totals.invalid_illegal_ep_capture),
+    )?;
+    wire.serialize_field("redundant", &stats.map(|stats| &stats.totals.redundant))?;
+    wire.serialize_field(
+        "histogram_win",
+        &stats.map(|stats| &stats.totals.histogram_win),
+    )?;
+    wire.serialize_field(
+        "histogram_loss",
+        &stats.map(|stats| &stats.totals.histogram_loss),
+    )?;
+    wire.serialize_field(
+        "longest_dtc_win",
+        &stats.map(|stats| &stats.totals.longest_dtc_win),
+    )?;
+    wire.serialize_field(
+        "longest_dtc_loss",
+        &stats.map(|stats| &stats.totals.longest_dtc_loss),
+    )?;
+    wire.end()
+}
+
+impl TryFrom<TableWire> for StatsRecord {
+    type Error = &'static str;
+
+    fn try_from(wire: TableWire) -> Result<Self, Self::Error> {
+        let TableWire {
+            tablename,
+            index_range,
+            sha256,
+            frame_size,
+            bytes,
+            num_frames,
+            unique_positions,
+            win,
+            draw,
+            loss,
+            invalid_opposite_check,
+            invalid_ep_squares_occupied,
+            invalid_illegal_ep_capture,
+            redundant,
+            histogram_win,
+            histogram_loss,
+            longest_dtc_win,
+            longest_dtc_loss,
+        } = wire;
+        match (
+            sha256,
+            frame_size,
+            bytes,
+            num_frames,
+            unique_positions,
+            win,
+            draw,
+            loss,
+            invalid_opposite_check,
+            invalid_ep_squares_occupied,
+            invalid_illegal_ep_capture,
+            redundant,
+            histogram_win,
+            histogram_loss,
+            longest_dtc_win,
+            longest_dtc_loss,
+        ) {
+            (
+                Some(sha256),
+                Some(frame_size),
+                Some(bytes),
+                Some(num_frames),
+                Some(unique_positions),
+                Some(win),
+                Some(draw),
+                Some(loss),
+                Some(invalid_opposite_check),
+                Some(invalid_ep_squares_occupied),
+                Some(invalid_illegal_ep_capture),
+                Some(redundant),
+                Some(histogram_win),
+                Some(histogram_loss),
+                Some(longest_dtc_win),
+                Some(longest_dtc_loss),
+            ) => Ok(Self::Complete(EgtStats {
+                tablename,
+                index_range,
+                sha256,
+                frame_size,
+                totals: Totals {
+                    bytes,
+                    num_frames,
+                    unique_positions,
+                    win,
+                    draw,
+                    loss,
+                    invalid_opposite_check,
+                    invalid_ep_squares_occupied,
+                    invalid_illegal_ep_capture,
+                    redundant,
+                    histogram_win,
+                    histogram_loss,
+                    longest_dtc_win,
+                    longest_dtc_loss,
+                },
+            })),
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => Ok(Self::Missing {
+                tablename,
+                index_range,
+            }),
+            _ => Err("inconsistent table stats nullability"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "TableWire")]
+pub struct EgtStats {
+    pub tablename: String,
+    pub sha256: String,
+    pub index_range: usize,
+    pub frame_size: usize,
+    pub totals: Totals,
+}
+
+impl Serialize for EgtStats {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_table(serializer, &self.tablename, self.index_range, Some(self))
+    }
+}
+
+impl TryFrom<TableWire> for EgtStats {
+    type Error = &'static str;
+
+    fn try_from(wire: TableWire) -> Result<Self, Self::Error> {
+        match StatsRecord::try_from(wire)? {
+            StatsRecord::Complete(stats) => Ok(stats),
+            StatsRecord::Missing { .. } => Err("requested statistics are unavailable"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "TableWire")]
 pub(crate) enum StatsRecord {
     Complete(EgtStats),
-    Missing(PlaceholderStats),
+    Missing {
+        tablename: String,
+        index_range: usize,
+    },
 }
 
-// Deserialize through JSON so integer histogram keys retain JSON's key conversion.
-impl TryFrom<serde_json::Value> for StatsRecord {
-    type Error = serde_json::Error;
-
-    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        if value.get("bytes").is_some_and(serde_json::Value::is_null) {
-            serde_json::from_value(value).map(Self::Missing)
-        } else {
-            serde_json::from_value(value).map(Self::Complete)
+impl Serialize for StatsRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Complete(stats) => stats.serialize(serializer),
+            Self::Missing {
+                tablename,
+                index_range,
+            } => serialize_table(serializer, tablename, *index_range, None),
         }
     }
 }
 
 impl StatsRecord {
     pub(crate) fn missing(id: &TableId) -> EgtResult<Self> {
-        Ok(Self::Missing(PlaceholderStats {
+        Ok(Self::Missing {
             tablename: id.to_string(),
             index_range: Egt::new(id)?.index_range(),
-            ..Default::default()
-        }))
+        })
     }
 
-    pub(crate) fn index_range(&self) -> usize {
+    #[cfg(test)]
+    fn index_range(&self) -> usize {
         match self {
             Self::Complete(stats) => stats.index_range,
-            Self::Missing(stats) => stats.index_range,
+            Self::Missing { index_range, .. } => *index_range,
         }
     }
 }
 
-// Unlike an ordinary Option, a missing field must not be mistaken for explicit null.
+// Missing fields are errors even when explicit nulls are allowed.
 fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -123,33 +326,7 @@ pub struct AggregateStats {
     pub available_tables: usize,
     pub index_range: usize,
     #[serde(deserialize_with = "required_nullable")]
-    pub bytes: Option<u64>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub num_frames: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub unique_positions: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub win: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub draw: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub loss: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub invalid_opposite_check: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub invalid_ep_squares_occupied: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub invalid_illegal_ep_capture: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub redundant: Option<usize>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub histogram_win: Option<BTreeMap<u16, usize>>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub histogram_loss: Option<BTreeMap<u16, usize>>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub longest_dtc_win: Option<Vec<LongestDtcPosition>>,
-    #[serde(deserialize_with = "required_nullable")]
-    pub longest_dtc_loss: Option<Vec<LongestDtcPosition>>,
+    pub totals: Option<Totals>,
 }
 
 impl Default for AggregateStats {
@@ -158,20 +335,7 @@ impl Default for AggregateStats {
             selected_tables: 0,
             available_tables: 0,
             index_range: 0,
-            bytes: Some(0),
-            num_frames: Some(0),
-            unique_positions: Some(0),
-            win: Some(0),
-            draw: Some(0),
-            loss: Some(0),
-            invalid_opposite_check: Some(0),
-            invalid_ep_squares_occupied: Some(0),
-            invalid_illegal_ep_capture: Some(0),
-            redundant: Some(0),
-            histogram_win: Some(BTreeMap::new()),
-            histogram_loss: Some(BTreeMap::new()),
-            longest_dtc_win: Some(Vec::new()),
-            longest_dtc_loss: Some(Vec::new()),
+            totals: Some(Totals::default()),
         }
     }
 }
@@ -182,59 +346,18 @@ impl AggregateStats {
         self.selected_tables += 1;
         self.available_tables += 1;
         self.index_range += stats.index_range;
-        self.bytes = sum(self.bytes, Some(stats.bytes));
-        self.num_frames = sum(self.num_frames, Some(stats.num_frames));
-        self.unique_positions = sum(self.unique_positions, Some(stats.unique_positions));
-        self.win = sum(self.win, Some(stats.win));
-        self.draw = sum(self.draw, Some(stats.draw));
-        self.loss = sum(self.loss, Some(stats.loss));
-        self.invalid_opposite_check = sum(
-            self.invalid_opposite_check,
-            Some(stats.invalid_opposite_check),
-        );
-        self.invalid_ep_squares_occupied = sum(
-            self.invalid_ep_squares_occupied,
-            Some(stats.invalid_ep_squares_occupied),
-        );
-        self.invalid_illegal_ep_capture = sum(
-            self.invalid_illegal_ep_capture,
-            Some(stats.invalid_illegal_ep_capture),
-        );
-        self.redundant = sum(self.redundant, Some(stats.redundant));
-        merge_distribution(
-            &mut self.histogram_win,
-            Some(&stats.histogram_win),
-            &mut self.longest_dtc_win,
-            Some(&stats.longest_dtc_win),
-        );
-        merge_distribution(
-            &mut self.histogram_loss,
-            Some(&stats.histogram_loss),
-            &mut self.longest_dtc_loss,
-            Some(&stats.longest_dtc_loss),
-        );
+        if let Some(totals) = &mut self.totals {
+            totals.add(&stats.totals);
+        }
     }
 
     pub(crate) fn add_record(&mut self, record: &StatsRecord) {
         match record {
             StatsRecord::Complete(stats) => self.add(stats),
-            StatsRecord::Missing(_) => {
+            StatsRecord::Missing { index_range, .. } => {
                 self.selected_tables += 1;
-                self.index_range += record.index_range();
-                self.bytes = None;
-                self.num_frames = None;
-                self.unique_positions = None;
-                self.win = None;
-                self.draw = None;
-                self.loss = None;
-                self.invalid_opposite_check = None;
-                self.invalid_ep_squares_occupied = None;
-                self.invalid_illegal_ep_capture = None;
-                self.redundant = None;
-                self.histogram_win = None;
-                self.histogram_loss = None;
-                self.longest_dtc_win = None;
-                self.longest_dtc_loss = None;
+                self.index_range += index_range;
+                self.totals = None;
             }
         }
     }
@@ -244,132 +367,96 @@ impl AggregateStats {
         self.selected_tables += other.selected_tables;
         self.available_tables += other.available_tables;
         self.index_range += other.index_range;
-        self.bytes = sum(self.bytes, other.bytes);
-        self.num_frames = sum(self.num_frames, other.num_frames);
-        self.unique_positions = sum(self.unique_positions, other.unique_positions);
-        self.win = sum(self.win, other.win);
-        self.draw = sum(self.draw, other.draw);
-        self.loss = sum(self.loss, other.loss);
-        self.invalid_opposite_check =
-            sum(self.invalid_opposite_check, other.invalid_opposite_check);
-        self.invalid_ep_squares_occupied = sum(
-            self.invalid_ep_squares_occupied,
-            other.invalid_ep_squares_occupied,
-        );
-        self.invalid_illegal_ep_capture = sum(
-            self.invalid_illegal_ep_capture,
-            other.invalid_illegal_ep_capture,
-        );
-        self.redundant = sum(self.redundant, other.redundant);
-        merge_distribution(
-            &mut self.histogram_win,
-            other.histogram_win.as_ref(),
-            &mut self.longest_dtc_win,
-            other.longest_dtc_win.as_deref(),
-        );
-        merge_distribution(
-            &mut self.histogram_loss,
-            other.histogram_loss.as_ref(),
-            &mut self.longest_dtc_loss,
-            other.longest_dtc_loss.as_deref(),
-        );
+        match (&mut self.totals, &other.totals) {
+            (Some(totals), Some(other)) => totals.add(other),
+            _ => self.totals = None,
+        }
     }
 
     pub(crate) fn validate(&self) -> EgtResult<()> {
         let complete = self.available_tables == self.selected_tables;
-        let fields = [
-            self.bytes.is_some(),
-            self.num_frames.is_some(),
-            self.unique_positions.is_some(),
-            self.win.is_some(),
-            self.draw.is_some(),
-            self.loss.is_some(),
-            self.invalid_opposite_check.is_some(),
-            self.invalid_ep_squares_occupied.is_some(),
-            self.invalid_illegal_ep_capture.is_some(),
-            self.redundant.is_some(),
-            self.histogram_win.is_some(),
-            self.histogram_loss.is_some(),
-            self.longest_dtc_win.is_some(),
-            self.longest_dtc_loss.is_some(),
-        ];
         if self.available_tables > self.selected_tables
             || (self.selected_tables == 0) != (self.index_range == 0)
             || self.index_range < self.selected_tables
-            || fields.iter().any(|&present| present != complete)
+            || self.totals.is_some() != complete
         {
             return Err(invalid_data("inconsistent aggregate counts or nullability"));
         }
-        if !complete {
+        let Some(totals) = &self.totals else {
             return Ok(());
+        };
+        if self.selected_tables == 0 && self != &Self::default() {
+            return Err(invalid_data("nonzero metadata in an empty aggregate"));
         }
-        if self.selected_tables == 0 {
-            return if self == &Self::default() {
-                Ok(())
-            } else {
-                Err(invalid_data("nonzero metadata in an empty aggregate"))
-            };
-        }
-        if self.bytes.unwrap() < self.available_tables as u64
-            || self.num_frames.unwrap() < self.available_tables
-            || self.num_frames.unwrap() > self.index_range
+        if totals.bytes < self.available_tables as u64
+            || totals.num_frames < self.available_tables
+            || totals.num_frames > self.index_range
         {
             return Err(invalid_data("inconsistent aggregate file totals"));
         }
-        validate_outcomes(
-            self.index_range,
-            self.unique_positions.unwrap(),
-            self.win.unwrap(),
-            self.draw.unwrap(),
-            self.loss.unwrap(),
-            [
-                self.invalid_opposite_check.unwrap(),
-                self.invalid_ep_squares_occupied.unwrap(),
-                self.invalid_illegal_ep_capture.unwrap(),
-                self.redundant.unwrap(),
-            ],
-        )?;
-        validate_distribution(
-            self.histogram_win.as_ref().unwrap(),
-            self.win.unwrap(),
-            self.longest_dtc_win.as_ref().unwrap(),
-        )?;
-        validate_distribution(
-            self.histogram_loss.as_ref().unwrap(),
-            self.loss.unwrap(),
-            self.longest_dtc_loss.as_ref().unwrap(),
-        )
+        totals.validate(self.index_range)
     }
 }
 
-fn sum<T: Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
-    a.zip(b).map(|(a, b)| a + b)
+impl Totals {
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.bytes += other.bytes;
+        self.num_frames += other.num_frames;
+        self.unique_positions += other.unique_positions;
+        self.win += other.win;
+        self.draw += other.draw;
+        self.loss += other.loss;
+        self.invalid_opposite_check += other.invalid_opposite_check;
+        self.invalid_ep_squares_occupied += other.invalid_ep_squares_occupied;
+        self.invalid_illegal_ep_capture += other.invalid_illegal_ep_capture;
+        self.redundant += other.redundant;
+        merge_distribution(
+            &mut self.histogram_win,
+            &other.histogram_win,
+            &mut self.longest_dtc_win,
+            &other.longest_dtc_win,
+        );
+        merge_distribution(
+            &mut self.histogram_loss,
+            &other.histogram_loss,
+            &mut self.longest_dtc_loss,
+            &other.longest_dtc_loss,
+        );
+    }
+
+    fn validate(&self, index_range: usize) -> EgtResult<()> {
+        validate_outcomes(
+            index_range,
+            self.unique_positions,
+            self.win,
+            self.draw,
+            self.loss,
+            [
+                self.invalid_opposite_check,
+                self.invalid_ep_squares_occupied,
+                self.invalid_illegal_ep_capture,
+                self.redundant,
+            ],
+        )?;
+        validate_distribution(&self.histogram_win, self.win, &self.longest_dtc_win)?;
+        validate_distribution(&self.histogram_loss, self.loss, &self.longest_dtc_loss)
+    }
 }
 
 fn merge_distribution(
-    histogram: &mut Option<BTreeMap<u16, usize>>,
-    source: Option<&BTreeMap<u16, usize>>,
-    examples: &mut Option<Vec<LongestDtcPosition>>,
-    source_examples: Option<&[LongestDtcPosition]>,
+    histogram: &mut BTreeMap<u16, usize>,
+    source: &BTreeMap<u16, usize>,
+    examples: &mut Vec<LongestDtcPosition>,
+    source_examples: &[LongestDtcPosition],
 ) {
-    if let (Some(histogram), Some(source), Some(examples), Some(source_examples)) = (
-        histogram.as_mut(),
-        source,
-        examples.as_mut(),
-        source_examples,
-    ) {
-        for (&ply, &count) in source {
-            *histogram.entry(ply).or_default() += count;
-        }
-        let maximum = histogram.last_key_value().map(|(&ply, _)| ply);
-        examples.extend(source_examples.iter().cloned());
-        examples.retain(|position| Some(position.ply) == maximum);
-        examples.sort_unstable_by(|a, b| a.epd.cmp(&b.epd).then(a.ply.cmp(&b.ply)));
-        examples.dedup();
-    } else {
-        *histogram = None;
-        *examples = None;
+    for (&ply, &count) in source {
+        *histogram.entry(ply).or_default() += count;
     }
+    let maximum = histogram.last_key_value().map(|(&ply, _)| ply);
+    examples.extend(source_examples.iter().cloned());
+    examples.retain(|position| Some(position.ply) == maximum);
+    examples.sort_unstable_by(|a, b| a.epd.cmp(&b.epd).then(a.ply.cmp(&b.ply)));
+    examples.dedup();
 }
 
 /// Publishes a sidecar after its binary table, invalidating hierarchy summaries first.
@@ -393,13 +480,13 @@ pub(crate) fn read_record(location: &Location, id: &TableId) -> EgtResult<StatsR
         StatsRecord::Complete(stats) => stats
             .validate(id)
             .map_err(|error| location.invalid_data(&key, error))?,
-        StatsRecord::Missing(_) if record != StatsRecord::missing(id)? => {
+        StatsRecord::Missing { .. } if record != StatsRecord::missing(id)? => {
             return Err(location.invalid_data(
                 &key,
                 "placeholder identity or index range does not match table",
             ));
         }
-        StatsRecord::Missing(_) => {}
+        StatsRecord::Missing { .. } => {}
     }
     Ok(record)
 }
@@ -408,7 +495,7 @@ pub(crate) fn read_record(location: &Location, id: &TableId) -> EgtResult<StatsR
 pub(crate) fn read_stats(location: &Location, id: &TableId) -> EgtResult<EgtStats> {
     match read_record(location, id)? {
         StatsRecord::Complete(stats) => Ok(stats),
-        StatsRecord::Missing(_) => Err(invalid_data("requested statistics are unavailable")),
+        StatsRecord::Missing { .. } => Err(invalid_data("requested statistics are unavailable")),
     }
 }
 
@@ -418,30 +505,16 @@ impl EgtStats {
         if self.tablename != id.name().as_str()
             || self.sha256.len() != 64
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || self.bytes == 0
+            || self.totals.bytes == 0
             || self.index_range == 0
             || self.frame_size != frame_size
-            || self.num_frames != self.index_range.div_ceil(self.frame_size)
+            || self.totals.num_frames != self.index_range.div_ceil(self.frame_size)
         {
             return Err(invalid_data(
                 "invalid table identity, SHA-256, or frame geometry",
             ));
         }
-        validate_outcomes(
-            self.index_range,
-            self.unique_positions,
-            self.win,
-            self.draw,
-            self.loss,
-            [
-                self.invalid_opposite_check,
-                self.invalid_ep_squares_occupied,
-                self.invalid_illegal_ep_capture,
-                self.redundant,
-            ],
-        )?;
-        validate_distribution(&self.histogram_win, self.win, &self.longest_dtc_win)?;
-        validate_distribution(&self.histogram_loss, self.loss, &self.longest_dtc_loss)
+        self.totals.validate(self.index_range)
     }
 }
 
@@ -506,25 +579,27 @@ mod tests {
     fn stats() -> EgtStats {
         EgtStats {
             tablename: "KQ_K".into(),
-            bytes: 100,
             sha256: "ab".repeat(32),
             index_range: 16,
             frame_size: Egt::new(&TableId::parse("KQ_K").unwrap())
                 .unwrap()
                 .frame_size(),
-            num_frames: 1,
-            unique_positions: 6,
-            win: 3,
-            draw: 1,
-            loss: 2,
-            invalid_opposite_check: 1,
-            invalid_ep_squares_occupied: 2,
-            invalid_illegal_ep_capture: 3,
-            redundant: 4,
-            histogram_win: BTreeMap::from([(1, 1), (3, 2)]),
-            histogram_loss: BTreeMap::from([(0, 1), (2, 1)]),
-            longest_dtc_win: vec![example("win", 3)],
-            longest_dtc_loss: vec![example("loss", 2)],
+            totals: Totals {
+                bytes: 100,
+                num_frames: 1,
+                unique_positions: 6,
+                win: 3,
+                draw: 1,
+                loss: 2,
+                invalid_opposite_check: 1,
+                invalid_ep_squares_occupied: 2,
+                invalid_illegal_ep_capture: 3,
+                redundant: 4,
+                histogram_win: BTreeMap::from([(1, 1), (3, 2)]),
+                histogram_loss: BTreeMap::from([(0, 1), (2, 1)]),
+                longest_dtc_win: vec![example("win", 3)],
+                longest_dtc_loss: vec![example("loss", 2)],
+            },
         }
     }
 
@@ -605,8 +680,8 @@ mod tests {
         assert_eq!(direct, aggregate(&[StatsRecord::Complete(stats())]));
         let low = StatsRecord::Complete(stats());
         let mut high = stats();
-        high.histogram_win = BTreeMap::from([(5, 3)]);
-        high.longest_dtc_win = vec![example("b", 5), example("a", 5), example("a", 5)];
+        high.totals.histogram_win = BTreeMap::from([(5, 3)]);
+        high.totals.longest_dtc_win = vec![example("b", 5), example("a", 5), example("a", 5)];
         let high = StatsRecord::Complete(high);
         let total = aggregate(&[low.clone(), high.clone()]);
         assert_eq!(total, aggregate(&[high.clone(), low.clone()]));
@@ -618,18 +693,19 @@ mod tests {
             ),
             (2, 2, 32)
         );
-        assert_eq!((total.bytes, total.unique_positions), (Some(200), Some(12)));
-        assert_eq!(total.invalid_opposite_check, Some(2));
-        assert_eq!(total.invalid_ep_squares_occupied, Some(4));
-        assert_eq!(total.invalid_illegal_ep_capture, Some(6));
-        assert_eq!(total.redundant, Some(8));
+        let totals = total.totals.as_ref().unwrap();
+        assert_eq!((totals.bytes, totals.unique_positions), (200, 12));
+        assert_eq!(totals.invalid_opposite_check, 2);
+        assert_eq!(totals.invalid_ep_squares_occupied, 4);
+        assert_eq!(totals.invalid_illegal_ep_capture, 6);
+        assert_eq!(totals.redundant, 8);
         assert_eq!(
-            total.histogram_win,
-            Some(BTreeMap::from([(1, 1), (3, 2), (5, 3)]))
+            totals.histogram_win,
+            BTreeMap::from([(1, 1), (3, 2), (5, 3)])
         );
         assert_eq!(
-            total.longest_dtc_win,
-            Some(vec![example("a", 5), example("b", 5)])
+            totals.longest_dtc_win,
+            vec![example("a", 5), example("b", 5)]
         );
         let mut merged = aggregate(&[low]);
         merged.merge(&aggregate(&[high]));
@@ -641,12 +717,14 @@ mod tests {
         ] {
             let total = aggregate(&records);
             assert_eq!((total.selected_tables, total.available_tables), (2, 1));
-            assert_eq!(total.index_range, stats().index_range + missing.index_range());
-            for (key, value) in serde_json::to_value(total).unwrap().as_object().unwrap() {
-                if !["selected_tables", "available_tables", "index_range"].contains(&key.as_str()) {
-                    assert!(value.is_null(), "{key}");
-                }
-            }
+            assert_eq!(
+                total.index_range,
+                stats().index_range + missing.index_range()
+            );
+            assert_eq!(
+                serde_json::to_value(total).unwrap()["totals"],
+                serde_json::Value::Null
+            );
         }
     }
 
@@ -688,19 +766,19 @@ mod tests {
         invalid.sha256.clear();
         assert!(invalid.validate(&id).is_err());
         invalid = stats();
-        invalid.histogram_win.insert(9, 1);
+        invalid.totals.histogram_win.insert(9, 1);
         assert!(invalid.validate(&id).is_err());
         invalid = stats();
-        invalid.longest_dtc_win[0].ply = 1;
+        invalid.totals.longest_dtc_win[0].ply = 1;
         assert!(invalid.validate(&id).is_err());
         let mut total = aggregate(&[StatsRecord::Complete(stats())]);
         total.available_tables = 0;
         assert!(total.validate().is_err());
         total = aggregate(&[StatsRecord::Complete(stats())]);
-        total.win = Some(0);
+        total.totals.as_mut().unwrap().win = 0;
         assert!(total.validate().is_err());
         total = AggregateStats::default();
-        total.bytes = Some(1);
+        total.totals.as_mut().unwrap().bytes = 1;
         assert!(total.validate().is_err());
     }
 
@@ -717,29 +795,33 @@ mod tests {
                 serde_json::from_value::<AggregateStats>(json.clone()).unwrap(),
                 total
             );
-            for field in PARTITION_FIELDS {
-                assert!(json.get(field).is_some(), "{field}");
-                let mut invalid = json.clone();
-                invalid.as_object_mut().unwrap().remove(field);
-                assert!(
-                    serde_json::from_value::<AggregateStats>(invalid).is_err(),
-                    "{field}"
-                );
-                let mut invalid = json.clone();
-                invalid[field] = if json[field].is_null() {
-                    0.into()
-                } else {
-                    serde_json::Value::Null
-                };
-                let invalid: AggregateStats = serde_json::from_value(invalid).unwrap();
-                assert!(invalid.validate().is_err(), "{field}");
+            let mut missing = json.clone();
+            missing.as_object_mut().unwrap().remove("totals");
+            assert!(serde_json::from_value::<AggregateStats>(missing).is_err());
+            let mut inconsistent = json.clone();
+            inconsistent["totals"] = if total.totals.is_some() {
+                serde_json::Value::Null
+            } else {
+                serde_json::to_value(Totals::default()).unwrap()
+            };
+            assert!(
+                serde_json::from_value::<AggregateStats>(inconsistent)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            if total.totals.is_some() {
+                for field in PARTITION_FIELDS {
+                    let mut invalid = json.clone();
+                    invalid["totals"].as_object_mut().unwrap().remove(field);
+                    assert!(serde_json::from_value::<AggregateStats>(invalid.clone()).is_err());
+                    invalid["totals"][field] = serde_json::Value::Null;
+                    assert!(serde_json::from_value::<AggregateStats>(invalid).is_err());
+                }
             }
             let mut old = json;
-            let fields = old.as_object_mut().unwrap();
-            for field in PARTITION_FIELDS {
-                fields.remove(field);
-            }
-            fields.insert("invalid_or_redundant".into(), serde_json::Value::Null);
+            old.as_object_mut().unwrap().remove("totals");
+            old["bytes"] = serde_json::Value::Null;
             assert!(serde_json::from_value::<AggregateStats>(old).is_err());
         }
     }
@@ -756,7 +838,7 @@ mod tests {
 
                 let mut json =
                     serde_json::to_value(aggregate(&[StatsRecord::Complete(stats())])).unwrap();
-                json[field] = count.into();
+                json["totals"][field] = count.into();
                 let invalid: AggregateStats = serde_json::from_value(json).unwrap();
                 assert!(invalid.validate().is_err(), "{field}: {count}");
             }

@@ -46,11 +46,11 @@ impl Tablebase {
         }
         let lowest_compression = results
             .iter()
-            .filter(|stats| stats.unique_positions > 0)
+            .filter(|stats| stats.totals.unique_positions > 0)
             .map(|stats| {
                 (
                     stats.tablename.as_str(),
-                    stats.bytes as f64 * 8.0 / stats.unique_positions as f64,
+                    stats.totals.bytes as f64 * 8.0 / stats.totals.unique_positions as f64,
                 )
             })
             .max_by(|a, b| a.1.total_cmp(&b.1));
@@ -182,9 +182,9 @@ mod tests {
             let mut totals = [0usize; 5];
             for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
                 let stats = crate::stats::read_stats(&location, &id).unwrap();
-                let excluded = stats.invalid_opposite_check
-                                    + stats.invalid_ep_squares_occupied + stats.invalid_illegal_ep_capture + stats.redundant;
-                                let counts = [stats.index_range, stats.win, stats.draw, stats.loss, excluded];
+                let excluded = stats.totals.invalid_opposite_check
+                                    + stats.totals.invalid_ep_squares_occupied + stats.totals.invalid_illegal_ep_capture + stats.totals.redundant;
+                                let counts = [stats.index_range, stats.totals.win, stats.totals.draw, stats.totals.loss, excluded];
                 for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
             }
             totals

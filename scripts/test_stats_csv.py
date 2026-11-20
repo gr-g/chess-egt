@@ -1,5 +1,6 @@
 """Standard-library tests for local metadata CSV exports; no tablebases needed."""
 
+from copy import deepcopy
 import csv
 import json
 from pathlib import Path
@@ -63,9 +64,8 @@ class StatsCsvTests(unittest.TestCase):
             "available_tables": len(complete),
             "index_range": sum(record["index_range"] for record in records),
         }
-        for key in OUTCOMES:
-            stats[key] = (sum(record[key] for record in complete)
-                          if len(complete) == len(records) else None)
+        stats["totals"] = ({key: sum(record[key] for record in complete) for key in OUTCOMES}
+                           if len(complete) == len(records) else None)
         summary = {"hierarchy": relative + "/", "stats": stats}
         self.put_json(leaf / "stats.json", summary)
         return leaf, summary
@@ -262,8 +262,9 @@ class StatsCsvTests(unittest.TestCase):
         leaf, summary = self.make_leaf([self.complete()])
         for key in ("selected_tables", "available_tables", "index_range", *OUTCOMES):
             with self.subTest(key=key):
-                changed = {**summary, "stats": dict(summary["stats"])}
-                changed["stats"][key] += 1
+                changed = deepcopy(summary)
+                target = changed["stats"]["totals"] if key in OUTCOMES else changed["stats"]
+                target[key] += 1
                 self.put_json(leaf / "stats.json", changed)
                 with self.assertRaisesRegex(ValueError, "refresh --cache-stats"):
                     leaf_stats.leaf_row(self.root, leaf)
@@ -284,19 +285,18 @@ class StatsCsvTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid hierarchy summary"):
                     leaf_stats.leaf_row(self.root, leaf)
 
-    def test_incomplete_summary_requires_explicit_null_outcomes(self):
+    def test_incomplete_summary_requires_explicit_null_totals(self):
         leaf, summary = self.make_leaf([self.complete(), self.placeholder()])
-        for key in OUTCOMES:
-            for missing in (False, True):
-                with self.subTest(key=key, missing=missing):
-                    changed = {**summary, "stats": dict(summary["stats"])}
-                    if missing:
-                        del changed["stats"][key]
-                    else:
-                        changed["stats"][key] = 0
-                    self.put_json(leaf / "stats.json", changed)
-                    with self.assertRaisesRegex(ValueError, "incomplete summary"):
-                        leaf_stats.leaf_row(self.root, leaf)
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                changed = deepcopy(summary)
+                if missing:
+                    del changed["stats"]["totals"]
+                else:
+                    changed["stats"]["totals"] = dict.fromkeys(OUTCOMES, 0)
+                self.put_json(leaf / "stats.json", changed)
+                with self.assertRaisesRegex(ValueError, "incomplete summary"):
+                    leaf_stats.leaf_row(self.root, leaf)
 
     def test_invalid_sidecar_fields_are_rejected(self):
         leaf, _ = self.make_leaf([self.complete()])
@@ -348,8 +348,9 @@ class StatsCsvTests(unittest.TestCase):
                 invalid += (0,)
             for value in invalid:
                 with self.subTest(key=key, value=value):
-                    changed = {**summary, "stats": dict(summary["stats"])}
-                    changed["stats"][key] = value
+                    changed = deepcopy(summary)
+                    target = changed["stats"]["totals"] if key in OUTCOMES else changed["stats"]
+                    target[key] = value
                     self.put_json(leaf / "stats.json", changed)
                     with self.assertRaisesRegex(ValueError, "invalid " + key):
                         leaf_stats.leaf_row(self.root, leaf)
