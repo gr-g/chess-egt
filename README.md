@@ -481,7 +481,7 @@ position. In pawnless tables, symmetry reduction can change how often a move
 is encountered during backward propagation. Initialization and propagation
 adjust counter updates accordingly. For the formal explanation, see
 "Move counters and diagonal symmetry" in the module documentation in
-[`src/generator/solver.rs`](src/generator/solver.rs).
+[`src/generator/unmoves.rs`](src/generator/unmoves.rs).
 
 #### Initialization phase
 Both tables in the pair being generated are initialized independently. For each of them, a full scan of the table is performed:

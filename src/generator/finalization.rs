@@ -8,10 +8,11 @@ use std::sync::atomic::AtomicU16;
 use rayon::prelude::*;
 
 use self::stats::TableStats;
-use crate::outcome::PackedOutcome;
+use super::WinLoss;
 use crate::egt::Egt;
 use crate::egt_file::writer::{COMPRESSION_LEVEL, CompressedSegment, EgtFileWriter, encode_frame};
 use crate::error::{EgtError, EgtResult};
+use crate::outcome::PackedOutcome;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, write_stats};
 use crate::storage::Location;
@@ -22,7 +23,7 @@ fn finalize_batch(
     start: usize,
     egt: &Egt,
     frame_size: usize,
-    maxima: [u16; 2],
+    maxima: WinLoss<u16>,
 ) -> EgtResult<(CompressedSegment, TableStats)> {
     let mut data = Vec::new();
     let mut encoder = zeekstd::EncodeOptions::new()
@@ -45,8 +46,7 @@ fn finalize_batch(
                 outcome,
                 start + frame_idx * frame_size + offset,
                 egt,
-                maxima[0],
-                maxima[1],
+                maxima,
             );
             plain.push(outcome);
         }
@@ -74,7 +74,7 @@ pub(super) fn finalize_table(
     id: &TableId,
     egt: &Egt,
     mut values: Vec<AtomicU16>,
-    maxima: [u16; 2],
+    maxima: WinLoss<u16>,
     invalid: InvalidCounts,
 ) -> EgtResult<EgtStats> {
     if values.len() != egt.index_range() {
@@ -118,7 +118,7 @@ mod tests {
                 &id,
                 &egt,
                 Vec::new(),
-                [0, 0],
+                WinLoss::default(),
                 InvalidCounts::default()
             ),
             Err(EgtError::Internal("completed table has wrong length"))

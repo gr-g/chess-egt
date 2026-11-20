@@ -248,7 +248,7 @@ remaining work is to narrow the exports around that API.
 
 ---
 
-## 5. Reorganize the generator
+## 5. Reorganize the generator (done)
 
 **Problem.** `src/generator/solver.rs` (about 800 lines of code and 850 of
 tests) mixes several things:

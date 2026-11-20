@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use shakmaty::{Chess, Color, MoveList, Position};
 
 use crate::egt_file::BatchReader;
-use crate::stats::format_timing;
+use crate::report::format_timing;
 use crate::table_id::TableId;
 use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, Tablebase, resolve_selectors};
 

@@ -4,8 +4,9 @@ use std::collections::BTreeMap;
 
 use shakmaty::{Color, EnPassantMode, fen::Epd};
 
-use crate::outcome::PackedOutcome;
+use super::WinLoss;
 use crate::egt::Egt;
+use crate::outcome::PackedOutcome;
 use crate::position::InvalidCounts;
 use crate::stats::{EgtStats, LongestDtcPosition};
 
@@ -16,8 +17,8 @@ pub(super) struct TableStats {
     draw: usize,
     loss: usize,
     redundant: usize,
-    histograms: [BTreeMap<u16, usize>; 2],
-    candidates: [Vec<usize>; 2],
+    histograms: WinLoss<BTreeMap<u16, usize>>,
+    candidates: WinLoss<Vec<usize>>,
 }
 
 impl TableStats {
@@ -27,8 +28,7 @@ impl TableStats {
         outcome: PackedOutcome,
         local_idx: usize,
         egt: &Egt,
-        max_win: u16,
-        max_loss: u16,
+        maxima: WinLoss<u16>,
     ) {
         // Statistics exclude the redundant half even though compression retains it.
         if let Some(other_idx) = egt.diagonal_symmetric(local_idx)
@@ -37,12 +37,20 @@ impl TableStats {
             self.redundant += 1;
             return;
         }
-        let side = if outcome.is_win() {
+        let (histogram, candidates, max) = if outcome.is_win() {
             self.win += 1;
-            0
+            (
+                &mut self.histograms.win,
+                &mut self.candidates.win,
+                (maxima.win > 0).then_some(maxima.win),
+            )
         } else if outcome.is_loss() {
             self.loss += 1;
-            1
+            (
+                &mut self.histograms.loss,
+                &mut self.candidates.loss,
+                Some(maxima.loss),
+            )
         } else {
             if outcome.is_draw() {
                 self.draw += 1;
@@ -50,9 +58,9 @@ impl TableStats {
             return;
         };
         let ply = outcome.plies();
-        *self.histograms[side].entry(ply).or_default() += 1;
-        if (side == 0 && ply == max_win && max_win > 0) || (side == 1 && ply == max_loss) {
-            self.candidates[side].push(local_idx);
+        *histogram.entry(ply).or_default() += 1;
+        if max == Some(ply) {
+            candidates.push(local_idx);
         }
     }
 
@@ -64,26 +72,27 @@ impl TableStats {
             self.draw += part.draw;
             self.loss += part.loss;
             self.redundant += part.redundant;
-            for (side, (histogram, candidates)) in
-                part.histograms.into_iter().zip(part.candidates).enumerate()
-            {
-                for (ply, count) in histogram {
-                    *self.histograms[side].entry(ply).or_default() += count;
+            for (histogram, other) in [
+                (&mut self.histograms.win, part.histograms.win),
+                (&mut self.histograms.loss, part.histograms.loss),
+            ] {
+                for (ply, count) in other {
+                    *histogram.entry(ply).or_default() += count;
                 }
-                self.candidates[side].extend(candidates);
             }
+            self.candidates.win.extend(part.candidates.win);
+            self.candidates.loss.extend(part.candidates.loss);
         }
     }
 
     pub(super) fn build(
         self,
         egt: &Egt,
-        maxima: [u16; 2],
+        maxima: WinLoss<u16>,
         invalid: InvalidCounts,
         bytes: u64,
         sha256: String,
     ) -> EgtStats {
-        let [win_candidates, loss_candidates] = self.candidates;
         let materialize = |candidates: Vec<usize>, ply| {
             candidates
                 .into_iter()
@@ -96,7 +105,6 @@ impl TableStats {
                 })
                 .collect()
         };
-        let [histogram_win, histogram_loss] = self.histograms;
         EgtStats {
             tablename: egt.id().to_string(),
             bytes,
@@ -112,10 +120,10 @@ impl TableStats {
             invalid_ep_squares_occupied: invalid.ep_squares_occupied,
             invalid_illegal_ep_capture: invalid.illegal_ep_capture,
             redundant: self.redundant,
-            histogram_win,
-            histogram_loss,
-            longest_dtc_win: materialize(win_candidates, maxima[0]),
-            longest_dtc_loss: materialize(loss_candidates, maxima[1]),
+            histogram_win: self.histograms.win,
+            histogram_loss: self.histograms.loss,
+            longest_dtc_win: materialize(self.candidates.win, maxima.win),
+            longest_dtc_loss: materialize(self.candidates.loss, maxima.loss),
         }
     }
 }
@@ -150,7 +158,7 @@ mod tests {
                 // A synthetic invalid outcome at a legal index must not be decoded.
                 (w, PackedOutcome::INVALID),
             ] {
-                stats.record_outcome(outcome, local_idx, &egt, 5, 3);
+                stats.record_outcome(outcome, local_idx, &egt, WinLoss { win: 5, loss: 3 });
             }
             stats
         };
@@ -161,15 +169,15 @@ mod tests {
             part(idx[2], idx[1], 5, 3),
         ]);
         totals.merge([part(idx[0], idx[1], 4, 2), part(idx[0], idx[5], 5, 3)]);
-        assert_eq!(totals.candidates[0], [idx[4], idx[2], idx[0]]);
-        assert_eq!(totals.candidates[1], [idx[3], idx[1], idx[5]]);
+        assert_eq!(totals.candidates.win, [idx[4], idx[2], idx[0]]);
+        assert_eq!(totals.candidates.loss, [idx[3], idx[1], idx[5]]);
         assert_eq!((totals.win, totals.draw, totals.loss), (5, 5, 5));
         assert_eq!(
-            totals.histograms[0],
+            totals.histograms.win,
             BTreeMap::from([(0, 1), (4, 1), (5, 3)])
         );
         assert_eq!(
-            totals.histograms[1],
+            totals.histograms.loss,
             BTreeMap::from([(0, 1), (2, 1), (3, 3)])
         );
     }
@@ -185,14 +193,16 @@ mod tests {
         let mut totals = TableStats::default();
         for _ in 0..2 {
             let mut part = TableStats::default();
-            part.record_outcome(PackedOutcome::INVALID, 0, &egt, 0, 0);
+            part.record_outcome(PackedOutcome::INVALID, 0, &egt, WinLoss::default());
             totals.merge([part, TableStats::default()]);
         }
         assert_eq!(totals.redundant, 0);
         assert_eq!(totals.win + totals.draw + totals.loss, 0);
-        assert!(totals.histograms.iter().all(BTreeMap::is_empty));
-        assert!(totals.candidates.iter().all(Vec::is_empty));
-        let stats = totals.build(&egt, [0, 0], invalid, 0, String::new());
+        assert!(totals.histograms.win.is_empty());
+        assert!(totals.histograms.loss.is_empty());
+        assert!(totals.candidates.win.is_empty());
+        assert!(totals.candidates.loss.is_empty());
+        let stats = totals.build(&egt, WinLoss::default(), invalid, 0, String::new());
         assert_eq!(stats.frame_size, egt.frame_size());
         assert_eq!(stats.num_frames, egt.index_range().div_ceil(egt.frame_size()));
         assert_eq!(stats.invalid_opposite_check, invalid.opposite_check);
@@ -218,22 +228,18 @@ mod tests {
             PackedOutcome::new_win(ConversionType::Capture, 0),
             idx,
             &egt,
-            0,
-            0,
+            WinLoss::default(),
         );
         stats.record_outcome(
             PackedOutcome::new_loss(ConversionType::Checkmate, 0),
             idx,
             &egt,
-            0,
-            0,
+            WinLoss::default(),
         );
-        assert!(stats.candidates[0].is_empty());
-        assert_eq!(stats.candidates[1], [idx]);
-        assert_eq!(
-            stats.histograms,
-            [BTreeMap::from([(0, 1)]), BTreeMap::from([(0, 1)])]
-        );
+        assert!(stats.candidates.win.is_empty());
+        assert_eq!(stats.candidates.loss, [idx]);
+        assert_eq!(stats.histograms.win, BTreeMap::from([(0, 1)]));
+        assert_eq!(stats.histograms.loss, BTreeMap::from([(0, 1)]));
     }
 
     #[test]
@@ -246,17 +252,17 @@ mod tests {
             })
             .unwrap();
         let mut stats = TableStats::default();
+        let maxima = WinLoss { win: 5, loss: 0 };
         stats.record_outcome(
             PackedOutcome::new_win(ConversionType::Checkmate, 5),
             idx,
             &egt,
-            5,
-            0,
+            maxima,
         );
-        stats.record_outcome(PackedOutcome::INVALID, idx, &egt, 5, 0);
+        stats.record_outcome(PackedOutcome::INVALID, idx, &egt, maxima);
         assert_eq!(stats.redundant, 2);
         assert_eq!(stats.win, 0);
-        assert!(stats.histograms[0].is_empty());
-        assert!(stats.candidates[0].is_empty());
+        assert!(stats.histograms.win.is_empty());
+        assert!(stats.candidates.win.is_empty());
     }
 }

@@ -44,6 +44,7 @@ mod error;
 mod generator;
 mod outcome;
 mod position;
+mod report;
 mod selection;
 mod stats;
 mod storage;
