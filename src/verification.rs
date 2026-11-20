@@ -107,9 +107,7 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
     for (relative_idx, outcome_maybe) in outcomes.iter().copied().enumerate() {
         let local_idx = start + relative_idx;
         let index = local_idx;
-        let position_opt = egt.position_from_index(local_idx, Color::White);
-
-        if position_opt.is_none() {
+        let Some(position) = egt.position_from_index(local_idx, Color::White) else {
             if !outcome_maybe.is_invalid() {
                 return Err(fail(
                     local_idx,
@@ -117,7 +115,7 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
                 ));
             }
             continue;
-        }
+        };
 
         if outcome_maybe.is_invalid() {
             return Err(fail(local_idx, "index is valid but outcome is invalid"));
@@ -130,10 +128,8 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
         {
             unique_positions += 1;
         }
-        let position = position_opt.ok_or(EgtError::Internal(
-            "position_opt should be Some after the None check",
-        ))?;
-        let outcome = outcome_maybe.to_outcome_at(index)?;
+        let outcome = DtcOutcome::try_from(outcome_maybe)
+            .map_err(|value| EgtError::CorruptedOutcome { value, index })?;
         let legals = position.legal_moves();
 
         if legals.is_empty() {
@@ -187,9 +183,7 @@ fn best_outcome(
         }
     }
 
-    best_value.ok_or(EgtError::Internal(
-        "best_value should be Some when legals is non-empty",
-    ))
+    Ok(best_value.expect("best_value should be Some when legals is non-empty"))
 }
 
 /// Builds a human-readable diagnostic for a mismatch between the outcome

@@ -2,8 +2,6 @@ use std::cmp::Ordering;
 
 use shakmaty::Move;
 
-use crate::{EgtError, EgtResult};
-
 /// Conversion types in increasing order of preference for a win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConversionType {
@@ -143,18 +141,18 @@ impl PackedOutcome {
     pub fn new_unknown(counter: u16) -> Self {
         Self(counter << 3)
     }
+}
 
-    /// Decodes an assigned outcome. Invalid and unknown entries return
-    /// [`EgtError::CorruptedOutcome`], with `index` as table-local error context.
-    pub fn to_outcome_at(self, index: usize) -> EgtResult<DtcOutcome> {
-        match self.0 & 0b111 {
-            0 => Err(EgtError::CorruptedOutcome {
-                value: self.0,
-                index,
-            }),
-            1 => Ok(DtcOutcome::Draw),
-            _ if self.0 & 1 == 0 => Ok(DtcOutcome::Win(self.conversion_type(), self.plies())),
-            _ => Ok(DtcOutcome::Loss(self.conversion_type(), self.plies())),
+impl TryFrom<PackedOutcome> for DtcOutcome {
+    type Error = u16;
+
+    /// Decodes an assigned outcome, returning the raw value for invalid or unknown entries.
+    fn try_from(packed: PackedOutcome) -> Result<Self, Self::Error> {
+        match packed.0 & 0b111 {
+            0 => Err(packed.0),
+            1 => Ok(Self::Draw),
+            _ if packed.0 & 1 == 0 => Ok(Self::Win(packed.conversion_type(), packed.plies())),
+            _ => Ok(Self::Loss(packed.conversion_type(), packed.plies())),
         }
     }
 }
@@ -187,13 +185,13 @@ mod tests {
                 ] {
                     assert_eq!(PackedOutcome::from_u16(packed.to_u16()), packed);
                     assert_eq!((packed.plies(), packed.conversion_type()), (n, ct));
-                    assert_eq!(packed.to_outcome_at(42).unwrap(), outcome);
+                    assert_eq!(DtcOutcome::try_from(packed).unwrap(), outcome);
                 }
             }
         }
         for raw in [1, 9, 65529] {
             let packed = PackedOutcome::from_u16(raw);
-            assert_eq!(packed.to_outcome_at(42).unwrap(), Draw);
+            assert_eq!(DtcOutcome::try_from(packed).unwrap(), Draw);
             assert_eq!(packed.is_draw(), raw == 1);
         }
         assert!(PackedOutcome::INVALID.is_invalid());
@@ -201,10 +199,9 @@ mod tests {
             let unknown = PackedOutcome::new_unknown(n);
             assert!(unknown.is_unknown() && !unknown.is_assigned());
             assert_eq!(unknown.get_unknown_counter(), n);
-            assert!(matches!(unknown.to_outcome_at(42),
-                Err(EgtError::CorruptedOutcome { value, index: 42 }) if value == n << 3));
+            assert_eq!(DtcOutcome::try_from(unknown), Err(n << 3));
         }
-        assert!(PackedOutcome::INVALID.to_outcome_at(42).is_err());
+        assert!(DtcOutcome::try_from(PackedOutcome::INVALID).is_err());
     }
 
     #[test]

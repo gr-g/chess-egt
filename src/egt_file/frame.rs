@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, io, ops::Range};
+use std::{cmp::Reverse, ops::Range};
 
 use crate::outcome::PackedOutcome;
 use crate::{EgtError, EgtResult};
@@ -11,7 +11,7 @@ pub(crate) struct Frame {
 }
 
 fn invalid(message: &'static str) -> EgtError {
-    io::Error::new(io::ErrorKind::InvalidData, message).into()
+    EgtError::invalid_data("tablebase frame", message)
 }
 
 fn serialized_length(d: usize, len: usize) -> u128 {

@@ -27,11 +27,6 @@ pub enum EgtError {
     #[error("index {index} out of range [0, {range})")]
     IndexOutOfRange { index: usize, range: usize },
 
-    /// A position does not map to a valid index in the table (e.g. pawns on
-    /// unexpected files, no matching sub-table).
-    #[error("position does not map to a valid index in table {table:?}")]
-    PositionNotInTable { table: String },
-
     /// An outcome value read from disk is corrupted (invalid bit pattern).
     #[error("corrupted outcome value 0x{value:04x} at index {index}")]
     CorruptedOutcome { value: u16, index: usize },
@@ -40,15 +35,17 @@ pub enum EgtError {
     #[error("egt file not found: {0}")]
     FileNotFound(String),
 
-        #[error("invalid storage location: {0}")]
-        InvalidStorageLocation(String),
+    /// A storage location could not be parsed or is unsupported.
+    #[error("invalid storage location: {0}")]
+    InvalidStorageLocation(String),
 
-        #[error("storage operation failed for {location}: {source}")]
-        Storage {
-            location: String,
-            #[source]
-            source: object_store::Error,
-        },
+    /// The storage backend failed to access or update an artifact.
+    #[error("storage operation failed for {location}: {source}")]
+    Storage {
+        location: String,
+        #[source]
+        source: object_store::Error,
+    },
 
     /// A stored binary or JSON artifact is malformed. The source retains parse
     /// or validation details; location may also identify a frame or index range.
@@ -100,4 +97,17 @@ pub enum EgtError {
     /// bugs are debuggable without crashing the process.
     #[error("internal error: {0}")]
     Internal(&'static str),
+}
+
+impl EgtError {
+    pub(crate) fn invalid_data(location: impl Into<String>, source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::InvalidData { location: location.into(), source: source.into() }
+    }
+
+    pub(crate) fn into_data_source(self) -> Box<dyn std::error::Error + Send + Sync> {
+        match self {
+            Self::InvalidData { source, .. } => source,
+            other => Box::new(other),
+        }
+    }
 }

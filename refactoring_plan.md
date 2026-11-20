@@ -402,7 +402,7 @@ four places:
 
 ---
 
-## 8. Tighten errors (`src/error.rs`)
+## 8. Tighten errors (`src/error.rs`) (done)
 
 **Problem.**
 - `EgtError::Internal` appears 47 times: 22 in `egt_file/cache.rs`, mostly

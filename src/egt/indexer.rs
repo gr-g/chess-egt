@@ -67,7 +67,6 @@
 use shakmaty::{Color, File, Piece, Rank, Role, Square, Setup, CastlingMode, Position, Chess};
 use arrayvec::ArrayVec;
 use crate::table_id::{EgtSide, MAX_PIECES, NONPAWN_ROLES, TableId, sides};
-use crate::error::EgtResult;
 use std::cmp::Reverse;
 
 
@@ -467,7 +466,7 @@ impl Indexer {
     }
 
     /// Decode an in-range index, retaining its rejection reason for initialization.
-    pub(super) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
+    pub(super) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
         crate::position::position_from_setup(self.setup_from_index(index, side_to_move))
     }
 
@@ -635,7 +634,7 @@ impl Indexer {
 
     fn position_from_setup<const VALIDATE: bool>(setup: Setup) -> Option<Chess> {
         if VALIDATE {
-            crate::position::position_from_setup(setup).expect("invalid indexing invariant").ok()
+            crate::position::position_from_setup(setup).ok()
         } else {
             Some(Chess::from_setup_unchecked(setup, CastlingMode::Standard))
         }
@@ -824,7 +823,7 @@ mod tests {
     fn assert_decoder_matches(indexer: &Indexer, index: usize, turn: Color) -> Option<Chess> {
         let expected = checked_position_from_setup(indexer.setup_from_index(index, turn));
         assert_eq!(indexer.position_from_index(index, turn), expected, "index {index}, {turn:?}");
-        assert_eq!(indexer.position_from_index_with_reason(index, turn).unwrap().is_err(), expected.is_none(),
+        assert_eq!(indexer.position_from_index_with_reason(index, turn).is_err(), expected.is_none(),
             "invalidity at index {index}, {turn:?}");
         if let Some(position) = &expected {
             assert_eq!(indexer.position_from_index_unchecked(index, turn), *position);

@@ -80,7 +80,7 @@ impl Egt {
     }
 
     /// Decodes an in-range index, retaining its rejection reason for initialization.
-    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> EgtResult<Result<Chess, crate::position::InvalidPosition>> {
+    pub(crate) fn position_from_index_with_reason(&self, index: usize, side_to_move: Color) -> Result<Chess, crate::position::InvalidPosition> {
         self.indexer.position_from_index_with_reason(index, side_to_move)
     }
 
@@ -240,7 +240,7 @@ mod tests {
                 let mut accepted = 0;
                 for index in (0..egt.index_range()).step_by((egt.index_range() / 256).max(1)) {
                     let decoded = egt.position_from_index(index, turn);
-                    assert_eq!(egt.position_from_index_with_reason(index, turn).unwrap().ok(), decoded);
+                    assert_eq!(egt.position_from_index_with_reason(index, turn).ok(), decoded);
                     if let Some(position) = decoded {
                         assert_eq!(egt.position_from_index_unchecked(index, turn), position);
                         accepted += 1;

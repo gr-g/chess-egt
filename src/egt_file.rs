@@ -221,7 +221,7 @@ impl TableFile {
             let encoded_len = table.frame_size_decomp(frame as u32)? as usize;
             decode_frame(&bytes, self.frame_len(frame), encoded_len).map_err(|error| match error {
                 EgtError::WorkingMemoryAllocation { .. } => error,
-                other => self.invalid_frame(frame, other),
+                other => self.invalid_frame(frame, other.into_data_source()),
             })
         }).collect()
     }
@@ -239,8 +239,8 @@ fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<
     // One-shot decoding is bounded by both slices and rejects truncated input.
     // zeekstd's streaming decoder can otherwise loop at premature EOF.
     let decoded = zstd_safe::decompress(&mut data[..], compressed).map_err(|code| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        EgtError::invalid_data(
+            "tablebase frame",
             format!(
                 "invalid compressed tablebase frame: {}",
                 zstd_safe::get_error_name(code)
@@ -248,11 +248,10 @@ fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<
         )
     })?;
     if decoded != data.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(EgtError::invalid_data(
+            "tablebase frame",
             "decompressed tablebase frame has wrong length",
-        )
-        .into());
+        ));
     }
     Frame::decode(data, len)
 }
@@ -471,7 +470,7 @@ mod tests {
             assert_eq!(reader.read_frames(&[frame]).unwrap()[0].get(offset), outcome);
         }
         let prober = crate::Tablebase::new(&dir.0).unwrap();
-        assert_eq!(prober.probe(&position).unwrap(), outcome.to_outcome_at(index).unwrap());
+        assert_eq!(prober.probe(&position).unwrap(), crate::DtcOutcome::try_from(outcome).unwrap());
     }
 
     #[test]

@@ -73,7 +73,7 @@ impl BatchReader {
 
     pub(crate) fn probe_outcome(&self, position: &Chess) -> EgtResult<DtcOutcome> {
         let (index, outcome) = self.probe_indexed(position)?;
-        outcome.to_outcome_at(index)
+        DtcOutcome::try_from(outcome).map_err(|value| EgtError::CorruptedOutcome { value, index })
     }
 
     fn probe_indexed(&self, position: &Chess) -> EgtResult<(usize, PackedOutcome)> {

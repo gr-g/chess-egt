@@ -8,7 +8,7 @@ use shakmaty::Chess;
 use super::{Frame, Source, TableFile};
 use crate::storage::Location;
 use crate::table_id::TableId;
-use crate::{DtcOutcome, EgtResult};
+use crate::{DtcOutcome, EgtError, EgtResult};
 
 #[derive(Debug, Default)]
 struct Lru {
@@ -155,7 +155,8 @@ impl SharedFileCache {
             let ready = self.read_frames(id, &file, &frames)?;
             for ((slot, _), index) in requests.into_iter().zip(indices) {
                 let (frame, offset) = file.locate(index);
-                outcomes[slot] = ready[&frame].get(offset).to_outcome_at(index)?;
+                outcomes[slot] = DtcOutcome::try_from(ready[&frame].get(offset))
+                    .map_err(|value| EgtError::CorruptedOutcome { value, index })?;
             }
         }
         Ok(outcomes)
@@ -172,7 +173,7 @@ impl SharedFileCache {
 mod tests {
     use super::*;
     use crate::outcome::PackedOutcome;
-    use crate::{ConversionType, EgtError};
+    use crate::ConversionType;
     use crate::egt_file::writer::write_fixture;
     use shakmaty::{CastlingMode, fen::Fen};
 

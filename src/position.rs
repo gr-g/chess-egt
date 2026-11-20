@@ -3,7 +3,6 @@
 //! Callers establish one king per color, bounded material, and no castling.
 //! This is not a validator for arbitrary FEN input.
 
-use crate::error::{EgtError, EgtResult};
 use shakmaty::{Board, CastlingMode, Chess, Color, Position, Rank, Role, Setup, Square};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,26 +42,24 @@ impl InvalidCounts {
 /// Indexing guarantees material, pawn ranks, nonoverlap, no castling, and
 /// geometric EP capturers.
 /// Impossible checks are accepted.
-pub(crate) fn position_from_setup(setup: Setup) -> EgtResult<Result<Chess, InvalidPosition>> {
+pub(crate) fn position_from_setup(setup: Setup) -> Result<Chess, InvalidPosition> {
     if opposite_check(&setup.board, setup.turn) {
-        return Ok(Err(InvalidPosition::OppositeCheck));
+        return Err(InvalidPosition::OppositeCheck);
     }
     if let Some(ep) = setup.ep_square {
         let capturers = setup.board.attacks_to(ep, setup.turn, setup.board.occupied())
             & setup.board.pawns();
-        if capturers.is_empty() {
-            return Err(EgtError::Internal("EP target has no geometric pawn capturer"));
-        }
+        debug_assert!(capturers.any(), "EP target has no geometric pawn capturer");
         if !valid_ep_square(&setup) {
-            return Ok(Err(InvalidPosition::EpSquaresOccupied));
+            return Err(InvalidPosition::EpSquaresOccupied);
         }
     }
     let ep_square = setup.ep_square;
     let position = Chess::from_setup_unchecked(setup, CastlingMode::Standard);
     if position.legal_ep_square() != ep_square {
-        return Ok(Err(InvalidPosition::IllegalEpCapture));
+        return Err(InvalidPosition::IllegalEpCapture);
     }
-    Ok(Ok(position))
+    Ok(position)
 }
 
 /// Whether the player not to move is in check. Both kings must be present.
@@ -125,7 +122,7 @@ mod tests {
                     original.clone()
                 };
                 assert_eq!(
-                    position_from_setup(setup).unwrap().err(),
+                    position_from_setup(setup).err(),
                     expected,
                     "{fen}, {mirrored}"
                 );
@@ -141,7 +138,7 @@ mod tests {
             let egt = crate::egt::Egt::new(&id).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
-                match egt.position_from_index_with_reason(index, Color::White).unwrap() {
+                match egt.position_from_index_with_reason(index, Color::White) {
                     Ok(_) => valid += 1,
                     Err(reason) => part.record(reason),
                 }

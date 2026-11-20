@@ -163,7 +163,7 @@ fn read_summary(location: &Location, prefix: &Hierarchy) -> EgtResult<Option<Agg
     summary
         .stats
         .validate()
-        .map_err(|error| location.invalid_data(&key, error))?;
+        .map_err(|error| location.invalid_data(&key, error.into_data_source()))?;
     Ok(Some(summary.stats))
 }
 

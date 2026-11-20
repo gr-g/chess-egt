@@ -3,7 +3,6 @@
 mod cache;
 
 use std::collections::BTreeMap;
-use std::io;
 
 use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
@@ -479,7 +478,7 @@ pub(crate) fn read_record(location: &Location, id: &TableId) -> EgtResult<StatsR
     match &record {
         StatsRecord::Complete(stats) => stats
             .validate(id)
-            .map_err(|error| location.invalid_data(&key, error))?,
+            .map_err(|error| location.invalid_data(&key, error.into_data_source()))?,
         StatsRecord::Missing { .. } if record != StatsRecord::missing(id)? => {
             return Err(location.invalid_data(
                 &key,
@@ -519,7 +518,7 @@ impl EgtStats {
 }
 
 fn invalid_data(reason: &str) -> EgtError {
-    EgtError::Io(io::Error::new(io::ErrorKind::InvalidData, reason))
+    EgtError::invalid_data("statistics", reason)
 }
 
 fn validate_outcomes(
