@@ -486,7 +486,7 @@ pub(super) fn solve_pair(
 mod tests {
     use super::*;
     use crate::Tablebase;
-    use crate::selection::GenerationPlan;
+    use crate::selection::plan_pairs;
     use crate::storage::Location;
     use crate::table_id::TableId;
 
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn pair_local_self_twin_uses_one_working_array() {
-        let pair = &GenerationPlan::new([TableId::parse("K_K").unwrap()]).pairs[0];
+        let pair = &plan_pairs([TableId::parse("K_K").unwrap()])[0];
         let mut tables = std::iter::once(&pair.table).chain(pair.twin.iter())
             .map(|id| TableState::new(Egt::new(id).unwrap()).unwrap())
             .collect::<Vec<_>>();
@@ -676,8 +676,8 @@ mod tests {
             assert_eq!(twin.name().as_str(), twin_name);
             assert_eq!(actual_reflection, reflected);
             for selected in [id, twin] {
-                let plan = GenerationPlan::new([selected]);
-                let pair = &plan.pairs[0];
+                let pairs = plan_pairs([selected]);
+                let pair = &pairs[0];
                 let ids: Vec<_> = std::iter::once(&pair.table).chain(pair.twin.iter()).collect();
                 assert_eq!(ids.len(), if id == twin { 1 } else { 2 });
                 for (slot, source) in ids.iter().enumerate() {

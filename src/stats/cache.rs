@@ -10,7 +10,7 @@ use object_store::{ObjectStoreExt, PutMode, PutOptions};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::selection::{hierarchy_prefixes, resolve_selectors};
+use crate::selection::{Hierarchy, hierarchy_prefixes, resolve_selectors};
 use crate::stats::{AggregateStats, StatsRecord, read_record};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
@@ -63,7 +63,7 @@ fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
         if let Some(summary) = read_summary(location, &prefix)? {
             total.merge(&summary);
         } else {
-            tables.extend(resolve_selectors(&[&prefix])?);
+            tables.extend(prefix.resolve()?);
         }
     }
     visit_records(location, &tables, ReadMode::ReadOnly, |_, record| {
@@ -83,7 +83,7 @@ fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
     let outside: BTreeSet<_> = prefixes
         .iter()
         .flatten()
-        .flat_map(|prefix| ancestors(prefix.trim_end_matches('/')))
+        .flat_map(Hierarchy::ancestors)
         .collect();
     for prefix in outside {
         delete_summary(location, &prefix)?;
@@ -94,24 +94,28 @@ fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
         ReadMode::Create
     };
     let mut total = AggregateStats::default();
-    let mut summaries: BTreeMap<String, AggregateStats> = BTreeMap::new();
+    let mut summaries: BTreeMap<Hierarchy, AggregateStats> = BTreeMap::new();
     visit_records(location, &tables, mode, |id, record| {
         total.add_record(&record);
-        for ancestor in ancestors(&id.relative_path("json")) {
+        let hierarchy = id.hierarchy();
+        for ancestor in hierarchy.ancestors().chain([hierarchy]) {
             if prefixes
                 .iter()
                 .flatten()
-                .any(|prefix| ancestor.starts_with(prefix))
+                .any(|prefix| prefix.contains_hierarchy(&ancestor))
             {
                 summaries.entry(ancestor).or_default().add_record(&record);
             }
         }
     })?;
-    // Reverse lexical order publishes descendants before their parents.
+    // Reverse hierarchy order publishes descendants before their parents.
     for (hierarchy, stats) in summaries.into_iter().rev() {
         stats.validate()?;
-        let key = location.key(&format!("{hierarchy}stats.json"));
-        let bytes = serde_json::to_vec_pretty(&Summary { hierarchy, stats })?;
+        let key = location.key(&summary_path(&hierarchy));
+        let bytes = serde_json::to_vec_pretty(&Summary {
+            hierarchy: hierarchy.to_string(),
+            stats,
+        })?;
         block_on(location.store.put(&key, bytes.into()))
             .map_err(|error| location.error(&key, error))?;
     }
@@ -121,28 +125,27 @@ fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
 
 /// Invalidates the four hierarchy summaries before publishing a table sidecar.
 pub(super) fn invalidate(location: &Location, id: &TableId) -> EgtResult<()> {
-    for prefix in ancestors(&id.relative_path("json")) {
+    let hierarchy = id.hierarchy();
+    for prefix in hierarchy.ancestors().chain([hierarchy]) {
         delete_summary(location, &prefix)?;
     }
     Ok(())
 }
 
-// Input is either a table path or a hierarchy directory without its trailing /.
-fn ancestors(path: &str) -> impl Iterator<Item = String> + '_ {
-    path.match_indices('/')
-        .map(|(index, _)| path[..=index].to_owned())
+fn summary_path(hierarchy: &Hierarchy) -> String {
+    format!("{hierarchy}stats.json")
 }
 
-fn delete_summary(location: &Location, prefix: &str) -> EgtResult<()> {
-    let key = location.key(&format!("{prefix}stats.json"));
+fn delete_summary(location: &Location, prefix: &Hierarchy) -> EgtResult<()> {
+    let key = location.key(&summary_path(prefix));
     match block_on(location.store.delete(&key)) {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
         Err(error) => Err(location.error(&key, error)),
     }
 }
 
-fn read_summary(location: &Location, prefix: &str) -> EgtResult<Option<AggregateStats>> {
-    let key = location.key(&format!("{prefix}stats.json"));
+fn read_summary(location: &Location, prefix: &Hierarchy) -> EgtResult<Option<AggregateStats>> {
+    let key = location.key(&summary_path(prefix));
     let result = match block_on(location.store.get(&key)) {
         Ok(result) => result,
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -151,7 +154,7 @@ fn read_summary(location: &Location, prefix: &str) -> EgtResult<Option<Aggregate
     let bytes = block_on(result.bytes()).map_err(|error| location.error(&key, error))?;
     let summary: Summary =
         serde_json::from_slice(&bytes).map_err(|error| location.invalid_data(&key, error))?;
-    if summary.hierarchy != prefix || summary.stats.selected_tables == 0 {
+    if summary.hierarchy != prefix.to_string() || summary.stats.selected_tables == 0 {
         return Err(location.invalid_data(
             &key,
             "cached summary must match the requested hierarchy and contain tables",
@@ -272,12 +275,13 @@ mod tests {
         assert_eq!(cache(&location, &selectors).unwrap(), expected);
         let mut prefixes = BTreeSet::new();
         for id in resolve_selectors(&["2", "3"]).unwrap() {
-            prefixes.extend(ancestors(&id.relative_path("json")));
+            let hierarchy = id.hierarchy();
+            prefixes.extend(hierarchy.ancestors().chain([hierarchy]));
             put(&location, &id.relative_path("json"), b"broken".to_vec());
         }
         for prefix in prefixes {
             let expected = read_summary(&location, &prefix).unwrap().unwrap();
-            assert_eq!(query(&location, &[&prefix]).unwrap(), expected);
+            assert_eq!(query(&location, &[&prefix.to_string()]).unwrap(), expected);
         }
         assert_eq!(query(&location, &selectors).unwrap(), expected);
         assert!(cache(&location, &selectors).is_err());
@@ -287,24 +291,25 @@ mod tests {
     fn subtree_rebuild_and_placeholder_creation_invalidate_ancestors() {
         let location = location();
         cache(&location, &["3"]).unwrap();
-        let sibling_prefix = "3/2v1/op0/1pawns/";
-        let sibling = read_summary(&location, sibling_prefix).unwrap();
+        let sibling_prefix = Hierarchy::parse("3/2v1/op0/1pawns/").unwrap();
+        let sibling = read_summary(&location, &sibling_prefix).unwrap();
         let prefix = "3/2v1/op0/0pawns/";
         let expected = query(&location, &[prefix]).unwrap();
         let path = format!("{prefix}stats.json");
         put(&location, &path, b"broken".to_vec());
         assert_eq!(cache(&location, &[prefix]).unwrap(), expected);
-        for parent in ancestors(prefix.trim_end_matches('/')) {
+        for parent in Hierarchy::parse(prefix).unwrap().ancestors() {
             assert!(absent(&location, &format!("{parent}stats.json")));
         }
-        assert_eq!(read_summary(&location, sibling_prefix).unwrap(), sibling);
+        assert_eq!(read_summary(&location, &sibling_prefix).unwrap(), sibling);
         cache(&location, &["2"]).unwrap();
         let id = TableId::parse("K_K").unwrap();
         let key = location.key(&id.relative_path("json"));
         block_on(location.store.delete(&key)).unwrap();
         let summary = cache(&location, &["K_K", "K_K"]).unwrap();
         assert_eq!(summary.available_tables, 0);
-        for prefix in ancestors(&id.relative_path("json")) {
+        let hierarchy = id.hierarchy();
+        for prefix in hierarchy.ancestors().chain([hierarchy]) {
             assert!(absent(&location, &format!("{prefix}stats.json")));
         }
         invalidate(&location, &id).unwrap();

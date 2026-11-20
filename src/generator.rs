@@ -7,7 +7,7 @@ use std::time::Instant;
 use self::solver::{TableState, solve_pair};
 use crate::egt_file::{BatchReader, Source};
 use crate::report::{generation_summary, print_table_stats};
-use crate::selection::{GenerationPlan, TablePair};
+use crate::selection::{TablePair, plan_pairs};
 use crate::{AggregateStats, Egt, EgtResult, EgtStats, Tablebase, resolve_selectors};
 
 #[derive(Default, Clone, Copy)]
@@ -23,7 +23,7 @@ impl Tablebase {
     /// Clears the probe cache before any tables can be replaced.
     pub fn generate(&mut self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
         let start = Instant::now();
-        let plan = GenerationPlan::new(resolve_selectors(selectors)?);
+        let pairs = plan_pairs(resolve_selectors(selectors)?);
         self.source().base().ensure_format()?;
         let pool = self.pool("failed to build generation thread pool")?;
         self.clear_probe_cache();
@@ -31,11 +31,11 @@ impl Tablebase {
         let mut results = Vec::new();
         println!(
             "Generating {} twin-pair jobs using {} threads.",
-            plan.pairs.len(),
+            pairs.len(),
             pool.current_num_threads()
         );
         pool.install(|| -> EgtResult<()> {
-            for pair in plan.pairs {
+            for pair in pairs {
                 results.extend(generate_pair(source, &pair)?);
             }
             Ok(())

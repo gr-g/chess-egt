@@ -362,7 +362,7 @@ using `#[serde(flatten)]`.
 
 ---
 
-## 7. Use one hierarchy type
+## 7. Use one hierarchy type (done)
 
 **Problem.** The `<n>/<max>v<min>/op<K>/<N>pawns` hierarchy is handled in
 four places:

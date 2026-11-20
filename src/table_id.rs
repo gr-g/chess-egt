@@ -8,6 +8,7 @@ use shakmaty::{ByRole, Chess, Color, File, Position, Role};
 use std::cmp::Ordering;
 
 use crate::error::{EgtError, EgtResult};
+use crate::selection::{Hierarchy, compare_file_reflection};
 
 mod dependencies;
 
@@ -163,7 +164,7 @@ impl TableId {
             })
             .sum()
     }
-    pub(crate) fn side_piece_counts(&self) -> (usize, usize) {
+    fn side_piece_counts(&self) -> (usize, usize) {
         let enemy = self
             .pawns
             .files
@@ -176,19 +177,14 @@ impl TableId {
                 .sum::<usize>();
         (self.n_pieces() - enemy, enemy)
     }
+    pub(crate) fn hierarchy(&self) -> Hierarchy {
+        Hierarchy::from_counts(self.side_piece_counts(), self.opposing_pairs(), self.n_pawns())
+    }
+
     /// Portable relative path; performs no storage I/O.
     pub fn relative_path(&self, extension: &str) -> String {
-        let (a, b) = self.side_piece_counts();
-        format!(
-            "{}/{}v{}/op{}/{}pawns/{}.{}",
-            self.n_pieces(),
-            a.max(b),
-            a.min(b),
-            self.opposing_pairs(),
-            self.n_pawns(),
-            self,
-            extension.trim_start_matches('.')
-        )
+        let ext = extension.trim_start_matches('.');
+        format!("{}{self}.{ext}", self.hierarchy())
     }
 }
 
@@ -338,6 +334,10 @@ pub(crate) struct PawnKey {
 }
 
 impl PawnKey {
+    pub(crate) fn from_words(files: [u8; 8]) -> Self {
+        Self { files }
+    }
+
     fn file_counts(self, stm: bool) -> [u32; 8] {
         self.files.map(|word| {
             let sntm = word.count_ones() - 1;
@@ -414,72 +414,6 @@ impl PawnKey {
         }
     }
 
-}
-
-/// Coarse filter for sorted file lists; color-word ties are resolved by `PawnKey`.
-pub(crate) fn is_canonical(stm: &[File], sntm: &[File]) -> bool {
-    compare_file_reflection(stm, sntm) != Ordering::Greater
-}
-
-fn compare_file_reflection(stm: &[File], sntm: &[File]) -> Ordering {
-    fn compare(files: &[File]) -> Ordering {
-        files
-            .iter()
-            .map(|f| f.to_usize())
-            .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
-    }
-    compare(stm).then_with(|| compare(sntm))
-}
-
-/// Enumerates rank color words for fixed pawn-file multisets, without indexers.
-pub(crate) fn pawn_order_combinations(stm: &[File], sntm: &[File]) -> Vec<PawnKey> {
-    let mut counts = [[0usize; 2]; 8];
-    for &file in stm {
-        counts[file.to_usize()][0] += 1;
-    }
-    for &file in sntm {
-        counts[file.to_usize()][1] += 1;
-    }
-    if counts.iter().any(|c| c[0] + c[1] > 6) {
-        return Vec::new();
-    }
-    let mut layouts = vec![PawnKey { files: [1; 8] }];
-    for (file, [n_stm, n_sntm]) in counts.into_iter().enumerate() {
-        let len = n_stm + n_sntm;
-        if len == 0 {
-            continue;
-        }
-        let mut next = Vec::new();
-        for mask in 0u8..(1 << len) {
-            if mask.count_ones() as usize != n_sntm {
-                continue;
-            }
-            for &layout in &layouts {
-                let mut layout = layout;
-                layout.files[file] = (1 << len) | mask;
-                next.push(layout);
-            }
-        }
-        layouts = next;
-    }
-    layouts
-}
-
-pub(crate) fn get_file_combinations(k: usize) -> Vec<Vec<File>> {
-    fn recurse(k: usize, start: usize, current: &mut Vec<File>, results: &mut Vec<Vec<File>>) {
-        if current.len() == k {
-            results.push(current.clone());
-            return;
-        }
-        for idx in start..8 {
-            current.push(File::new(idx as u32));
-            recurse(k, idx, current, results);
-            current.pop();
-        }
-    }
-    let mut results = Vec::new();
-    recurse(k, 0, &mut Vec::new(), &mut results);
-    results
 }
 
 pub(crate) const MAX_PIECES: usize = 8;
