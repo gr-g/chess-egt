@@ -1,5 +1,6 @@
 use std::{cmp::Reverse, ops::Range};
 
+use crate::error::try_allocate;
 use crate::outcome::PackedOutcome;
 use crate::{EgtError, EgtResult};
 
@@ -24,18 +25,6 @@ fn serialized_length(d: usize, len: usize) -> u128 {
             } else {
                 2
             }
-}
-
-fn allocate<T>(len: usize) -> EgtResult<Vec<T>> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(len)
-        .map_err(|error| EgtError::WorkingMemoryAllocation {
-            context: "frame payload".into(),
-            bytes: len as u128 * std::mem::size_of::<T>() as u128,
-            reason: error.to_string(),
-        })?;
-    Ok(values)
 }
 
 impl Frame {
@@ -91,7 +80,7 @@ impl Frame {
         if range.start > range.end || range.end > self.len {
             return Err(invalid("frame expansion range out of bounds"));
         }
-        let mut values = allocate(range.end - range.start)?;
+        let mut values = try_allocate(range.end - range.start, "frame payload")?;
         values.extend(range.map(|index| self.get(index)));
         Ok(values)
     }
@@ -115,7 +104,7 @@ pub(super) fn encode(values: &[PackedOutcome]) -> EgtResult<Vec<u8>> {
     palette.sort_unstable_by_key(|&raw| (Reverse(counts[raw as usize]), raw));
     let size = usize::try_from(serialized_length(d, values.len()))
         .map_err(|_| EgtError::Internal("encoded frame length overflows usize"))?;
-    let mut data = allocate(size)?;
+    let mut data = try_allocate(size, "frame payload")?;
     data.extend_from_slice(&(d as u16).to_le_bytes());
     let mut ranks = vec![0u16; 65536];
     for (rank, raw) in palette.into_iter().enumerate() {

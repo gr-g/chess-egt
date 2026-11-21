@@ -8,14 +8,12 @@ pub(crate) use cache::SharedFileCache;
 use frame::Frame;
 
 use crate::egt::Egt;
-use crate::error::{EgtError, EgtResult};
+use crate::error::{EgtError, EgtResult, try_allocate};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
 use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
 use rayon::prelude::*;
 use shakmaty::Chess;
-#[cfg(test)]
-use shakmaty::{CastlingMode, Position};
 
 /// Resolves existing tables with input-first, missing-only fallback.
 #[derive(Debug)]
@@ -71,7 +69,7 @@ impl TableFile {
     /// Objects must not be replaced while this reader is in use: reads are not
     /// pinned to an object version.
     pub(crate) fn open(location: &Location, id: &TableId) -> EgtResult<Self> {
-        let egt = Egt::new(id)?;
+        let egt = Egt::new(id);
         let index_range = egt.index_range();
         let key = location.key(&id.relative_path("ggegt"));
         location.validate_format()?;
@@ -241,13 +239,7 @@ impl TableFile {
 }
 
 fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<Frame> {
-    let mut data = Vec::new();
-    data.try_reserve_exact(encoded_len)
-        .map_err(|error| EgtError::WorkingMemoryAllocation {
-            context: "frame decompression buffer".to_owned(),
-            bytes: encoded_len as u128,
-            reason: error.to_string(),
-        })?;
+    let mut data = try_allocate(encoded_len, "frame decompression buffer")?;
     data.resize(encoded_len, 0);
     // One-shot decoding is bounded by both slices and rejects truncated input.
     // zeekstd's streaming decoder can otherwise loop at premature EOF.
@@ -269,25 +261,16 @@ fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<
     Frame::decode(data, len)
 }
 
-/// Mirrors a chess position horizontally for independent indexing checks.
-#[cfg(test)]
-pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
-    let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
-    setup.board.flip_horizontal();
-    setup.ep_square = setup.ep_square.map(|sq| sq.flip_horizontal());
-    setup
-        .position(CastlingMode::Standard)
-        .map_err(|e| EgtError::InvalidPosition(format!("mirrored position is invalid: {:?}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ConversionType;
     use crate::egt_file::writer::write_fixture;
     use crate::outcome::PackedOutcome;
+    use crate::position::mirror_horizontally;
     use shakmaty::Color;
     use shakmaty::fen::Fen;
+    use shakmaty::{CastlingMode, Position};
     use std::path::Path;
 
     fn open_local(base: &Path, name: &str) -> EgtResult<TableFile> {
@@ -304,9 +287,9 @@ mod tests {
     fn pawn_orders_route_to_distinct_tables_and_their_twins() {
         for name in ["KPa_KPa", "KPao_KPao", "KPaPa_KPb", "KPa_KPbPb"] {
             let id = TableId::parse(name).unwrap();
-            let egt = Egt::new(&id).unwrap();
+            let egt = Egt::new(&id);
             let (twin, _) = id.twin();
-            let twin_egt = Egt::new(&twin).unwrap();
+            let twin_egt = Egt::new(&twin);
             let stride = (egt.index_range() / 64).max(1);
             for turn in [Color::White, Color::Black] {
                 for index in (0..egt.index_range()).step_by(stride) {
@@ -332,7 +315,7 @@ mod tests {
                                 .position_from_index(local, successor.turn())
                                 .unwrap(),
                             if reflected {
-                                mirror_horizontally(&successor).unwrap()
+                                mirror_horizontally(&successor)
                             } else {
                                 successor
                             }
@@ -385,7 +368,7 @@ mod tests {
             .unwrap()
             .into_position(CastlingMode::Standard)
             .unwrap();
-        let egt = Egt::new(&crate::TableId::parse("KPa_K").unwrap()).unwrap();
+        let egt = Egt::new(&crate::TableId::parse("KPa_K").unwrap());
         let index = egt.position_to_index(&position);
         let outcome = PackedOutcome::new_win(ConversionType::Checkmate, 987);
         let reader = write_fixture(&dir.0, "KPa_K", |i| {
@@ -395,7 +378,7 @@ mod tests {
                 PackedOutcome::INVALID
             }
         });
-        for position in [&position, &mirror_horizontally(&position).unwrap()] {
+        for position in [&position, &mirror_horizontally(&position)] {
             let (id, reflected) = TableId::from_position(position).unwrap();
             assert_eq!(id, reader.egt().id());
             assert_eq!(reader.index(position, reflected).unwrap(), index);
@@ -415,7 +398,7 @@ mod tests {
     #[test]
     fn full_frames_short_tail_and_table_boundaries() {
         let dir = crate::TestDir::new("frame_boundaries");
-        let egt = Egt::new(&crate::TableId::parse("KQ_KR").unwrap()).unwrap();
+        let egt = Egt::new(&crate::TableId::parse("KQ_KR").unwrap());
         let length = egt.index_range();
         let frame_size = egt.frame_size();
         let indexes = [0, frame_size - 1, frame_size, frame_size + 1, length - 1];

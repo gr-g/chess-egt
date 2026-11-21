@@ -276,12 +276,12 @@ mod tests {
             .resolve()
             .unwrap()
             .into_iter()
-            .map(|id| Egt::new(&id).unwrap())
+            .map(|id| Egt::new(&id))
             .collect()
     }
 
     fn table(name: &str) -> Egt {
-        Egt::new(&TableId::parse(name).unwrap()).unwrap()
+        Egt::new(&TableId::parse(name).unwrap())
     }
 
     #[test]
@@ -430,8 +430,8 @@ mod tests {
         for name in ["KPaPh_K", "K_KPaPh", "KPcPf_KPdPe", "KPd_KPe", "KPaPa_KPh"] {
             let id = TableId::parse(name).unwrap();
             let (twin_id, mirrored) = id.twin();
-            let egt = Egt::new(&id).unwrap();
-            let twin = Egt::new(&twin_id).unwrap();
+            let egt = Egt::new(&id);
+            let twin = Egt::new(&twin_id);
             let reverse_mirrored = twin_id.twin().1;
             let stride = (egt.index_range() / 128).max(1);
             let mut samples: Vec<_> = (0..egt.index_range()).step_by(stride).collect();

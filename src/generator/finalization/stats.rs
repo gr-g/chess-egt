@@ -117,7 +117,7 @@ mod tests {
     use crate::table_id::TableId;
 
     fn table(name: &str) -> Egt {
-        Egt::new(&TableId::parse(name).unwrap()).unwrap()
+        Egt::new(&TableId::parse(name).unwrap())
     }
 
     #[test]

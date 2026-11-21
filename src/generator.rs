@@ -8,7 +8,7 @@ use self::solver::{TableState, solve_pair};
 use crate::egt_file::{BatchReader, Source};
 use crate::report::{generation_summary, print_table_stats};
 use crate::selection::{TablePair, plan_pairs};
-use crate::{AggregateStats, Egt, EgtResult, EgtStats, Tablebase, resolve_selectors};
+use crate::{AggregateStats, Egt, EgtResult, EgtStats, resolve_selectors};
 
 #[derive(Default, Clone, Copy)]
 struct WinLoss<T> {
@@ -16,55 +16,51 @@ struct WinLoss<T> {
     loss: T,
 }
 
-impl Tablebase {
-    /// Generates twin-pair jobs in the base location, ordered by pieces then pawns.
-    /// Capture/promotion dependencies must already exist or be explicitly selected.
-    /// Working arrays and each pair's eagerly loaded dependencies must fit in memory.
-    /// Clears the probe cache before any tables can be replaced.
-    pub fn generate(&mut self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
-        let start = Instant::now();
-        let pairs = plan_pairs(resolve_selectors(selectors)?);
-        self.source().base().ensure_format()?;
-        let pool = self.pool("failed to build generation thread pool")?;
-        self.clear_probe_cache();
-        let source = self.source();
-        let mut results = Vec::new();
-        println!(
-            "Generating {} twin-pair jobs using {} threads.",
-            pairs.len(),
-            pool.current_num_threads()
-        );
-        pool.install(|| -> EgtResult<()> {
-            for pair in pairs {
-                results.extend(generate_pair(source, &pair)?);
-            }
-            Ok(())
-        })?;
-        let mut total = AggregateStats::default();
-        for stats in &results {
-            total.add(stats);
+/// Generates the selected tables and their twins in the base location.
+pub(crate) fn generate(
+    source: &Source,
+    pool: &rayon::ThreadPool,
+    selectors: &[&str],
+) -> EgtResult<Vec<EgtStats>> {
+    let start = Instant::now();
+    let pairs = plan_pairs(resolve_selectors(selectors)?);
+    source.base().ensure_format()?;
+    let mut results = Vec::new();
+    println!(
+        "Generating {} twin-pair jobs using {} threads.",
+        pairs.len(),
+        pool.current_num_threads()
+    );
+    pool.install(|| -> EgtResult<()> {
+        for pair in pairs {
+            results.extend(generate_pair(source, &pair)?);
         }
-        let lowest_compression = results
-            .iter()
-            .filter(|stats| stats.totals.unique_positions > 0)
-            .map(|stats| {
-                (
-                    stats.tablename.as_str(),
-                    stats.totals.bytes as f64 * 8.0 / stats.totals.unique_positions as f64,
-                )
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        println!(
-            "{}",
-            generation_summary(
-                &total,
-                start.elapsed(),
-                pool.current_num_threads(),
-                lowest_compression
-            )
-        );
-        Ok(results)
+        Ok(())
+    })?;
+    let mut total = AggregateStats::default();
+    for stats in &results {
+        total.add(stats);
     }
+    let lowest_compression = results
+        .iter()
+        .filter(|stats| stats.totals.unique_positions > 0)
+        .map(|stats| {
+            (
+                stats.tablename.as_str(),
+                stats.totals.bytes as f64 * 8.0 / stats.totals.unique_positions as f64,
+            )
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    println!(
+        "{}",
+        generation_summary(
+            &total,
+            start.elapsed(),
+            pool.current_num_threads(),
+            lowest_compression
+        )
+    );
+    Ok(results)
 }
 
 /// Generates and publishes one table and its twin in the caller's Rayon pool.
@@ -87,7 +83,7 @@ fn generate_pair(source: &Source, pair: &TablePair) -> EgtResult<Vec<EgtStats>> 
     base.ensure_writable()?;
     let setup_start = Instant::now();
     let mut tables = ids()
-        .map(|id| TableState::new(Egt::new(id)?))
+        .map(|id| TableState::new(Egt::new(id)))
         .collect::<EgtResult<Vec<_>>>()?;
     let setup_time = setup_start.elapsed();
     let timings = solve_pair(&mut tables, pair.reflected, &reader)?;
@@ -122,11 +118,10 @@ fn generate_pair(source: &Source, pair: &TablePair) -> EgtResult<Vec<EgtStats>> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::EgtError;
     use crate::selection::TableSelector;
     use crate::storage::Location;
     use crate::table_id::TableId;
+    use crate::{EgtError, Tablebase};
 
     #[test]
     fn parallel_missing_dependency_returns_error_without_generating() {

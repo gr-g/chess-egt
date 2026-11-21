@@ -13,14 +13,13 @@ from stats_csv import (
     validate_root, write_csv,
 )
 
-# Reference values from scaling.md.
+# Reference values from scaling.md: measured up to REFERENCE_PIECES, assumed above.
 REFERENCE_PIECES = 5
+# Allocated core time per index position, as reported by generation.
 CORE_US_PER_INDEX = 1.22
-COMPUTE_GROWTH_PER_PIECE = 1.06
-PARALLEL_EFFICIENCY = 0.70
+CORE_US_PER_INDEX_6 = 1.30
 
 # Unlike the actual table CSV compression, these rates use INDEX positions.
-# Use the measured five-piece rate and the six/seven-piece range midpoints.
 COMPRESSION_BITS_PER_INDEX = 0.78
 COMPRESSION_BITS_PER_INDEX_6 = 0.90
 COMPRESSION_GROWTH_PER_PIECE = 0.10
@@ -62,13 +61,13 @@ def leaf_row(root, leaf):
     totals = stats.get("totals")
     if all_available:
         if not isinstance(totals, dict):
-            raise ValueError(f"{summary_path}: missing totals object; refresh --cache-stats")
+            raise ValueError(f"{summary_path}: missing totals object; run chess-egt cache-stats")
         for key in OUTCOME_FIELDS:
             actual = count(totals, key, summary_path)
             if actual != sum(record[key] for record in complete):
                 raise ValueError(f"{summary_path}: {key} disagrees with sidecars; run chess-egt cache-stats")
     elif "totals" not in stats or totals is not None:
-        raise ValueError(f"{summary_path}: incomplete summary must have null totals; refresh --cache-stats")
+        raise ValueError(f"{summary_path}: incomplete summary must have null totals; run chess-egt cache-stats")
 
     row = {
         "path": path,
@@ -81,16 +80,18 @@ def leaf_row(root, leaf):
         row["size_gib"] = decimal(totals["bytes"] / 2**30)
     else:
         pieces = int(path.split("/")[0])
-        bits_per_index = (COMPRESSION_BITS_PER_INDEX if pieces <= REFERENCE_PIECES else
+        measured = pieces <= REFERENCE_PIECES
+        bits_per_index = (COMPRESSION_BITS_PER_INDEX if measured else
                           COMPRESSION_BITS_PER_INDEX_6 + COMPRESSION_GROWTH_PER_PIECE * (pieces - 6))
+        core_us = CORE_US_PER_INDEX if measured else CORE_US_PER_INDEX_6
         known_bytes = sum(record["bytes"] for record in complete)
         missing_indexes = sum(record["index_range"] for record in records if record["bytes"] is None)
-        core_us = CORE_US_PER_INDEX * COMPUTE_GROWTH_PER_PIECE ** (pieces - REFERENCE_PIECES)
+
         memory_bytes = 8 * max(record["index_range"] for record in records) + MEMORY_OVERHEAD_GIB * 2**30
         rounding_bytes = MEMORY_ROUNDING_GIB * 2**30
         row.update({
             "estimated_final_size_gib": decimal((known_bytes + missing_indexes * bits_per_index / 8) / 2**30),
-            "estimated_total_core_hours": decimal(index_range * core_us / (3_600_000_000 * PARALLEL_EFFICIENCY)),
+            "estimated_total_core_hours": decimal(index_range * core_us / 3_600_000_000),
             "estimated_memory_gib": ((memory_bytes + rounding_bytes - 1) // rounding_bytes) * MEMORY_ROUNDING_GIB,
         })
     return row

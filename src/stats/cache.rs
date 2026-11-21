@@ -14,24 +14,8 @@ use crate::selection::{Hierarchy, hierarchy_prefixes, resolve_selectors};
 use crate::stats::{AggregateStats, StatsRecord, read_record};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
-use crate::{EgtError, EgtResult, Tablebase};
-
-impl Tablebase {
-    /// Reads metadata without modifying storage. Missing sidecars contribute
-    /// theoretical index ranges; computed totals are null for incomplete selections.
-    /// Hierarchy selections use cached summaries when available. Only the base
-    /// location is consulted, even when an input overlay is configured.
-    pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
-        query(self.source().base(), selectors)
-    }
-
-    /// Creates missing placeholders and rebuilds hierarchy summaries in the base location.
-    /// Does not scan table contents or replace complete per-table metadata.
-    /// Do not run concurrently with generation or another cache rebuild.
-    pub fn cache_stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
-        cache(self.source().base(), selectors)
-    }
-}
+use crate::tablebase::thread_pool;
+use crate::{EgtError, EgtResult};
 
 /// Binds cached totals to their canonical hierarchy prefix, including its '/'.
 #[derive(Serialize, Deserialize)]
@@ -49,7 +33,7 @@ enum ReadMode {
 }
 
 /// Reads summaries when available, without creating placeholders or caches.
-fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
+pub(crate) fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
     let prefixes = hierarchy_prefixes(selectors)?;
     // Validate nonhierarchical selectors before touching storage, too.
     let mut tables = if prefixes.is_none() {
@@ -74,7 +58,7 @@ fn query(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
 }
 
 /// Rebuilds selected summaries and creates only absent per-table sidecars.
-fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
+pub(crate) fn cache(location: &Location, selectors: &[&str]) -> EgtResult<AggregateStats> {
     let prefixes = hierarchy_prefixes(selectors)?;
     let tables = resolve_selectors(selectors)?;
     location.ensure_writable()?;
@@ -173,7 +157,7 @@ fn record(location: &Location, id: &TableId, mode: ReadMode) -> EgtResult<StatsR
         Err(EgtError::FileNotFound(_)) => {}
         Err(error) => return Err(error),
     }
-    let missing = StatsRecord::missing(id)?;
+    let missing = StatsRecord::missing(id);
     if matches!(mode, ReadMode::ReadOnly) {
         return Ok(missing);
     }
@@ -203,10 +187,8 @@ fn visit_records(
     if tables.is_empty() {
         return Ok(());
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
-        .build()
-        .map_err(|_| EgtError::Internal("failed to build statistics thread pool"))?;
+    // Sidecar reads are I/O-bound, so this pool does not follow `set_threads`.
+    let pool = thread_pool(8)?;
     for batch in tables.chunks(32) {
         let results: Vec<_> = pool.install(|| {
             batch
@@ -258,7 +240,7 @@ mod tests {
         let id = TableId::parse("K_K").unwrap();
         let summary = query(&location, &["2"]).unwrap();
         assert_eq!((summary.selected_tables, summary.available_tables), (1, 0));
-        let missing = StatsRecord::missing(&id).unwrap();
+        let missing = StatsRecord::missing(&id);
         assert_eq!(summary.index_range, missing.index_range());
         assert_eq!(summary.totals, None);
         assert!(absent(&location, &id.relative_path("json")));
@@ -324,7 +306,7 @@ mod tests {
                     if location.ends_with("/K_K.json")));
             }
         }
-        let missing = serde_json::to_vec(&StatsRecord::missing(&id).unwrap()).unwrap();
+        let missing = serde_json::to_vec(&StatsRecord::missing(&id)).unwrap();
         put(&location, &id.relative_path("json"), missing);
         let stats = query(&location, &["K_K"]).unwrap();
         let envelope = serde_json::json!({ "hierarchy": "2/", "stats": stats });

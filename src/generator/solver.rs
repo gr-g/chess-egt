@@ -45,7 +45,7 @@ use super::unmoves::{quiet_unmoves, symmetry_adjusted_move_counter};
 use crate::ConversionType;
 use crate::egt::Egt;
 use crate::egt_file::BatchReader;
-use crate::error::{EgtError, EgtResult};
+use crate::error::{EgtResult, try_allocate};
 use crate::outcome::PackedOutcome;
 use crate::position::InvalidCounts;
 
@@ -370,22 +370,7 @@ impl TableState {
     }
 
     fn allocate_values(table: impl std::fmt::Display, len: usize) -> EgtResult<Vec<AtomicU16>> {
-        let context = format!("table {table} working values");
-        let bytes = len
-            .checked_mul(std::mem::size_of::<AtomicU16>())
-            .ok_or_else(|| EgtError::WorkingMemoryAllocation {
-                context: context.clone(),
-                bytes: len as u128 * std::mem::size_of::<AtomicU16>() as u128,
-                reason: "allocation size overflow".to_string(),
-            })?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(len)
-            .map_err(|err| EgtError::WorkingMemoryAllocation {
-                context,
-                bytes: bytes as u128,
-                reason: err.to_string(),
-            })?;
+        let mut values = try_allocate(len, &format!("table {table} working values"))?;
         values.resize_with(len, || AtomicU16::new(PackedOutcome::INVALID.to_u16()));
         Ok(values)
     }
@@ -560,13 +545,13 @@ pub(super) fn solve_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tablebase;
     use crate::selection::plan_pairs;
     use crate::storage::Location;
     use crate::table_id::TableId;
+    use crate::{EgtError, Tablebase};
 
     fn table(name: &str) -> Egt {
-        Egt::new(&TableId::parse(name).unwrap()).unwrap()
+        Egt::new(&TableId::parse(name).unwrap())
     }
 
     fn atomic_values(values: Vec<PackedOutcome>) -> Vec<AtomicU16> {

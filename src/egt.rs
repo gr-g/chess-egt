@@ -1,7 +1,6 @@
 use crate::{InvalidPosition, TableId};
 use shakmaty::{Chess, Color};
 mod indexer;
-use crate::error::EgtResult;
 use indexer::Indexer;
 
 /// An immutable indexing descriptor, in either horizontal orientation.
@@ -50,11 +49,11 @@ impl Egt {
     }
 
     /// Builds an indexing plan for a validated table identity.
-    pub fn new(id: &TableId) -> EgtResult<Self> {
-        Ok(Self {
+    pub fn new(id: &TableId) -> Self {
+        Self {
             id: *id,
             indexer: Indexer::new(id),
-        })
+        }
     }
 
     /// Encodes a no-castling position matching this table's material, pawn files,
@@ -231,7 +230,7 @@ mod tests {
             ("KQQPaoPa_KPao", 7, 3, 3422, 410640),
             ("KNNNNNN_K", 8, 0, 3306, 390108),
         ] {
-            let egt = Egt::new(&TableId::parse(name).unwrap()).unwrap();
+            let egt = Egt::new(&TableId::parse(name).unwrap());
             assert_eq!(egt.id().name().as_str(), name);
             assert_eq!(egt.n_pieces(), pieces);
             assert_eq!(egt.n_pawns(), pawns);
@@ -242,16 +241,16 @@ mod tests {
 
     #[test]
     fn reflected_index_matches_board_reflection() {
-        use crate::egt_file::mirror_horizontally;
+        use crate::position::mirror_horizontally;
 
         for name in ["KPa_K", "KPd_KPe", "KPaPaPd_KPbPf", "KNN_K"] {
-            let egt = Egt::new(&TableId::parse(name).unwrap()).unwrap();
+            let egt = Egt::new(&TableId::parse(name).unwrap());
             let stride = (egt.index_range() / 256).max(1);
             let mut checked = 0;
             for turn in [Color::White, Color::Black] {
                 for idx in (0..egt.index_range()).step_by(stride) {
                     if let Ok(position) = egt.position_from_index(idx, turn) {
-                        let source = mirror_horizontally(&position).unwrap();
+                        let source = mirror_horizontally(&position);
                         assert_eq!(
                             egt.reflected_position_to_index(&source),
                             idx,
@@ -267,7 +266,7 @@ mod tests {
 
     #[test]
     fn reflected_index_preserves_legal_en_passant() {
-        use crate::egt_file::mirror_horizontally;
+        use crate::position::mirror_horizontally;
         use shakmaty::{CastlingMode, Position, fen::Fen};
 
         for (fen, name) in [
@@ -282,12 +281,12 @@ mod tests {
                 .into_position(CastlingMode::Standard)
                 .unwrap();
             assert!(position.legal_ep_square().is_some());
-            let reflected = mirror_horizontally(&position).unwrap();
+            let reflected = mirror_horizontally(&position);
             assert_eq!(
                 reflected.legal_ep_square(),
                 position.legal_ep_square().map(|sq| sq.flip_horizontal())
             );
-            let egt = Egt::new(&parse_oriented(name).unwrap()).unwrap();
+            let egt = Egt::new(&parse_oriented(name).unwrap());
             assert_eq!(
                 egt.reflected_position_to_index(&position),
                 egt.position_to_index(&reflected),
@@ -298,7 +297,7 @@ mod tests {
 
     #[test]
     fn diagonal_symmetry_excludes_pawnful_tables() {
-        let egt = Egt::new(&TableId::parse("KPd_K").unwrap()).unwrap();
+        let egt = Egt::new(&TableId::parse("KPd_K").unwrap());
         assert_eq!(egt.diagonal_symmetric(0), None);
     }
 
@@ -312,7 +311,7 @@ mod tests {
             "KPdPePf_KPePe",
             "KPePe_KPdPf",
         ] {
-            let egt = Egt::new(&parse_oriented(name).unwrap()).unwrap();
+            let egt = Egt::new(&parse_oriented(name).unwrap());
             let range = egt.index_range();
             let stride = if egt.n_pieces() <= 3 {
                 1

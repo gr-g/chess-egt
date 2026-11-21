@@ -92,6 +92,17 @@ pub(crate) fn valid_ep_square(setup: &Setup) -> bool {
         && !setup.board.occupied().contains(pushed_from)
 }
 
+/// Mirrors a chess position horizontally for independent indexing checks.
+#[cfg(test)]
+pub(crate) fn mirror_horizontally(position: &Chess) -> Chess {
+    let mut setup = position.to_setup(shakmaty::EnPassantMode::Legal);
+    setup.board.flip_horizontal();
+    setup.ep_square = setup.ep_square.map(|sq| sq.flip_horizontal());
+    setup
+        .position(CastlingMode::Standard)
+        .expect("a mirrored legal position is legal")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +151,7 @@ mod tests {
             .resolve()
             .unwrap()
         {
-            let egt = crate::egt::Egt::new(&id).unwrap();
+            let egt = crate::egt::Egt::new(&id);
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
                 match egt.position_from_index(index, Color::White) {

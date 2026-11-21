@@ -8,7 +8,7 @@ use shakmaty::{ByRole, Chess, Color, File, Position, Role};
 use std::cmp::Ordering;
 
 use crate::error::{EgtError, EgtResult};
-use crate::selection::{Hierarchy, compare_file_reflection};
+use crate::selection::Hierarchy;
 
 mod dependencies;
 
@@ -146,7 +146,8 @@ impl TableId {
     }
 
     /// Oriented material, retaining STM on the left.
-    pub fn material(&self) -> String {
+    #[cfg(test)]
+    fn material(&self) -> String {
         self.name()
             .chars()
             .filter(|c| !c.is_ascii_lowercase())
@@ -180,7 +181,7 @@ impl TableId {
             .sum()
     }
     /// Each mutually opposing pair has exactly one opposed STM pawn.
-    pub fn opposing_pairs(&self) -> usize {
+    pub(crate) fn opposing_pairs(&self) -> usize {
         self.pawns
             .files
             .iter()
@@ -212,7 +213,7 @@ impl TableId {
     }
 
     /// Portable relative path within a tablebase root.
-    pub fn relative_path(&self, extension: &str) -> String {
+    pub(crate) fn relative_path(&self, extension: &str) -> String {
         let ext = extension.trim_start_matches('.');
         format!("{}{self}.{ext}", self.hierarchy())
     }
@@ -442,6 +443,17 @@ impl PawnKey {
             (reflected, true)
         }
     }
+}
+
+/// Compares STM then SNTM pawn files with their horizontal reflections.
+pub(crate) fn compare_file_reflection(stm: &[File], sntm: &[File]) -> Ordering {
+    fn compare(files: &[File]) -> Ordering {
+        files
+            .iter()
+            .map(|f| f.to_usize())
+            .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
+    }
+    compare(stm).then_with(|| compare(sntm))
 }
 
 pub(crate) const MAX_PIECES: usize = 8;
@@ -687,7 +699,7 @@ mod tests {
                 if table.n_pieces() > 4 {
                     continue;
                 }
-                let egt = Egt::new(&table).unwrap();
+                let egt = Egt::new(&table);
                 for turn in [Color::White, Color::Black] {
                     for index in (0..egt.index_range()).step_by((egt.index_range() / 16).max(1)) {
                         let Ok(position) = egt.position_from_index(index, turn) else {

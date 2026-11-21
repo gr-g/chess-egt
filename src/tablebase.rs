@@ -4,7 +4,8 @@ use shakmaty::{CastlingMode, Chess, Move, Position, PositionError, fen::Fen};
 
 use crate::egt_file::{SharedFileCache, Source};
 use crate::storage::Location;
-use crate::{DtcOutcome, EgtError, EgtResult};
+use crate::{AggregateStats, DtcOutcome, EgtError, EgtResult, EgtStats};
+use crate::{generator, stats, verification};
 
 /// Parses a standard-chess FEN for probing, accepting impossible checks as indexing does.
 pub fn parse_position(fen: &str) -> EgtResult<Chess> {
@@ -50,19 +51,8 @@ impl Tablebase {
         }
     }
 
-    pub(crate) fn source(&self) -> &Source {
+    fn source(&self) -> &Source {
         self.cache.source()
-    }
-
-    pub(crate) fn clear_probe_cache(&mut self) {
-        self.cache.clear();
-    }
-
-    pub(crate) fn pool(&self, error: &'static str) -> EgtResult<rayon::ThreadPool> {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads)
-            .build()
-            .map_err(|_| EgtError::Internal(error))
     }
 
     /// Sets generation and verification workers. Zero (the default) uses Rayon's default.
@@ -71,9 +61,8 @@ impl Tablebase {
     }
 
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
-    pub fn set_cache_size(&mut self, n: usize) -> EgtResult<()> {
+    pub fn set_cache_size(&mut self, n: usize) {
         self.cache.set_cache_size(n);
-        Ok(())
     }
 
     /// Sets an input overlay for probing, verification, and generation dependencies.
@@ -116,4 +105,44 @@ impl Tablebase {
                 .collect(),
         })
     }
+
+    /// Generates twin-pair jobs in the base location, ordered by pieces then pawns.
+    /// Capture/promotion dependencies must already exist or be explicitly selected.
+    /// Working arrays and each pair's eagerly loaded dependencies must fit in memory.
+    /// Clears the probe cache before any tables can be replaced.
+    pub fn generate(&mut self, selectors: &[&str]) -> EgtResult<Vec<EgtStats>> {
+        let pool = thread_pool(self.threads)?;
+        self.cache.clear();
+        generator::generate(self.source(), &pool, selectors)
+    }
+
+    /// Verifies the sorted, deduplicated selection against legal successors.
+    /// Each selected table, its quiet twin, and its direct conversion dependencies
+    /// must fit in memory together. Twins are loaded but not implicitly verified.
+    pub fn verify(&self, selectors: &[&str]) -> EgtResult<()> {
+        verification::verify(self.source(), &thread_pool(self.threads)?, selectors)
+    }
+
+    /// Reads metadata without modifying storage. Missing sidecars contribute
+    /// theoretical index ranges; computed totals are null for incomplete selections.
+    /// Hierarchy selections use cached summaries when available. Only the base
+    /// location is consulted, even when an input overlay is configured.
+    pub fn stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
+        stats::query(self.source().base(), selectors)
+    }
+
+    /// Creates missing placeholders and rebuilds hierarchy summaries in the base location.
+    /// Does not scan table contents or replace complete per-table metadata.
+    /// Do not run concurrently with generation or another cache rebuild.
+    pub fn cache_stats(&self, selectors: &[&str]) -> EgtResult<AggregateStats> {
+        stats::cache(self.source().base(), selectors)
+    }
+}
+
+/// A Rayon pool with `threads` workers, or Rayon's default for zero.
+pub(crate) fn thread_pool(threads: usize) -> EgtResult<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|_| EgtError::Internal("failed to build thread pool"))
 }

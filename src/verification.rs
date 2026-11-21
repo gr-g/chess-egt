@@ -3,57 +3,57 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use rayon::prelude::*;
 use shakmaty::{Chess, Color, Move, Position};
 
-use crate::egt_file::BatchReader;
+use crate::egt_file::{BatchReader, Source};
 use crate::report::format_timing;
 use crate::table_id::TableId;
-use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, Tablebase, resolve_selectors};
+use crate::{ConversionType, DtcOutcome, Egt, EgtError, EgtResult, resolve_selectors};
 
-impl Tablebase {
-    /// Verifies the sorted, deduplicated selection against legal successors.
-    /// Each selected table, its quiet twin, and its direct conversion dependencies
-    /// must fit in memory together. Twins are loaded but not implicitly verified.
-    pub fn verify(&self, selectors: &[&str]) -> EgtResult<()> {
-        let start = std::time::Instant::now();
-        let ids = resolve_selectors(selectors)?;
-        let pool = self.pool("failed to build verification thread pool")?;
-        let (unique_positions, index_range) = pool.install(|| self.verify_tables_in_pool(&ids))?;
+/// Verifies the selected tables against their legal successors.
+pub(crate) fn verify(
+    source: &Source,
+    pool: &rayon::ThreadPool,
+    selectors: &[&str],
+) -> EgtResult<()> {
+    let start = std::time::Instant::now();
+    let ids = resolve_selectors(selectors)?;
+    let (unique_positions, index_range) = pool.install(|| verify_tables(source, &ids))?;
+    println!(
+        "Verified {} tables: {} unique positions in {}.",
+        ids.len(),
+        unique_positions,
+        format_timing(start.elapsed(), index_range, pool.current_num_threads())
+    );
+    Ok(())
+}
+
+/// Returns the unique positions and the index range of the verified tables.
+fn verify_tables(source: &Source, ids: &[TableId]) -> EgtResult<(usize, usize)> {
+    let mut unique_positions = 0;
+    let mut index_range = 0;
+    for id in ids {
+        let file = source.open(id)?;
+        let mut dependencies = id.dependencies();
+        dependencies.push(id.twin().0);
+        dependencies.retain(|dependency| dependency != id);
+        dependencies.sort();
+        dependencies.dedup();
+        let mut reader = BatchReader::open(source, &dependencies)?;
+        let frames = file.read_all()?;
+        reader.insert(file, frames);
         println!(
-            "Verified {} tables: {} unique positions in {}.",
-            ids.len(),
-            unique_positions,
-            format_timing(start.elapsed(), index_range, pool.current_num_threads())
+            "{}: loaded {} bytes of dependencies.",
+            id,
+            reader.resident_bytes()
         );
-        Ok(())
+        let egt = reader.egt(id);
+        unique_positions += verify_egt(&reader, egt)?;
+        index_range += egt.index_range();
+        println!(
+            "Successfully verified internal consistency of table {}.",
+            id
+        );
     }
-
-    fn verify_tables_in_pool(&self, ids: &[TableId]) -> EgtResult<(usize, usize)> {
-        let mut unique_positions = 0;
-        let mut index_range = 0;
-        for id in ids {
-            let file = self.source().open(id)?;
-            let mut dependencies = id.dependencies();
-            dependencies.push(id.twin().0);
-            dependencies.retain(|dependency| dependency != id);
-            dependencies.sort();
-            dependencies.dedup();
-            let mut reader = BatchReader::open(self.source(), &dependencies)?;
-            let frames = file.read_all()?;
-            reader.insert(file, frames);
-            println!(
-                "{}: loaded {} bytes of dependencies.",
-                id,
-                reader.resident_bytes()
-            );
-            let egt = reader.egt(id);
-            unique_positions += verify_egt(&reader, egt)?;
-            index_range += egt.index_range();
-            println!(
-                "Successfully verified internal consistency of table {}.",
-                id
-            );
-        }
-        Ok((unique_positions, index_range))
-    }
+    Ok((unique_positions, index_range))
 }
 
 /// Verifies independent blocks and returns the number of valid, unique positions.
@@ -99,7 +99,7 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
     let fail = |local_idx: usize, reason: &str| EgtError::ConsistencyCheckFailed {
         endgame: tablename.to_string(),
         index: local_idx,
-        reason: format!("table {}, local index {}: {}", tablename, local_idx, reason),
+        reason: reason.to_owned(),
     };
 
     let mut unique_positions = 0;
@@ -181,7 +181,7 @@ fn describe_mismatch(
     best: DtcOutcome,
 ) -> String {
     let mut reason = format!(
-        "consistency check failed.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
+        "outcome mismatch.\nPosition: {:?}\nOutcome in file: {:?}\nBest outcome from legal moves: {:?}",
         position, outcome, best
     );
     reason.push_str("\nLegal moves and their outcomes:");
@@ -199,12 +199,13 @@ fn describe_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestDir;
+    use crate::storage::Location;
+    use crate::{Tablebase, TestDir};
 
     #[test]
     fn verification_counts_only_source_positions() {
         let dir = TestDir::new("verify_position_counts");
-        let mut generator = crate::Tablebase::new(&dir.0).unwrap();
+        let mut generator = Tablebase::new(&dir.0).unwrap();
         generator.set_threads(2);
         generator.generate(&["K_K"]).unwrap();
         let stats = generator.generate(&["KQ_K"]).unwrap();
@@ -212,9 +213,8 @@ mod tests {
             .iter()
             .find(|stats| stats.tablename == "KQ_K")
             .unwrap();
-        let counts = generator
-            .verify_tables_in_pool(&resolve_selectors(&["KQ_K"]).unwrap())
-            .unwrap();
+        let base = Source::new(Location::parse(&dir.0).unwrap());
+        let counts = verify_tables(&base, &resolve_selectors(&["KQ_K"]).unwrap()).unwrap();
         assert_eq!(counts, (source.totals.unique_positions, source.index_range));
     }
 
@@ -223,7 +223,7 @@ mod tests {
         use crate::outcome::PackedOutcome;
 
         let dir = TestDir::new("verify_invalid_outcome");
-        let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
+        let egt = Egt::new(&crate::TableId::parse("K_K").unwrap());
         let index = (0..egt.index_range())
             .find(|&index| egt.position_from_index(index, Color::White).is_ok())
             .unwrap();

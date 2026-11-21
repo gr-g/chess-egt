@@ -99,6 +99,19 @@ pub enum EgtError {
     Internal(&'static str),
 }
 
+/// Reserves exactly `len` elements, reporting failure as `WorkingMemoryAllocation`.
+pub(crate) fn try_allocate<T>(len: usize, context: &str) -> EgtResult<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|error| EgtError::WorkingMemoryAllocation {
+            context: context.to_owned(),
+            bytes: len as u128 * std::mem::size_of::<T>() as u128,
+            reason: error.to_string(),
+        })?;
+    Ok(values)
+}
+
 impl EgtError {
     pub(crate) fn invalid_data(
         location: impl Into<String>,

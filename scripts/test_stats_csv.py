@@ -27,7 +27,7 @@ class StatsCsvTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.root = self.base / "tables"
         self.root.mkdir()
-        self.put_json(self.root / "format.json", {"format": "ggegt-v0.12"})
+        self.put_json(self.root / "format.json", {"format": "ggegt-v0.13"})
 
     def put_json(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ class StatsCsvTests(unittest.TestCase):
             self.placeholder(index_range=8 * GIB),
         ])
         row = leaf_stats.leaf_row(self.root, leaf)
-        self.assertEqual(row["estimated_final_size_gib"], "1.849000")
+        self.assertEqual(row["estimated_final_size_gib"], "1.780000")
         self.assertEqual(row["table_count"], 2)
         self.assertEqual(row["available_tables"], 1)
         self.assertEqual(row["index_range"], 9 * GIB)
@@ -119,13 +119,12 @@ class StatsCsvTests(unittest.TestCase):
         ])
         row = leaf_stats.leaf_row(self.root, leaf)
         self.assertEqual(row["estimated_total_core_hours"],
-                         f"{2 * GIB * 1.28 / (3_600_000_000 * 0.70):.6f}")
+                         f"{2 * GIB * 1.22 / 3_600_000_000:.6f}")
         self.assertNotEqual(row["estimated_total_core_hours"],
-                            f"{GIB * 1.28 / (3_600_000_000 * 0.70):.6f}")
+                            f"{GIB * 1.22 / 3_600_000_000:.6f}")
 
     def test_piece_count_scales_index_compression_and_compute_model(self):
-        for pieces, bits, growth in ((5, 0.849, 1), (6, 1.05, 1.4),
-                                     (7, 1.25, 1.4**2)):
+        for pieces, bits, core_us in ((5, 0.78, 1.22), (6, 0.90, 1.30), (7, 1.00, 1.30)):
             with self.subTest(pieces=pieces):
                 leaf, _ = self.make_leaf(
                     [self.placeholder(index_range=8 * GIB)],
@@ -133,11 +132,13 @@ class StatsCsvTests(unittest.TestCase):
                 row = leaf_stats.leaf_row(self.root, leaf)
                 self.assertEqual(row["estimated_final_size_gib"], f"{bits:.6f}")
                 self.assertEqual(row["estimated_total_core_hours"],
-                                 f"{8 * GIB * 1.28 * growth / (3_600_000_000 * 0.70):.6f}")
+                                 f"{8 * GIB * core_us / 3_600_000_000:.6f}")
 
     def test_complete_set_projections_use_scaling_model(self):
-        for pieces, indexes, core_hours in ((6, 5_606_162_736_600, 3986.604613),
-                                           (7, 679_345_381_690_216, 676326.068883)):
+        # Allocated core-hours and compressed sizes in scaling.md, sections 3 and 4.
+        for pieces, indexes, core_hours, size_tib in (
+                (6, 5_606_162_736_600, 2_025, 0.57),
+                (7, 679_345_381_690_216, 245_319, 77)):
             with self.subTest(pieces=pieces):
                 leaf, _ = self.make_leaf(
                     [self.placeholder(index_range=indexes)],
@@ -145,6 +146,8 @@ class StatsCsvTests(unittest.TestCase):
                 row = leaf_stats.leaf_row(self.root, leaf)
                 self.assertAlmostEqual(float(row["estimated_total_core_hours"]),
                                        core_hours, delta=core_hours * 0.002)
+                self.assertAlmostEqual(float(row["estimated_final_size_gib"]) / 1024,
+                                       size_tib, delta=size_tib * 0.01)
 
     def test_memory_rounds_up_at_32_gib_boundary(self):
         # Eight bytes/index plus 2 GiB overhead is exactly 32 GiB here.
@@ -222,7 +225,7 @@ class StatsCsvTests(unittest.TestCase):
     def test_format_validation_requires_exact_supported_object(self):
         self.assertEqual(stats_csv.validate_root(self.root), self.root.resolve())
         for value in ({"format": "ggegt-v0.11"}, {}, {"format": None},
-                      {"format": "ggegt-v0.12", "extra": True}, [], "ggegt-v0.12"):
+                      {"format": "ggegt-v0.13", "extra": True}, [], "ggegt-v0.13"):
             with self.subTest(value=value):
                 self.put_json(self.root / "format.json", value)
                 with self.assertRaises(ValueError):
@@ -389,7 +392,7 @@ class StatsCsvTests(unittest.TestCase):
                     self.assertEqual(rows[0]["estimated_final_size_gib"], "")
                     self.assertEqual(rows[1]["size_gib"], "")
                     self.assertEqual(rows[1]["unique_positions"], "")
-                    self.assertEqual(rows[1]["estimated_final_size_gib"], "0.262500")
+                    self.assertEqual(rows[1]["estimated_final_size_gib"], "0.225000")
 
     def test_cli_reports_invalid_format_without_creating_output(self):
         self.put_json(self.root / "format.json", {"format": "ggegt-v0.11"})

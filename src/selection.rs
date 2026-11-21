@@ -20,7 +20,9 @@ use std::fmt;
 use shakmaty::{ByRole, File, Role};
 
 use crate::error::{EgtError, EgtResult};
-use crate::table_id::{MAX_PIECES, NONPAWN_ROLES, PawnKey, TableId, uppercase_role};
+use crate::table_id::{
+    MAX_PIECES, NONPAWN_ROLES, PawnKey, TableId, compare_file_reflection, uppercase_role,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Hierarchy {
@@ -449,16 +451,6 @@ fn material_names(n: usize) -> Vec<String> {
         }
     }
     result
-}
-
-pub(crate) fn compare_file_reflection(stm: &[File], sntm: &[File]) -> Ordering {
-    fn compare(files: &[File]) -> Ordering {
-        files
-            .iter()
-            .map(|f| f.to_usize())
-            .cmp(files.iter().rev().map(|f| 7 - f.to_usize()))
-    }
-    compare(stm).then_with(|| compare(sntm))
 }
 
 /// Enumerates rank color words for fixed pawn-file multisets.

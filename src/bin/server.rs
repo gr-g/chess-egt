@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let tablebase = tokio::task::spawn_blocking(move || {
         let mut tablebase = Tablebase::new(&cli.path)?;
-        tablebase.set_cache_size(cli.cache_size)?;
+        tablebase.set_cache_size(cli.cache_size);
         // An empty selection validates the root format without loading any tables.
         tablebase.stats(&[])?;
         Ok::<_, EgtError>(tablebase)
@@ -468,7 +468,7 @@ mod tests {
             tablebase
                 .generate(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
                 .unwrap();
-            tablebase.set_cache_size(0).unwrap();
+            tablebase.set_cache_size(0);
             tablebase
         })
         .await

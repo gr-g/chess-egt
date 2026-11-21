@@ -82,30 +82,30 @@ impl PartialOrd for DtcOutcome {
 pub(crate) struct PackedOutcome(u16);
 
 impl PackedOutcome {
-    pub const INVALID: Self = Self(0b000);
-    pub const DRAW: Self = Self(0b001);
+    pub(crate) const INVALID: Self = Self(0b000);
+    pub(crate) const DRAW: Self = Self(0b001);
 
-    pub fn from_u16(value: u16) -> Self {
+    pub(crate) fn from_u16(value: u16) -> Self {
         Self(value)
     }
 
-    pub fn to_u16(self) -> u16 {
+    pub(crate) fn to_u16(self) -> u16 {
         self.0
     }
 
-    pub fn is_assigned(self) -> bool {
+    pub(crate) fn is_assigned(self) -> bool {
         (self.0 & 0b111) != 0b000
     }
 
-    pub fn is_invalid(self) -> bool {
+    pub(crate) fn is_invalid(self) -> bool {
         self.0 == 0b000
     }
 
-    pub fn is_unknown(self) -> bool {
+    pub(crate) fn is_unknown(self) -> bool {
         !self.is_assigned() && self.get_unknown_counter() != 0
     }
 
-    pub fn get_unknown_counter(self) -> u16 {
+    pub(crate) fn get_unknown_counter(self) -> u16 {
         self.0 >> 3
     }
 
@@ -123,19 +123,19 @@ impl PackedOutcome {
         }
     }
 
-    pub fn is_draw(self) -> bool {
+    pub(crate) fn is_draw(self) -> bool {
         self.0 == 0b001
     }
 
-    pub fn is_win(self) -> bool {
+    pub(crate) fn is_win(self) -> bool {
         matches!(self.0 & 0b111, 0b010 | 0b100 | 0b110)
     }
 
-    pub fn is_loss(self) -> bool {
+    pub(crate) fn is_loss(self) -> bool {
         matches!(self.0 & 0b111, 0b011 | 0b101 | 0b111)
     }
 
-    pub fn new_win(ct: ConversionType, distance: u16) -> Self {
+    pub(crate) fn new_win(ct: ConversionType, distance: u16) -> Self {
         let bits = match ct {
             ConversionType::Checkmate => 0b010,
             ConversionType::Capture => 0b100,
@@ -144,11 +144,11 @@ impl PackedOutcome {
         Self(bits | (distance << 3))
     }
 
-    pub fn new_loss(ct: ConversionType, distance: u16) -> Self {
+    pub(crate) fn new_loss(ct: ConversionType, distance: u16) -> Self {
         Self(Self::new_win(ct, distance).0 | 1)
     }
 
-    pub fn new_unknown(counter: u16) -> Self {
+    pub(crate) fn new_unknown(counter: u16) -> Self {
         Self(counter << 3)
     }
 }

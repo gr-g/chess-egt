@@ -92,7 +92,7 @@ fn probe_with_moves_matches_scalar_probes() {
     prober
         .generate(&["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KP_K"])
         .unwrap();
-    prober.set_cache_size(0).unwrap();
+    prober.set_cache_size(0);
     for fen in [
         "7k/8/8/8/8/8/P7/K7 w - - 0 1",
         "7k/P7/2K5/8/8/8/8/8 w - - 0 1",
@@ -306,7 +306,7 @@ fn object_exists(location: &Location, path: &str) -> bool {
 }
 
 fn position_for(name: &str) -> Chess {
-    let egt = Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
+    let egt = Egt::new(&crate::TableId::parse(name).unwrap());
     (0..egt.index_range())
         .find_map(|index| egt.position_from_index(index, Color::White).ok())
         .unwrap()

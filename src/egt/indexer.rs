@@ -284,6 +284,11 @@ impl PawnMap {
 type CoordBuf = ArrayVec<(usize, usize), MAX_PIECES>;
 type PidxBuf = ArrayVec<usize, MAX_PIECES>;
 
+/// A zero-filled buffer with one slot per piece.
+fn filled<T: Copy + Default>(n: usize) -> ArrayVec<T, MAX_PIECES> {
+    std::iter::repeat_n(T::default(), n).collect()
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Indexer {
     pub(super) n_pieces: usize,
@@ -390,16 +395,6 @@ impl Indexer {
         }
     }
 
-    #[inline]
-    fn filled_coord(n: usize) -> CoordBuf {
-        std::iter::repeat_n((0, 0), n).collect()
-    }
-
-    #[inline]
-    fn filled_pidx(n: usize) -> PidxBuf {
-        std::iter::repeat_n(0, n).collect()
-    }
-
     fn compute_piece_squares(nonpawns: &mut [IndexerPieceGroup], n_pawns: usize) {
         let mut available_squares = 64 - n_pawns;
         for p in nonpawns.iter_mut() {
@@ -451,8 +446,8 @@ impl Indexer {
     }
 
     fn encode_position<const REFLECTED: bool>(&self, position: &Chess) -> usize {
-        let mut coord = Self::filled_coord(self.n_pieces);
-        let mut pidx = Self::filled_pidx(self.n_pieces);
+        let mut coord = filled(self.n_pieces);
+        let mut pidx = filled(self.n_pieces);
         self.position_to_coord::<REFLECTED>(&mut coord, position);
         // Now `coord` has the coordinates (rank, file) of the pieces, with
         // pawns first and their ranks normalized to the side to move.
@@ -517,8 +512,8 @@ impl Indexer {
 
     fn setup_from_index(&self, index: usize, side_to_move: Color) -> Setup {
         debug_assert!(index < self.index_range);
-        let mut coord = Self::filled_coord(self.n_pieces);
-        let mut pidx = Self::filled_pidx(self.n_pieces);
+        let mut coord = filled(self.n_pieces);
+        let mut pidx = filled(self.n_pieces);
         let ep_file = if let Some(pawn_map) = &self.pawn_map {
             // The quotient selects the pawn configuration; the remainder
             // encodes the non-pawn placement within that slice.
@@ -582,8 +577,8 @@ impl Indexer {
             return None;
         }
 
-        let mut buffer_coord = Self::filled_coord(self.n_pieces);
-        let mut buffer_pidx = Self::filled_pidx(self.n_pieces);
+        let mut buffer_coord = filled(self.n_pieces);
+        let mut buffer_pidx = filled(self.n_pieces);
 
         self.index_to_cpidx(&mut buffer_pidx, index);
         Self::unmap_kings(&mut buffer_pidx);
@@ -962,7 +957,7 @@ mod tests {
     #[test]
     fn symmetric_pawns_pack_kings_and_round_trip_reflections() {
         for name in ["KPaPh_K", "KNNPaPh_K", "KPcPf_KPdPe", "KPaoPho_KPaoPho"] {
-            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
+            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap());
             let indexer = &egt.indexer;
             assert!(indexer.symmetric_pawns, "{name}");
             let kings = &indexer.nonpawns[0];
@@ -1015,7 +1010,7 @@ mod tests {
             "KPdPdoPe_KPdo",
             "KNNNNNN_K",
         ] {
-            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap()).unwrap();
+            let egt = crate::egt::Egt::new(&crate::TableId::parse(name).unwrap());
             let indexer = &egt.indexer;
             let mut accepted = 0;
             let mut rejected = 0;
@@ -1144,7 +1139,7 @@ mod tests {
                     if ranks.count_ones() as usize != k {
                         continue;
                     }
-                    let mut coord = Indexer::filled_coord(k + 2);
+                    let mut coord = filled(k + 2);
                     let normalized_ranks: ArrayVec<u8, 6> = (1u8..=6)
                         .rev()
                         .filter(|r| ranks & (1 << (r - 1)) != 0)
@@ -1161,14 +1156,13 @@ mod tests {
                     coord[k + 1] = (7, 7);
                     for turn in [Color::White, Color::Black] {
                         if let Some(position) = coord_to_position(&indexer, None, &coord, turn) {
-                            let mut gathered = Indexer::filled_coord(k + 2);
+                            let mut gathered = filled(k + 2);
                             indexer.position_to_coord::<false>(&mut gathered, &position);
                             assert_eq!(gathered, coord);
                             let index = indexer.position_to_index(&position);
                             assert_eq!(index / indexer.nonpawn_combinations, pawn_index);
 
-                            let reflected =
-                                crate::egt_file::mirror_horizontally(&position).unwrap();
+                            let reflected = crate::position::mirror_horizontally(&position);
                             assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                             assert_eq!(indexer.position_from_index(index, turn), Ok(position));
                             legal_positions += 1;
@@ -1183,7 +1177,7 @@ mod tests {
 
     #[test]
     fn combined_en_passant_groups_interleave_and_round_trip() {
-        use crate::egt_file::mirror_horizontally;
+        use crate::position::mirror_horizontally;
 
         for k in 1usize..=4 {
             for colors in 0usize..1 << (k - 1) {
@@ -1213,7 +1207,7 @@ mod tests {
                     if ranks.count_ones() as usize != k - 1 {
                         continue;
                     }
-                    let mut coord = Indexer::filled_coord(k + 3);
+                    let mut coord = filled(k + 3);
                     coord[0] = (4, 3); // Neighboring STM pawn on d5.
                     coord[1] = (4, 4); // Fixed SNTM victim on e5.
                     for (i, rank) in (0..3).rev().filter(|r| ranks & (1 << r) != 0).enumerate() {
@@ -1246,7 +1240,7 @@ mod tests {
                             index,
                             indexer.position_to_index(&without_ep) + indexer.nonpawn_combinations
                         );
-                        let reflected = mirror_horizontally(&position).unwrap();
+                        let reflected = mirror_horizontally(&position);
                         assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                     }
 
@@ -1332,7 +1326,7 @@ mod tests {
                         assert_decoder_matches(&indexer, index, turn),
                         Some(position.clone())
                     );
-                    let reflected = crate::egt_file::mirror_horizontally(&position).unwrap();
+                    let reflected = crate::position::mirror_horizontally(&position);
                     assert_eq!(indexer.reflected_position_to_index(&reflected), index);
                 }
             }
