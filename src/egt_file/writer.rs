@@ -138,7 +138,7 @@ fn publish_buffers(
                 source: Box::new(error),
             },
         })?;
-        Ok((length, format!("{:x}", hash.finalize())))
+        Ok((length, hex::encode(hash.finalize())))
     })
 }
 
@@ -238,7 +238,7 @@ mod tests {
         }
         let (bytes, sha256) = writer.publish(segments).unwrap();
         assert_eq!(bytes, expected.len() as u64);
-        assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
+        assert_eq!(sha256, hex::encode(Sha256::digest(&expected)));
         assert_eq!(
             fs::read(
                 dir.0
@@ -268,7 +268,7 @@ mod tests {
             let buffers = [data.slice(..split), data.slice(split..)];
             let (bytes, sha256) = publish_buffers(&location, &key, buffers).unwrap();
             assert_eq!(bytes, data.len() as u64);
-            assert_eq!(sha256, format!("{:x}", Sha256::digest(&data)));
+            assert_eq!(sha256, hex::encode(Sha256::digest(&data)));
             let uploaded = block_on(async {
                 location
                     .store

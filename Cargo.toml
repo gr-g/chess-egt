@@ -5,17 +5,18 @@ edition = "2024"
 default-run = "chess-egt"
 
 [dependencies]
-rayon = "1.11"
-zeekstd = "0.6.2"
-zstd-safe = { version = "7.2.4", features = ["std"] }
-clap = { version = "4.4", features = ["derive"] }
+rayon = "1.12"
+zeekstd = "0.6"
+zstd-safe = { version = "8.3", features = ["std"] }
+clap = { version = "4.6", features = ["derive"] }
 shakmaty = "0.30"
 arrayvec = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
-thiserror = "1.0"
-object_store = { version = "0.14.2", features = ["aws", "azure", "gcp", "http"] }
+sha2 = "0.11"
+hex = "0.4"
+thiserror = "2.0"
+object_store = { version = "0.14", features = ["aws", "azure", "gcp", "http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
 url = "2"

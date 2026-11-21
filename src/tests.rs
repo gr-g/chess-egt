@@ -187,7 +187,7 @@ fn generator_publishes_finalized_stats_with_shadowed_outputs() {
     for stats in &tables {
         let data = std::fs::read(table_path(&output.0, &stats.tablename, "ggegt")).unwrap();
         assert_eq!(stats.totals.bytes, data.len() as u64);
-        assert_eq!(stats.sha256, format!("{:x}", Sha256::digest(&data)));
+        assert_eq!(stats.sha256, hex::encode(Sha256::digest(&data)));
         let json = std::fs::read(table_path(&output.0, &stats.tablename, "json")).unwrap();
         assert_eq!(serde_json::from_slice::<EgtStats>(&json).unwrap(), *stats);
     }
