@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use shakmaty::{CastlingMode, Chess, Move, Position, PositionError, fen::Fen};
 
@@ -63,6 +63,17 @@ impl Tablebase {
     /// Sets the retained-frame cache budget in bytes and evicts frames if necessary.
     pub fn set_cache_size(&mut self, n: usize) {
         self.cache.set_cache_size(n);
+    }
+
+    /// Sets the idle age at which retained frames become eligible for eviction
+    /// by [`Self::evict_idle_frames`], which the caller should run periodically.
+    pub fn set_cache_idle_timeout(&mut self, timeout: Duration) {
+        self.cache.set_cache_idle_timeout(timeout);
+    }
+
+    /// Drops idle frames if an idle timeout is configured. In-flight probes keep their frames.
+    pub fn evict_idle_frames(&self) {
+        self.cache.evict_idle_frames();
     }
 
     /// Sets an input overlay for probing, verification, and generation dependencies.

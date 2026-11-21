@@ -16,7 +16,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
 object_store = { version = "0.14.2", features = ["aws", "azure", "gcp", "http"] }
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
 url = "2"
 bytes = "1"

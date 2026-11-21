@@ -21,10 +21,16 @@ use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, Tablebase,
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use shakmaty::{CastlingMode, Chess, Position, san::SanPlus};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::Semaphore;
 
 const MAX_OPERATIONS: usize = 8;
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 #[command(about = "gg-EGT API server")]
@@ -36,23 +42,25 @@ struct Cli {
     #[arg(long, default_value = "256MiB", value_parser = parse_byte_size)]
     cache_size: usize,
 
+    /// Evict frames after this many idle seconds (checked every 60 seconds).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    cache_idle_timeout: Option<u64>,
+
     #[arg(long, default_value = "127.0.0.1:44348")]
     bind: SocketAddr,
 }
 
 fn parse_byte_size(value: &str) -> Result<usize, String> {
     let normalized = value.to_ascii_lowercase();
-    let (number, multiplier) = if let Some(number) = normalized.strip_suffix("kib") {
-        (number, 1024)
-    } else if let Some(number) = normalized.strip_suffix("mib") {
-        (number, 1024 * 1024)
-    } else if let Some(number) = normalized.strip_suffix("gib") {
-        (number, 1024 * 1024 * 1024)
-    } else if let Some(number) = normalized.strip_suffix('b') {
-        (number, 1)
-    } else {
-        (normalized.as_str(), 1)
-    };
+    let (number, multiplier) = [
+        ("kib", 1 << 10),
+        ("mib", 1 << 20),
+        ("gib", 1 << 30),
+        ("b", 1),
+    ]
+    .into_iter()
+    .find_map(|(unit, multiplier)| Some((normalized.strip_suffix(unit)?, multiplier)))
+    .unwrap_or((&normalized, 1));
     let bytes = number
         .parse::<usize>()
         .map_err(|_| format!("invalid byte size '{value}'"))?;
@@ -99,17 +107,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tablebase = tokio::task::spawn_blocking(move || {
         let mut tablebase = Tablebase::new(&cli.path)?;
         tablebase.set_cache_size(cli.cache_size);
+        if let Some(seconds) = cli.cache_idle_timeout {
+            tablebase.set_cache_idle_timeout(Duration::from_secs(seconds));
+        }
         // An empty selection validates the root format without loading any tables.
         tablebase.stats(&[])?;
-        Ok::<_, EgtError>(tablebase)
+        Ok::<_, EgtError>(Arc::new(tablebase))
     })
     .await??;
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
     eprintln!("Listening on http://{}", listener.local_addr()?);
+    if cli.cache_idle_timeout.is_some() {
+        tokio::spawn(sweep_cache(tablebase.clone()));
+    }
     axum::serve(listener, router(tablebase))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+async fn sweep_cache(tablebase: Arc<Tablebase>) {
+    let mut interval = tokio::time::interval(CACHE_SWEEP_INTERVAL);
+    loop {
+        interval.tick().await;
+        let tablebase = tablebase.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || tablebase.evict_idle_frames()).await
+        {
+            eprintln!("frame cache sweep failed: {error}");
+            break;
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -129,7 +156,7 @@ async fn shutdown_signal() {
         .expect("failed to install interrupt handler");
 }
 
-fn router(tablebase: Tablebase) -> Router {
+fn router(tablebase: Arc<Tablebase>) -> Router {
     Router::new()
         .route("/outcome", get(outcome))
         .route("/query", get(query))
@@ -142,9 +169,10 @@ fn router(tablebase: Tablebase) -> Router {
                 "Method not allowed",
             )
         })
+        .layer(middleware::from_fn(limit_uri_length))
         .layer(middleware::from_fn(log_request))
         .with_state(AppState {
-            tablebase: Arc::new(tablebase),
+            tablebase,
             operations: Arc::new(Semaphore::new(MAX_OPERATIONS)),
         })
 }
@@ -153,22 +181,26 @@ async fn log_request(request: Request, next: Next) -> Response {
     let start = Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let response = if request.uri().to_string().len() > 8192 {
-        ApiError::new(
-            StatusCode::URI_TOO_LONG,
-            "uri_too_long",
-            "Request URI is too long",
-        )
-        .into_response()
-    } else {
-        next.run(request).await
-    };
+    let response = next.run(request).await;
     eprintln!(
         "{method} {path} {} {}ms",
         response.status(),
         start.elapsed().as_millis()
     );
     response
+}
+
+async fn limit_uri_length(request: Request, next: Next) -> Response {
+    let uri = request.uri();
+    if uri.path().len() + uri.query().map_or(0, str::len) > 8192 {
+        return ApiError::new(
+            StatusCode::URI_TOO_LONG,
+            "uri_too_long",
+            "Request URI is too long",
+        )
+        .into_response();
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]
@@ -209,7 +241,7 @@ async fn outcome(
     State(state): State<AppState>,
     params: Result<Query<QueryParams>, QueryRejection>,
 ) -> Result<Json<OutcomeResponse>, ApiError> {
-    let Query(params) = params.map_err(ApiError::invalid_query)?;
+    let Query(params) = params?;
     state
         .run(move |state| {
             let position = parse_position(&params.fen)?;
@@ -239,7 +271,7 @@ async fn query(
     State(state): State<AppState>,
     params: Result<Query<QueryParams>, QueryRejection>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let Query(params) = params.map_err(ApiError::invalid_query)?;
+    let Query(params) = params?;
     state
         .run(move |state| {
             let position = parse_position(&params.fen)?;
@@ -280,7 +312,7 @@ async fn stats(
     State(state): State<AppState>,
     params: Result<Query<StatsParams>, QueryRejection>,
 ) -> Result<Json<AggregateStats>, ApiError> {
-    let Query(params) = params.map_err(ApiError::invalid_query)?;
+    let Query(params) = params?;
     state
         .run(move |state| {
             let selectors: Vec<_> = params.tables.split(',').map(str::trim).collect();
@@ -312,8 +344,10 @@ impl ApiError {
             "Internal tablebase error",
         )
     }
+}
 
-    fn invalid_query(_: QueryRejection) -> Self {
+impl From<QueryRejection> for ApiError {
+    fn from(_: QueryRejection) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             "invalid_query",
@@ -324,67 +358,45 @@ impl ApiError {
 
 impl From<EgtError> for ApiError {
     fn from(error: EgtError) -> Self {
-        match error {
-            EgtError::InvalidEndgameName { .. } => Self::new(
-                StatusCode::BAD_REQUEST,
+        use StatusCode as S;
+        let (status, code, message) = match error {
+            EgtError::InvalidEndgameName { .. } => (
+                S::BAD_REQUEST,
                 "invalid_selector",
                 "Invalid table selection",
             ),
-            EgtError::InvalidFen(_) => {
-                Self::new(StatusCode::BAD_REQUEST, "invalid_fen", "Invalid FEN")
+            EgtError::InvalidFen(_) => (S::BAD_REQUEST, "invalid_fen", "Invalid FEN"),
+            EgtError::InvalidPosition(_) => {
+                (S::BAD_REQUEST, "invalid_position", "Invalid position")
             }
-            EgtError::InvalidPosition(_) => Self::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_position",
-                "Invalid position",
-            ),
-            EgtError::UnsupportedPosition(reason) => Self::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unsupported_position",
-                reason,
-            ),
-            EgtError::FileNotFound(_) => Self::new(
-                StatusCode::NOT_FOUND,
+            EgtError::UnsupportedPosition(reason) => {
+                (S::UNPROCESSABLE_ENTITY, "unsupported_position", reason)
+            }
+            EgtError::FileNotFound(_) => (
+                S::NOT_FOUND,
                 "table_unavailable",
                 "Required tablebase data is unavailable",
             ),
             other => {
                 eprintln!("tablebase error: {other}");
-                if matches!(other, EgtError::Storage { .. }) {
-                    Self::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "storage_unavailable",
-                        "Tablebase storage is unavailable",
-                    )
-                } else {
-                    Self::internal()
+                if !matches!(other, EgtError::Storage { .. }) {
+                    return Self::internal();
                 }
+                (
+                    S::SERVICE_UNAVAILABLE,
+                    "storage_unavailable",
+                    "Tablebase storage is unavailable",
+                )
             }
-        }
+        };
+        Self::new(status, code, message)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        #[derive(Serialize)]
-        struct ErrorBody {
-            code: &'static str,
-            message: &'static str,
-        }
-        #[derive(Serialize)]
-        struct Envelope {
-            error: ErrorBody,
-        }
-        (
-            self.status,
-            Json(Envelope {
-                error: ErrorBody {
-                    code: self.code,
-                    message: self.message,
-                },
-            }),
-        )
-            .into_response()
+        let body = serde_json::json!({"error": {"code": self.code, "message": self.message}});
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -473,7 +485,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let app = router(tablebase);
+        let app = router(Arc::new(tablebase));
         for (fen, expected) in [
             (
                 "8/8/8/8/8/8/3K4/k7 w - - 0 1",

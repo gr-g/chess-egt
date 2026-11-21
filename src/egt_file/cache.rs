@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use shakmaty::Chess;
 
@@ -10,49 +11,82 @@ use crate::storage::Location;
 use crate::table_id::TableId;
 use crate::{DtcOutcome, EgtError, EgtResult};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct CachedFrame {
+    frame: Arc<Frame>,
+    lru_order: u64,
+    last_used: Instant,
+}
+
+#[derive(Debug)]
 struct Lru {
-    map: HashMap<(TableId, usize), (Arc<Frame>, u64)>,
+    map: HashMap<(TableId, usize), CachedFrame>,
     resident: usize,
-    assigned: Option<usize>,
+    assigned: usize,
     clock: u64,
+    idle_timeout: Option<Duration>,
 }
 
 impl Lru {
-    fn get(&mut self, key: (TableId, usize)) -> Option<Arc<Frame>> {
-        let (frame, last_used) = self.map.get_mut(&key)?;
+    fn get(&mut self, key: (TableId, usize), now: Instant) -> Option<Arc<Frame>> {
+        let entry = self.map.get_mut(&key)?;
         self.clock = self.clock.wrapping_add(1);
-        *last_used = self.clock;
-        Some(Arc::clone(frame))
+        entry.lru_order = self.clock;
+        entry.last_used = now;
+        Some(Arc::clone(&entry.frame))
     }
 
-    fn insert(&mut self, key: (TableId, usize), frame: Frame) -> Arc<Frame> {
+    fn insert(&mut self, key: (TableId, usize), frame: Frame, now: Instant) -> Arc<Frame> {
         self.clock = self.clock.wrapping_add(1);
         match self.map.entry(key) {
             Entry::Occupied(mut entry) => {
-                let (frame, last_used) = entry.get_mut();
-                *last_used = self.clock;
-                Arc::clone(frame)
+                let entry = entry.get_mut();
+                entry.lru_order = self.clock;
+                entry.last_used = now;
+                Arc::clone(&entry.frame)
             }
             Entry::Vacant(entry) => {
                 self.resident += frame.bytes();
                 let frame = Arc::new(frame);
-                entry.insert((Arc::clone(&frame), self.clock));
+                entry.insert(CachedFrame {
+                    frame: Arc::clone(&frame),
+                    lru_order: self.clock,
+                    last_used: now,
+                });
                 frame
             }
         }
     }
 
     fn enforce_limit(&mut self) {
-        if self.assigned == Some(0) {
+        // Avoid one linear victim scan per frame when the cache is disabled.
+        if self.assigned == 0 {
             self.map.clear();
             self.resident = 0;
-            return;
         }
-        while self.assigned.is_some_and(|limit| self.resident > limit) {
-            let (&victim, _) = self.map.iter().min_by_key(|(_, (_, age))| age).unwrap();
-            let (frame, _) = self.map.remove(&victim).unwrap();
-            self.resident -= frame.bytes();
+        while self.resident > self.assigned {
+            let (&victim, _) = self
+                .map
+                .iter()
+                .min_by_key(|(_, entry)| entry.lru_order)
+                .unwrap();
+            self.resident -= self.map.remove(&victim).unwrap().frame.bytes();
+        }
+    }
+
+    fn evict_idle(&mut self, now: Instant) {
+        let Some(timeout) = self.idle_timeout else {
+            return;
+        };
+        self.map.retain(|_, entry| {
+            let expired = now.duration_since(entry.last_used) >= timeout;
+            if expired {
+                self.resident -= entry.frame.bytes();
+            }
+            !expired
+        });
+        if self.map.is_empty() {
+            self.map = HashMap::new();
         }
     }
 }
@@ -73,14 +107,29 @@ impl SharedFileCache {
         Self {
             files: RwLock::new(HashMap::new()),
             source,
-            frames: Mutex::new(Lru::default()),
+            frames: Mutex::new(Lru {
+                map: HashMap::new(),
+                resident: 0,
+                assigned: usize::MAX,
+                clock: 0,
+                idle_timeout: None,
+            }),
         }
     }
 
     pub(crate) fn set_cache_size(&self, assigned: usize) {
         let mut lru = self.frames.lock().unwrap();
-        lru.assigned = Some(assigned);
+        lru.assigned = assigned;
         lru.enforce_limit();
+    }
+
+    pub(crate) fn set_cache_idle_timeout(&self, timeout: Duration) {
+        self.frames.lock().unwrap().idle_timeout = Some(timeout);
+    }
+
+    pub(crate) fn evict_idle_frames(&self) {
+        let mut lru = self.frames.lock().unwrap();
+        lru.evict_idle(Instant::now());
     }
 
     pub(crate) fn source(&self) -> &Source {
@@ -110,10 +159,11 @@ impl SharedFileCache {
     ) -> EgtResult<HashMap<usize, Arc<Frame>>> {
         let mut ready = HashMap::with_capacity(frames.len());
         let mut missing = Vec::new();
+        let now = Instant::now();
         {
             let mut lru = self.frames.lock().unwrap();
             for &frame in frames {
-                if let Some(data) = lru.get((id, frame)) {
+                if let Some(data) = lru.get((id, frame), now) {
                     ready.insert(frame, data);
                 } else {
                     missing.push(frame);
@@ -124,7 +174,7 @@ impl SharedFileCache {
             let decoded = file.read_frames(&missing)?;
             let mut lru = self.frames.lock().unwrap();
             for (frame, data) in missing.into_iter().zip(decoded) {
-                ready.insert(frame, lru.insert((id, frame), data));
+                ready.insert(frame, lru.insert((id, frame), data, now));
             }
             lru.enforce_limit();
         }
@@ -167,10 +217,8 @@ impl SharedFileCache {
     pub(crate) fn clear(&mut self) {
         self.files.get_mut().unwrap().clear();
         let lru = self.frames.get_mut().unwrap();
-        *lru = Lru {
-            assigned: lru.assigned,
-            ..Lru::default()
-        };
+        lru.map = HashMap::new();
+        lru.resident = 0;
     }
 }
 
@@ -283,6 +331,32 @@ mod tests {
         assert_eq!(cache.probe(&positions[0].1).unwrap(), DtcOutcome::Draw);
         assert!(!resident("KQ_K"));
         assert_eq!(cache.frames.lock().unwrap().resident, 0);
+    }
+
+    #[test]
+    fn shared_cache_sweeps_idle_frames() {
+        let dir = crate::TestDir::new("shared_cache_idle");
+        write_fixture(&dir.0, "KQ_K", |_| PackedOutcome::DRAW);
+        let position = crate::parse_position("8/8/8/8/8/8/3Q4/K6k w - - 0 1").unwrap();
+        let key = (TableId::parse("KQ_K").unwrap(), 0);
+        let cache = SharedFileCache::new(Source::new(Location::parse(&dir.0).unwrap()));
+        let timeout = Duration::from_secs(3600);
+        cache.probe(&position).unwrap();
+        let mut lru = cache.frames.lock().unwrap();
+        let first_access = lru.map[&key].last_used;
+        lru.evict_idle(first_access + 2 * timeout);
+        assert_eq!(lru.map.len(), 1, "no timeout configured");
+
+        lru.idle_timeout = Some(timeout);
+        let hit_at = first_access + timeout;
+        let frame = lru.get(key, hit_at).unwrap();
+        let bytes = frame.bytes();
+        lru.evict_idle(hit_at);
+        assert_eq!(lru.resident, bytes);
+        lru.evict_idle(hit_at + timeout);
+        assert!(lru.map.is_empty());
+        assert_eq!(lru.resident, 0);
+        assert_eq!(frame.bytes(), bytes);
     }
 
     #[test]

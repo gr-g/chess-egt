@@ -35,8 +35,6 @@ Compressed size: 3289.07 MiB (1.07 bits/pos). Lowest compression: KBB_KQ (3.80 b
 - Visibility and public interface.
 - Freeze file format ("v1").
 - `generate` does not replace existing tables.
-- `--cache-ttl` option.
-- Zeekstd seek table?
 - Frontend, cloning https://syzygy-tables.info/
 - Explore possibility of generating tables that store together DTC and DTM for
   the same index, not only DTC.
