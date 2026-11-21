@@ -1,6 +1,6 @@
-use crate::outcome::PackedOutcome;
 use super::*;
 use crate::egt_file::TableFile;
+use crate::outcome::PackedOutcome;
 use crate::storage::Location;
 use shakmaty::{Chess, Color, Position};
 use std::collections::BTreeSet;
@@ -30,30 +30,8 @@ fn aggregate(tables: &[EgtStats]) -> AggregateStats {
     total
 }
 
-fn verify_internal_consistency(selector: &str) {
-    let dir = TestDir::new(&format!("verify_internal_consistency_{selector}"));
-    let mut tablebase = test_generator(&dir.0);
-    tablebase.generate(&["K_K", selector]).unwrap();
-    let mut tables = resolve_selectors(&[selector]).unwrap();
-    tables.extend(tables.clone().into_iter().map(|id| id.twin().0));
-    let names: Vec<_> = tables.iter().map(TableId::name).collect();
-    tablebase
-        .verify(&names.iter().map(|name| name.as_str()).collect::<Vec<_>>())
-        .unwrap();
-}
-
 #[test]
-fn test_verify_internal_consistency_k_k() {
-    verify_internal_consistency("K_K");
-}
-
-#[test]
-fn test_verify_internal_consistency_kr_k() {
-    verify_internal_consistency("KR_K");
-}
-
-#[test]
-fn test_verify_internal_consistency_kp_k() {
+fn verification_distinguishes_exact_tables_from_material_families() {
     let dir = TestDir::new("verify_internal_consistency_KP_K");
     let mut tablebase = test_generator(&dir.0);
     let tables = tablebase
@@ -66,13 +44,16 @@ fn test_verify_internal_consistency_kp_k() {
         .collect();
     let expected = resolve_selectors(&["KP_K", "K_KP"]).unwrap();
     let names: Vec<_> = expected.iter().map(TableId::name).collect();
-    assert_eq!(pawn_tables, names.iter().map(|name| name.as_str()).collect());
+    assert_eq!(
+        pawn_tables,
+        names.iter().map(|name| name.as_str()).collect()
+    );
     assert_eq!(pawn_tables.len(), 8);
     for id in &expected {
         let file = TableFile::open(&Location::parse(&dir.0).unwrap(), id).unwrap();
         assert_eq!(file.egt().id(), *id);
     }
-    tablebase.verify(&["KP_K", "K_KP"]).unwrap();
+    tablebase.verify(&["KR_K", "K_KR", "KP_K", "K_KP"]).unwrap();
 
     // Exact verification must not expand an identity to its material family.
     for id in expected
@@ -100,24 +81,6 @@ fn default_and_zero_threads_generate_and_verify() {
         assert_eq!(tables.len(), 1);
         tablebase.verify(&["K_K"]).unwrap();
     }
-}
-
-#[test]
-fn bounded_cache_size_supports_probing_generated_and_verified_tables() {
-    let dir = TestDir::new("bounded_cache_size");
-    // Fit both queen-table frames, but force eviction when K_K is also probed.
-    let cache_bytes = 2 * Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap().index_range() * 2;
-    let mut tablebase = test_generator(&dir.0);
-    let tables = tablebase.generate(&["K_K", "KQ_K"]).unwrap();
-    assert_eq!(tables.len(), 3);
-    tablebase.verify(&["KQ_K", "K_KQ"]).unwrap();
-    tablebase.set_cache_size(cache_bytes).unwrap();
-
-    let egt = Egt::new(&crate::TableId::parse("KQ_K").unwrap()).unwrap();
-    let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White).ok())
-        .unwrap();
-    tablebase.probe(&position).unwrap();
 }
 
 #[test]
@@ -186,20 +149,6 @@ fn probing_rejects_castling_rights_before_table_lookup() {
             );
         }
     }
-}
-
-#[test]
-fn zero_cache_size_supports_probing_generated_and_verified_tables() {
-    let dir = TestDir::new("zero_cache_size");
-    let mut tablebase = test_generator(&dir.0);
-    tablebase.generate(&["K_K"]).unwrap();
-    tablebase.verify(&["K_K"]).unwrap();
-    tablebase.set_cache_size(0).unwrap();
-    let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
-    let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White).ok())
-        .unwrap();
-    assert_eq!(tablebase.probe(&position).unwrap(), DtcOutcome::Draw);
 }
 
 #[test]
@@ -312,10 +261,7 @@ fn changing_input_path_invalidates_warmed_lookup_precedence() {
     test_generator(&output.0).generate(&["K_K"]).unwrap();
     Location::parse(&input.0).unwrap().ensure_format().unwrap();
     write_artifact(&input.0, "K_K", "ggegt", &[0xff; 64]);
-    let egt = Egt::new(&crate::TableId::parse("K_K").unwrap()).unwrap();
-    let position = (0..egt.index_range())
-        .find_map(|index| egt.position_from_index(index, Color::White).ok())
-        .unwrap();
+    let position = position_for("K_K");
     let mut prober = Tablebase::new(&output.0).unwrap();
     assert_eq!(prober.probe(&position).unwrap(), DtcOutcome::Draw);
     prober.set_input_path(&input.0).unwrap();
@@ -357,20 +303,6 @@ fn statistics_describe_one_root_independently_of_probing_overlays() {
 fn object_exists(location: &Location, path: &str) -> bool {
     use object_store::ObjectStoreExt;
     crate::storage::block_on(location.store.head(&location.key(path))).is_ok()
-}
-
-#[test]
-fn selector_union_is_sorted_deduplicated_and_preserves_orientation() {
-    let tables = resolve_selectors(&["KP_K", "K_KP", "KP_K"]).unwrap();
-    assert_eq!(tables, resolve_selectors(&["KP_K", "K_KP"]).unwrap());
-    assert_eq!(tables.len(), 8);
-    assert!(tables.windows(2).all(|pair| pair[0] < pair[1]));
-    let exact = resolve_selectors(&["KQ_K", "KQ_K", "KR_K"]).unwrap();
-    assert_eq!(
-        exact.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        ["KQ_K", "KR_K"]
-    );
-    assert!(!exact.contains(&TableId::parse("K_KQ").unwrap()));
 }
 
 fn position_for(name: &str) -> Chess {

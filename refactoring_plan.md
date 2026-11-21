@@ -520,7 +520,7 @@ four places:
 
 ---
 
-## 12. Formatting and comments
+## 12. Formatting and comments (done)
 
 **Implementation.**
 1. Run `cargo fmt` over the whole crate in a dedicated commit-sized step

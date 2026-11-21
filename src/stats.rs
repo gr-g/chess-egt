@@ -728,34 +728,19 @@ mod tests {
     }
 
     #[test]
-    fn validates_table_specific_frame_size_with_synthetic_index_range() {
-        for name in ["K_K", "KQ_K", "KQ_KR", "KPao_KPao"] {
-            let id = TableId::parse(name).unwrap();
-            let mut stats = stats();
-            stats.tablename = name.into();
-            stats.frame_size = Egt::new(&id).unwrap().frame_size();
-            stats.validate(&id).unwrap();
-            for frame_size in [0, 256 * 1024, stats.frame_size + 1] {
-                stats.frame_size = frame_size;
-                assert!(stats.validate(&id).is_err(), "{name}: {frame_size}");
-            }
-        }
-    }
-
-    #[test]
     fn validates_file_metadata_and_cached_totals() {
         let id = TableId::parse("KQ_K").unwrap();
+        stats().validate(&id).unwrap();
+        let mut wrong_frame_size = stats();
+        wrong_frame_size.frame_size += 1;
+        assert!(wrong_frame_size.validate(&id).is_err());
         for field in [
             "bytes",
-            "frame_size",
             "num_frames",
             "index_range",
             "win",
             "unique_positions",
-        ]
-        .into_iter()
-        .chain(PARTITION_FIELDS)
-        {
+        ] {
             let mut json = serde_json::to_value(stats()).unwrap();
             json[field] = 0.into();
             let invalid: EgtStats = serde_json::from_value(json).unwrap();

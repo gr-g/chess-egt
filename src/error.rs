@@ -1,6 +1,5 @@
 //! Error types for the chess-egt library.
 
-
 /// A specialized result type for chess-egt operations.
 pub type EgtResult<T> = Result<T, EgtError>;
 
@@ -9,10 +8,7 @@ pub type EgtResult<T> = Result<T, EgtError>;
 pub enum EgtError {
     /// The endgame name (e.g. "KQ_KPc") is malformed.
     #[error("invalid endgame name {name:?}: {reason}")]
-    InvalidEndgameName {
-        name: String,
-        reason: &'static str,
-    },
+    InvalidEndgameName { name: String, reason: &'static str },
 
     /// A position is not supported (too many pieces, position has
     /// castling rights).
@@ -104,8 +100,14 @@ pub enum EgtError {
 }
 
 impl EgtError {
-    pub(crate) fn invalid_data(location: impl Into<String>, source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::InvalidData { location: location.into(), source: source.into() }
+    pub(crate) fn invalid_data(
+        location: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::InvalidData {
+            location: location.into(),
+            source: source.into(),
+        }
     }
 
     pub(crate) fn into_data_source(self) -> Box<dyn std::error::Error + Send + Sync> {

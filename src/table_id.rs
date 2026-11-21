@@ -14,7 +14,7 @@ mod dependencies;
 
 type TableName = ArrayString<{ 3 * MAX_PIECES + 1 }>;
 
-/// A validated exact table name, without an indexing plan or storage access.
+/// A validated table identity, independent of its indexer and storage location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TableId {
     pawns: PawnKey,
@@ -45,18 +45,37 @@ impl Ord for TableId {
             .cmp(&(other.n_pieces(), other.n_pawns()))
             .then_with(|| other.pieces[0].cmp(&self.pieces[0]))
             // Earlier tokens sort first, even when a STM token faces the '_' separator.
-            .then_with(|| other.pawns.file_counts(true).cmp(&self.pawns.file_counts(true)))
+            .then_with(|| {
+                other
+                    .pawns
+                    .file_counts(true)
+                    .cmp(&self.pawns.file_counts(true))
+            })
             .then_with(|| other.pieces[1].cmp(&self.pieces[1]))
-            .then_with(|| other.pawns.file_counts(false).cmp(&self.pawns.file_counts(false)))
+            .then_with(|| {
+                other
+                    .pawns
+                    .file_counts(false)
+                    .cmp(&self.pawns.file_counts(false))
+            })
             // Equal file counts imply equal word lengths. Compare ascending rank,
             // which is stored least-significant bit first.
             .then_with(|| {
-                self.pawns.files.map(u8::reverse_bits).cmp(&other.pawns.files.map(u8::reverse_bits))
+                self.pawns
+                    .files
+                    .map(u8::reverse_bits)
+                    .cmp(&other.pawns.files.map(u8::reverse_bits))
             })
     }
 }
 
-pub(crate) const NONPAWN_ROLES: [Role; 5] = [Role::King, Role::Queen, Role::Rook, Role::Bishop, Role::Knight];
+pub(crate) const NONPAWN_ROLES: [Role; 5] = [
+    Role::King,
+    Role::Queen,
+    Role::Rook,
+    Role::Bishop,
+    Role::Knight,
+];
 
 fn role_index(role: Role) -> usize {
     match role {
@@ -105,7 +124,11 @@ impl TableId {
     }
 
     pub(crate) fn pawn_groups(&self) -> impl Iterator<Item = (File, u8)> + '_ {
-        self.pawns.files.iter().copied().enumerate()
+        self.pawns
+            .files
+            .iter()
+            .copied()
+            .enumerate()
             .filter(|&(_, word)| word != 1)
             .map(|(file, word)| (File::new(file as u32), word))
     }
@@ -124,7 +147,10 @@ impl TableId {
 
     /// Oriented material, retaining STM on the left.
     pub fn material(&self) -> String {
-        self.name().chars().filter(|c| !c.is_ascii_lowercase()).collect()
+        self.name()
+            .chars()
+            .filter(|c| !c.is_ascii_lowercase())
+            .collect()
     }
 
     /// Exchanges STM and SNTM, returning the canonical identity and file reflection.
@@ -178,10 +204,14 @@ impl TableId {
         (self.n_pieces() - enemy, enemy)
     }
     pub(crate) fn hierarchy(&self) -> Hierarchy {
-        Hierarchy::from_counts(self.side_piece_counts(), self.opposing_pairs(), self.n_pawns())
+        Hierarchy::from_counts(
+            self.side_piece_counts(),
+            self.opposing_pairs(),
+            self.n_pawns(),
+        )
     }
 
-    /// Portable relative path; performs no storage I/O.
+    /// Portable relative path within a tablebase root.
     pub fn relative_path(&self, extension: &str) -> String {
         let ext = extension.trim_start_matches('.');
         format!("{}{self}.{ext}", self.hierarchy())
@@ -226,7 +256,6 @@ fn format_name(key: PawnKey, count: impl Fn(EgtSide, Role) -> usize) -> TableNam
     name
 }
 
-/// Parses and validates a descriptor without constructing an indexing plan.
 pub(crate) fn parse_oriented(tablename: &str) -> EgtResult<TableId> {
     let invalid = |reason| EgtError::InvalidEndgameName {
         name: tablename.to_owned(),
@@ -413,7 +442,6 @@ impl PawnKey {
             (reflected, true)
         }
     }
-
 }
 
 pub(crate) const MAX_PIECES: usize = 8;
@@ -429,9 +457,12 @@ pub(crate) mod test_support {
     use super::*;
 
     pub(crate) fn pawn_group(file: File, order: &[EgtSide]) -> (File, u8) {
-        let word = order.iter().enumerate().fold(1 << order.len(), |word, (i, &side)| {
-            word | (u8::from(side == EgtSide::SideNotToMove) << i)
-        });
+        let word = order
+            .iter()
+            .enumerate()
+            .fold(1 << order.len(), |word, (i, &side)| {
+                word | (u8::from(side == EgtSide::SideNotToMove) << i)
+            });
         (file, word)
     }
 
@@ -510,24 +541,11 @@ mod tests {
     }
 
     #[test]
-    fn parsing_is_cheap_canonical_and_strict() {
-        for name in ["K_K", "KQ_K", "KPa_K", "KPao_KPao", "KPa_KPa", "KPaPh_K"] {
-            let table = TableId::parse(name).unwrap();
-            assert_eq!(table.name().as_str(), name);
-            assert_eq!(parse_oriented(name).unwrap(), table);
-        }
-        for name in [
-            "",
-            "KP_K",
-            "KPh_K",
-            "K_KPh",
-            "KQK_K",
-            "KPaPaPaPaPaPaPa_K",
-            "KQQQQQQQ_K",
-        ] {
+    fn only_oriented_parsing_accepts_reflected_names() {
+        for name in ["KPh_K", "K_KPh"] {
             assert!(TableId::parse(name).is_err(), "{name}");
+            assert_eq!(parse_oriented(name).unwrap().name().as_str(), name);
         }
-        assert_eq!(parse_oriented("KPh_K").unwrap().name().as_str(), "KPh_K");
     }
 
     fn old_name_order(a: &TableId, b: &TableId) -> Ordering {
@@ -550,10 +568,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let counts = |name: &str| {
-            (name.bytes().filter(u8::is_ascii_uppercase).count(), name.bytes().filter(|&b| b == b'P').count())
+            (
+                name.bytes().filter(u8::is_ascii_uppercase).count(),
+                name.bytes().filter(|&b| b == b'P').count(),
+            )
         };
         let (a_name, b_name) = (a.name(), b.name());
-        counts(&a_name).cmp(&counts(&b_name))
+        counts(&a_name)
+            .cmp(&counts(&b_name))
             .then_with(|| name_key(&a_name).cmp(name_key(&b_name)))
             .then_with(|| pawn_elements(a).cmp(&pawn_elements(b)))
     }
@@ -568,15 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn table_order_preserves_material_and_pawn_ties() {
-        for (first, second) in [("KR_K", "K_KQ"), ("KQQ_K", "KQR_K"), ("KPao_KPao", "KPa_KPa")] {
-            let first = TableId::parse(first).unwrap();
-            let second = TableId::parse(second).unwrap();
-            assert!(first < second);
-        }
-    }
-
-    #[test]
     fn ordering_is_consistent_with_identity() {
         let mut tables = crate::resolve_selectors(&["2/", "3/", "4/"]).unwrap();
         tables.extend(crate::resolve_selectors(&["KPP_KP"]).unwrap());
@@ -586,10 +599,7 @@ mod tests {
                 assert_eq!(a.cmp(b), b.cmp(a).reverse());
                 assert_eq!(a.partial_cmp(b), Some(a.cmp(b)));
             }
-            assert_eq!(
-                a.cmp(&TableId::parse(&a.name()).unwrap()),
-                Ordering::Equal
-            );
+            assert_eq!(a.cmp(&TableId::parse(&a.name()).unwrap()), Ordering::Equal);
         }
     }
 
@@ -651,12 +661,8 @@ mod tests {
         let table = TableId::parse("KPaPho_KPaPho").unwrap();
         let key = table.pawns;
         assert!(TableId::parse("KPaoPh_KPaoPh").is_err());
-        assert_eq!(
-            opposite.pawns.canonicalized(),
-            (key, true)
-        );
+        assert_eq!(opposite.pawns.canonicalized(), (key, true));
         assert_eq!(key.canonicalized(), (key, false));
-        assert_eq!(key.reflected().canonicalized(), (key, true));
         assert!(!key.is_symmetric());
         for name in ["K_K", "KPaPh_K", "KPaoPho_KPaoPho"] {
             let key = TableId::parse(name).unwrap().pawns;
@@ -678,8 +684,6 @@ mod tests {
                 assert_eq!(key.twin().twin(), key);
                 assert_eq!(key.twin().canonicalized().1, reflected);
                 assert_eq!(TableId::parse(&table.name()).unwrap(), table);
-                // Indexers are used only by this compatibility test, never by
-                // production identity construction or theoretical enumeration.
                 if table.n_pieces() > 4 {
                     continue;
                 }

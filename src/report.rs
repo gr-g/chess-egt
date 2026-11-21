@@ -3,11 +3,7 @@ use std::time::Duration;
 use crate::{AggregateStats, EgtStats};
 
 /// Formats wall time and allocated core time per index slot.
-pub(crate) fn format_timing(
-    elapsed: Duration,
-    index_range: usize,
-    threads: usize,
-) -> String {
+pub(crate) fn format_timing(elapsed: Duration, index_range: usize, threads: usize) -> String {
     let seconds = elapsed.as_secs();
     let core_us_per_index = if index_range > 0 {
         elapsed.as_secs_f64() * threads as f64 * 1_000_000.0 / index_range as f64
@@ -29,7 +25,10 @@ pub(crate) fn generation_summary(
     threads: usize,
     lowest_compression: Option<(&str, f64)>,
 ) -> String {
-    let totals = total.totals.as_ref().expect("generation statistics are complete");
+    let totals = total
+        .totals
+        .as_ref()
+        .expect("generation statistics are complete");
     let unique_positions = totals.unique_positions;
     let bytes = totals.bytes;
     let average_compression = if unique_positions > 0 {

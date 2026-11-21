@@ -38,9 +38,7 @@ impl TableId {
         let counts = self.pieces;
         let victims: Vec<_> = NONPAWN_ROLES
             .into_iter()
-            .filter(|&role| {
-                role != Role::King && counts[1][role_index(role)] != 0
-            })
+            .filter(|&role| role != Role::King && counts[1][role_index(role)] != 0)
             .collect();
         let mut dependencies = BTreeSet::new();
         let mut emit = |key: PawnKey, captured: Option<Role>, promoted: Option<Role>| {

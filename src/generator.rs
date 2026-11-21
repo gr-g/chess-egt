@@ -98,7 +98,9 @@ fn generate_pair(source: &Source, pair: &TablePair) -> EgtResult<Vec<EgtStats>> 
     for (id, table) in ids().zip(tables) {
         let (egt, values, maxima, invalid) = table.into_parts();
         println!("{id}: finalizing outcomes, statistics and compression...");
-        stats.push(finalization::finalize_table(base, id, &egt, values, maxima, invalid)?);
+        stats.push(finalization::finalize_table(
+            base, id, &egt, values, maxima, invalid,
+        )?);
     }
     let finalize_time = finalize_start.elapsed();
     let total_time = dependency_time + init_time + timings.propagation + finalize_time;
@@ -132,8 +134,10 @@ mod tests {
         let mut generator = Tablebase::new(&dir.0).unwrap();
         generator.set_threads(4);
         let result = generator.generate(&["KQ_K"]);
-        assert!(matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
-            if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_))));
+        assert!(
+            matches!(result, Err(EgtError::DependencyUnavailable { dependency, source })
+            if dependency == "K_K" && matches!(*source, EgtError::FileNotFound(_)))
+        );
         for name in ["K_K", "KQ_K", "K_KQ"] {
             let id = TableId::parse(name).unwrap();
             assert!(!dir.0.join(id.relative_path("ggegt")).exists());
@@ -141,111 +145,44 @@ mod tests {
     }
 
     #[test]
-    fn zero_threads_uses_rayon_default() {
-        let dir = crate::TestDir::new("zero_threads");
+    fn three_piece_generation_matches_established_outcome_counts() {
+        let dir = crate::TestDir::new("three_piece_generation");
+        let location = Location::parse(&dir.0).unwrap();
         let mut generator = Tablebase::new(&dir.0).unwrap();
-        generator.set_threads(0);
-        generator.generate(&["K_K"]).unwrap();
-        assert!(dir.0.join(TableId::parse("K_K").unwrap().relative_path("ggegt")).exists());
-    }
-
-    fn verify_table_generation(
-        endgame: &str,
-        expected_range_a: usize,
-        expected_wins_a: usize,
-        expected_draws_a: usize,
-        expected_losses_a: usize,
-        expected_invalid_a: usize,
-        expected_range_b: Option<usize>,
-        expected_wins_b: Option<usize>,
-        expected_draws_b: Option<usize>,
-        expected_losses_b: Option<usize>,
-        expected_invalid_b: Option<usize>,
-    ) {
-        let test_dir = crate::TestDir::new(&format!("generation_{}", endgame));
-        let location = Location::parse(&test_dir.0).unwrap();
-        let mut generator = Tablebase::new(&test_dir.0).unwrap();
         generator.set_threads(2);
-        if endgame != "K_K" {
-            generator.generate(&["K_K"]).unwrap();
-        }
-        if endgame == "KP_K" {
-            for dependency in ["KQ_K", "KR_K", "KB_K", "KN_K"] {
-                generator.generate(&[dependency]).unwrap();
-            }
-        }
-        generator.generate(&[endgame]).unwrap();
+        generator.generate(&["2", "3"]).unwrap();
 
-        // Check the established outcome totals by summing individual sidecars,
-        // not by constructing a composite table or comparing legacy artifacts.
-        let totals = |material: &str| {
-            let mut totals = [0usize; 5];
+        // Index range, wins, draws, losses, excluded indices.
+        for (material, expected) in [
+            ("K_K", [462, 0, 462, 0, 0]),
+            ("KQ_K", [28644, 18081, 0, 0, 10563]),
+            ("K_KQ", [28644, 0, 2896, 25160, 588]),
+            ("KR_K", [28644, 21959, 0, 0, 6685]),
+            ("K_KR", [28644, 0, 2796, 25260, 588]),
+            ("KB_K", [28644, 0, 24178, 0, 4466]),
+            ("K_KB", [28644, 0, 28056, 0, 588]),
+            ("KN_K", [28644, 0, 25750, 0, 2894]),
+            ("K_KN", [28644, 0, 28056, 0, 588]),
+            ("KP_K", [93744, 62480, 19184, 0, 12080]),
+            ("K_KP", [93744, 0, 35210, 48802, 9732]),
+        ] {
+            let mut totals = [0; 5];
             for id in TableSelector::parse(material).unwrap().resolve().unwrap() {
                 let stats = crate::stats::read_stats(&location, &id).unwrap();
-                let excluded = stats.totals.invalid_opposite_check
-                                    + stats.totals.invalid_ep_squares_occupied + stats.totals.invalid_illegal_ep_capture + stats.totals.redundant;
-                                let counts = [stats.index_range, stats.totals.win, stats.totals.draw, stats.totals.loss, excluded];
-                for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
+                let t = stats.totals;
+                let excluded = t.invalid_opposite_check
+                    + t.invalid_ep_squares_occupied
+                    + t.invalid_illegal_ep_capture
+                    + t.redundant;
+                for (total, count) in
+                    totals
+                        .iter_mut()
+                        .zip([stats.index_range, t.win, t.draw, t.loss, excluded])
+                {
+                    *total += count;
+                }
             }
-            totals
-        };
-        assert_eq!(totals(endgame), [expected_range_a, expected_wins_a, expected_draws_a, expected_losses_a, expected_invalid_a]);
-        if let Some(expected_range_b) = expected_range_b {
-            let (a, b) = endgame.split_once('_').unwrap();
-            assert_eq!(totals(&format!("{b}_{a}")), [expected_range_b, expected_wins_b.unwrap(), expected_draws_b.unwrap(), expected_losses_b.unwrap(), expected_invalid_b.unwrap()]);
-        } else {
-            let ids = TableSelector::parse(endgame).unwrap().resolve().unwrap();
-            assert!(ids.iter().all(|id| id.twin().0 == *id));
+            assert_eq!(totals, expected, "{material}");
         }
-    }
-
-    #[test]
-    fn test_k_k_table_generation() {
-        verify_table_generation("K_K", 462, 0, 462, 0, 0, None, None, None, None, None);
-    }
-
-    #[test]
-    fn test_kq_k_table_generation() {
-        verify_table_generation(
-            "KQ_K",
-            28644, 18081, 0, 0, 10563,
-            Some(28644), Some(0), Some(2896), Some(25160), Some(588)
-        );
-    }
-
-    #[test]
-    fn test_kr_k_table_generation() {
-        verify_table_generation(
-            "KR_K",
-            28644, 21959, 0, 0, 6685,
-            Some(28644), Some(0), Some(2796), Some(25260), Some(588)
-        );
-    }
-
-    #[test]
-    fn test_kb_k_table_generation() {
-        verify_table_generation(
-            "KB_K",
-            28644, 0, 24178, 0, 4466,
-            Some(28644), Some(0), Some(28056), Some(0), Some(588)
-        );
-    }
-
-    #[test]
-    fn test_kn_k_table_generation() {
-        verify_table_generation(
-            "KN_K",
-            28644, 0, 25750, 0, 2894,
-            Some(28644), Some(0), Some(28056), Some(0), Some(588)
-        );
-    }
-
-    #[test]
-    fn test_kp_k_table_generation() {
-        verify_table_generation(
-            "KP_K",
-            93744, 62480, 19184, 0, 12080,
-            Some(93744), Some(0), Some(35210), Some(48802), Some(9732)
-        );
     }
 }

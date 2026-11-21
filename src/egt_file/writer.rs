@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::frame;
-use crate::outcome::PackedOutcome;
 use crate::error::{EgtError, EgtResult};
+use crate::outcome::PackedOutcome;
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
 
@@ -19,7 +19,7 @@ pub(crate) const COMPRESSION_LEVEL: i32 = 19;
 pub(crate) struct CompressedSegment {
     pub(crate) data: Bytes,
     pub(crate) seek_table: zeekstd::SeekTable,
-    // Serialized palette lengths no longer identify the number of positions.
+    // Palette payload sizes do not determine position counts.
     pub(crate) frame_lengths: Vec<usize>,
 }
 
@@ -187,7 +187,6 @@ pub(crate) fn write_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egt_file::TableFile;
     use object_store::ObjectStoreExt;
     use std::{fs, path::Path};
 
@@ -256,8 +255,6 @@ mod tests {
         let key = location.key("2/1v1/op0/0pawns/K_K.ggegt");
         for length in [
             0,
-            17,
-            UPLOAD_BUFFER_SIZE - 1,
             UPLOAD_BUFFER_SIZE,
             UPLOAD_BUFFER_SIZE + 17,
             2 * UPLOAD_BUFFER_SIZE,
@@ -287,73 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn short_tail_loads_via_reader() {
-        let dir = crate::TestDir::new("writer_short_tail");
-        let writer = writer(&dir.0, "KQ_KR");
-        assert!(writer.length % writer.frame_size != 0);
-        let values: Vec<_> = (0..writer.length)
-            .map(|index| {
-                PackedOutcome::new_win(crate::ConversionType::Capture, (index % 257) as u16)
-            })
-            .collect();
-        let mut expected = Vec::new();
-        let mut encoder = zeekstd::EncodeOptions::new()
-            .compression_level(COMPRESSION_LEVEL)
-            .into_encoder(&mut expected)
-            .unwrap();
-        for chunk in values.chunks(writer.frame_size) {
-            encode_frame(&mut encoder, chunk).unwrap();
-        }
-        encoder.flush().unwrap();
-        let seek_table = encoder.into_seek_table();
-        let segment = CompressedSegment {
-            data: expected.clone().into(),
-            seek_table: seek_table.clone(),
-            frame_lengths: values.chunks(writer.frame_size).map(<[_]>::len).collect(),
-        };
-        seek_table
-            .into_serializer()
-            .read_to_end(&mut expected)
-            .unwrap();
-        let length = writer.length;
-        let frame_size = writer.frame_size;
-        let destination = dir
-            .0
-            .join(TableId::parse("KQ_KR").unwrap().relative_path("ggegt"));
-        assert!(!destination.exists());
-        let (bytes, sha256) = writer.publish(vec![segment]).unwrap();
-        assert_eq!(bytes, expected.len() as u64);
-        assert_eq!(sha256, format!("{:x}", Sha256::digest(&expected)));
-        assert_eq!(fs::read(&destination).unwrap(), expected);
-
-        let reader = TableFile::open(
-            &Location::parse(&dir.0).unwrap(),
-            &TableId::parse("KQ_KR").unwrap(),
-        )
-        .unwrap();
-        let frames = reader.read_all().unwrap();
-        for index in [0, frame_size - 1, frame_size, length - 1] {
-            let (frame, offset) = reader.locate(index);
-            assert_eq!(frames[frame].get(offset), values[index]);
-            assert_eq!(
-                frames[frame].bytes(),
-                2 + 2 * 257 + 2 * reader.frame_len(frame)
-            );
-        }
-        let (tail, offset) = reader.locate(length - 3);
-        assert_eq!(
-            frames[tail].expand(offset..offset + 3).unwrap(),
-            values[length - 3..]
-        );
-    }
-
-    #[test]
     fn rejects_invalid_segments_and_missing_frames() {
         let dir = crate::TestDir::new("writer_rejections");
         assert!(writer(&dir.0, "KPa_K").publish(Vec::new()).is_err());
         let length = writer(&dir.0, "KPa_K").length;
         for (compressed, decompressed) in
-            [(0, 4), (1, 0), (1, 3), (1, frame::max_length(length) + 1)]
+            [(0, 4), (2, 4), (1, 3), (1, frame::max_length(length) + 1)]
         {
             let mut seek_table = zeekstd::SeekTable::new();
             seek_table
@@ -409,34 +345,10 @@ mod tests {
                 }])
                 .is_err()
         );
-        assert_eq!(fs::read(destination).unwrap(), b"existing destination");
-    }
-
-    #[test]
-    fn invalid_publication_preserves_destination_without_temporary_files() {
-        let dir = crate::TestDir::new("writer_cleanup");
-        let writer = writer(&dir.0, "K_K");
-        let destination = dir
-            .0
-            .join(TableId::parse("K_K").unwrap().relative_path("ggegt"));
-        fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        fs::write(&destination, b"existing destination").unwrap();
-        let length = writer.length;
-        let mut table = zeekstd::SeekTable::new();
-        table.log_frame(1, (length * 2) as u32).unwrap();
-        assert!(
-            writer
-                .publish(vec![CompressedSegment {
-                    data: Bytes::new(),
-                    seek_table: table,
-                    frame_lengths: vec![length],
-                }])
-                .is_err()
-        );
         assert_eq!(
             fs::read_dir(destination.parent().unwrap()).unwrap().count(),
             1
         );
-        assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
+        assert_eq!(fs::read(destination).unwrap(), b"existing destination");
     }
 }

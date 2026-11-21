@@ -4,8 +4,8 @@ use rayon::prelude::*;
 use shakmaty::Chess;
 
 use super::{Frame, Source, TableFile};
-use crate::table_id::TableId;
 use crate::outcome::PackedOutcome;
+use crate::table_id::TableId;
 use crate::{DtcOutcome, Egt, EgtError, EgtResult};
 
 /// Job-scoped tables loaded before workers borrow them immutably.
@@ -106,9 +106,9 @@ impl BatchReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConversionType;
     use crate::egt_file::writer::write_fixture;
     use crate::storage::Location;
-    use crate::ConversionType;
     use shakmaty::{CastlingMode, fen::Fen};
 
     #[test]

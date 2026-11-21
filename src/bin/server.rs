@@ -9,7 +9,6 @@
 //! `dtc` is signed in plies: positive for wins, negative for losses, zero for an
 //! already checkmated position. Draws have null `dtc` and `dtc_type`.
 
-
 use axum::{
     Json, Router,
     extract::{Query, Request, State, rejection::QueryRejection},
@@ -206,7 +205,6 @@ impl OutcomeResponse {
     }
 }
 
-
 async fn outcome(
     State(state): State<AppState>,
     params: Result<Query<QueryParams>, QueryRejection>,
@@ -247,9 +245,9 @@ async fn query(
             let position = parse_position(&params.fen)?;
             let mut result = state.tablebase.probe_with_moves(&position)?;
             // Best for the root first; response outcomes still describe successors.
-            result.moves.sort_by_key(|(m, outcome)| {
-                std::cmp::Reverse(outcome.before_move(m))
-            });
+            result
+                .moves
+                .sort_by_key(|(m, outcome)| std::cmp::Reverse(outcome.before_move(m)));
             let moves = result
                 .moves
                 .into_iter()

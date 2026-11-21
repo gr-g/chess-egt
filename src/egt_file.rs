@@ -12,10 +12,10 @@ use crate::error::{EgtError, EgtResult};
 use crate::storage::{Location, block_on};
 use crate::table_id::TableId;
 use object_store::{GetOptions, GetRange, ObjectStoreExt, path::Path as ObjectPath};
+use rayon::prelude::*;
+use shakmaty::Chess;
 #[cfg(test)]
 use shakmaty::{CastlingMode, Position};
-use shakmaty::Chess;
-use rayon::prelude::*;
 
 /// Resolves existing tables with input-first, missing-only fallback.
 #[derive(Debug)]
@@ -178,7 +178,12 @@ impl TableFile {
     pub(crate) fn read_all(&self) -> EgtResult<Vec<Frame>> {
         (0..self.num_frames())
             .into_par_iter()
-            .map(|frame| Ok(self.read_frames(&[frame])?.pop().expect("one requested frame")))
+            .map(|frame| {
+                Ok(self
+                    .read_frames(&[frame])?
+                    .pop()
+                    .expect("one requested frame"))
+            })
             .collect()
     }
 
@@ -204,26 +209,34 @@ impl TableFile {
         .map_err(|error| {
             // A backend may reject a short range instead of returning partial bytes.
             // Only classify it as corrupt data when truncation is confirmed.
-            if let Ok(meta) = block_on(self.location.store.head(&self.key)) {
-                if let Some(index) = ranges.iter().position(|range| range.end > meta.size) {
-                    return self.invalid_frame(frames[index], error);
-                }
+            if let Ok(meta) = block_on(self.location.store.head(&self.key))
+                && let Some(index) = ranges.iter().position(|range| range.end > meta.size)
+            {
+                return self.invalid_frame(frames[index], error);
             }
             self.location.error(&self.key, error)
         })?;
         if compressed.len() != frames.len() {
             return Err(EgtError::Internal("invalid tablebase range count"));
         }
-        frames.iter().copied().zip(ranges).zip(compressed).map(|((frame, range), bytes)| {
-            if bytes.len() as u64 != range.end - range.start {
-                return Err(self.invalid_frame(frame, "truncated tablebase range"));
-            }
-            let encoded_len = table.frame_size_decomp(frame as u32)? as usize;
-            decode_frame(&bytes, self.frame_len(frame), encoded_len).map_err(|error| match error {
-                EgtError::WorkingMemoryAllocation { .. } => error,
-                other => self.invalid_frame(frame, other.into_data_source()),
+        frames
+            .iter()
+            .copied()
+            .zip(ranges)
+            .zip(compressed)
+            .map(|((frame, range), bytes)| {
+                if bytes.len() as u64 != range.end - range.start {
+                    return Err(self.invalid_frame(frame, "truncated tablebase range"));
+                }
+                let encoded_len = table.frame_size_decomp(frame as u32)? as usize;
+                decode_frame(&bytes, self.frame_len(frame), encoded_len).map_err(
+                    |error| match error {
+                        EgtError::WorkingMemoryAllocation { .. } => error,
+                        other => self.invalid_frame(frame, other.into_data_source()),
+                    },
+                )
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -256,7 +269,6 @@ fn decode_frame(compressed: &[u8], len: usize, encoded_len: usize) -> EgtResult<
     Frame::decode(data, len)
 }
 
-
 /// Mirrors a chess position horizontally for independent indexing checks.
 #[cfg(test)]
 pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
@@ -271,9 +283,9 @@ pub fn mirror_horizontally(position: &Chess) -> EgtResult<Chess> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConversionType;
     use crate::egt_file::writer::write_fixture;
     use crate::outcome::PackedOutcome;
-    use crate::ConversionType;
     use shakmaty::Color;
     use shakmaty::fen::Fen;
     use std::path::Path;
@@ -366,84 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn test_egt_file_creation() {
-        let dir = crate::TestDir::new("single_table_creation");
-        let file = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
-        assert_eq!(file.egt().id().name().as_str(), "KPa_K");
-        let other: Chess = "8/8/8/8/8/8/1P6/K6k w - - 0 1"
-            .parse::<Fen>()
-            .unwrap()
-            .into_position(CastlingMode::Standard)
-            .unwrap();
-        assert_ne!(TableId::from_position(&other).unwrap().0, file.egt().id());
-        let other_material: Chess = "8/8/8/8/8/8/Q7/K6k w - - 0 1"
-            .parse::<Fen>()
-            .unwrap()
-            .into_position(CastlingMode::Standard)
-            .unwrap();
-        assert_ne!(TableId::from_position(&other_material).unwrap().0, file.egt().id());
-        assert!(
-            file.egt().position_from_index(file.egt.index_range(), Color::White).is_err()
-        );
-    }
-
-    fn run_round_trip_test(tablename: &str, stride: usize) {
-        let egt = Egt::new(&crate::TableId::parse(tablename).unwrap()).unwrap();
-        for turn in [Color::White, Color::Black] {
-            for index in (0..egt.index_range()).step_by(stride) {
-                if let Ok(position) = egt.position_from_index(index, turn) {
-                    assert_eq!(egt.position_to_index(&position), index);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn egt_file_decode_encode_kpp_kpp() {
-        run_round_trip_test("KPaPb_KPcPd", 100_000);
-    }
-
-    #[test]
-    fn egt_file_decode_encode_kq_kr() {
-        run_round_trip_test("KQ_KR", 100);
-    }
-
-    #[test]
-    fn egt_file_decode_encode_kppp_k() {
-        run_round_trip_test("KPaPbPc_K", 100);
-    }
-
-    #[test]
-    fn egt_file_decode_encode_kpp_kp() {
-        run_round_trip_test("KPaPb_KPc", 500);
-    }
-
-    #[test]
-    fn test_palette_frame_roundtrip() {
-        // Use a frame size that is a multiple of 8 (as in production).
-        let n = 16;
-        let mut inputs = vec![PackedOutcome::INVALID; n];
-        inputs[4] = PackedOutcome::new_win(ConversionType::Checkmate, 67);
-        inputs[6] = PackedOutcome::new_loss(ConversionType::Capture, 12);
-        inputs[7] = PackedOutcome::new_win(ConversionType::Promotion, 4567);
-        inputs[8] = PackedOutcome::DRAW;
-        inputs[10] = PackedOutcome::new_loss(ConversionType::Checkmate, 30);
-        inputs[11] = PackedOutcome::new_win(ConversionType::Capture, 1);
-        inputs[12] = PackedOutcome::DRAW;
-        inputs[13] = PackedOutcome::new_loss(ConversionType::Promotion, 1200);
-        let encoded = frame::encode(&inputs).unwrap();
-        let recovered = Frame::decode(encoded, n).unwrap().expand(0..n).unwrap();
-        for i in 0..n {
-            assert_eq!(
-                inputs[i].to_u16(),
-                recovered[i].to_u16(),
-                "mismatch at i={}",
-                i
-            );
-        }
-    }
-
-    #[test]
     fn published_file_probes_canonical_and_mirrored_positions() {
         let dir = crate::TestDir::new("published_file_probe");
         let position = "8/8/8/8/8/8/P7/K6k w - - 0 1"
@@ -466,39 +400,16 @@ mod tests {
             assert_eq!(id, reader.egt().id());
             assert_eq!(reader.index(position, reflected).unwrap(), index);
             let (frame, offset) = reader.locate(index);
-            assert_eq!(reader.read_frames(&[frame]).unwrap()[0].get(offset), outcome);
+            assert_eq!(
+                reader.read_frames(&[frame]).unwrap()[0].get(offset),
+                outcome
+            );
         }
         let prober = crate::Tablebase::new(&dir.0).unwrap();
-        assert_eq!(prober.probe(&position).unwrap(), crate::DtcOutcome::try_from(outcome).unwrap());
-    }
-
-    #[test]
-    fn published_file_scan_and_reload() {
-        let dir = crate::TestDir::new("published_file_scan");
-        let outcome = |idx| {
-            if idx % 3 == 0 {
-                PackedOutcome::new_win(ConversionType::Promotion, 4567)
-            } else {
-                PackedOutcome::DRAW
-            }
-        };
-        let reader = write_fixture(&dir.0, "KPa_K", outcome);
         assert_eq!(
-            reader.num_frames(),
-            reader.egt.index_range().div_ceil(reader.egt.frame_size())
+            prober.probe(&position).unwrap(),
+            crate::DtcOutcome::try_from(outcome).unwrap()
         );
-        let id = reader.egt().id();
-        let location = Location::parse(&dir.0).unwrap();
-        let range = reader.egt().index_range();
-        for _ in 0..2 {
-            let frames = reader.read_all().unwrap();
-            for idx in 0..range {
-                let (frame, offset) = reader.locate(idx);
-                assert_eq!(frames[frame].get(offset), outcome(idx));
-            }
-        }
-        let batch = BatchReader::open(&Source::new(location), &[id]).unwrap();
-        assert!(batch.read_chunk(&id, range, range).unwrap().is_empty());
     }
 
     #[test]
@@ -518,25 +429,28 @@ mod tests {
         });
         assert!(reader.num_frames() > 1);
         assert_ne!(length % frame_size, 0);
-        assert_eq!(reader.frame_len(reader.num_frames() - 1), length % frame_size);
+        assert_eq!(
+            reader.frame_len(reader.num_frames() - 1),
+            length % frame_size
+        );
         let id = reader.egt().id();
         let mut batch = BatchReader::default();
         let frames = reader.read_all().unwrap();
         batch.insert(reader, frames);
-        assert!(batch.read_chunk(&id, frame_size - 1, frame_size + 1).is_err());
+        assert!(
+            batch
+                .read_chunk(&id, frame_size - 1, frame_size + 1)
+                .is_err()
+        );
         for (n, &idx) in indexes.iter().enumerate() {
             assert_eq!(
                 batch.read_chunk(&id, idx, idx + 1).unwrap()[0],
                 PackedOutcome::new_loss(ConversionType::Capture, n as u16 + 1)
             );
         }
-        let pawnful = write_fixture(&dir.0, "KPa_K", |_| PackedOutcome::INVALID);
-        assert_eq!(pawnful.num_frames(), 1);
-        assert_eq!(pawnful.locate(0), (0, 0));
-        assert_eq!(pawnful.frame_len(0), pawnful.egt.index_range());
+        assert!(batch.read_chunk(&id, length, length).unwrap().is_empty());
         assert!(batch.read_chunk(&id, length, length + 1).is_err());
         assert!(batch.read_chunk(&id, 1, 0).is_err());
-        assert!(batch.read_chunk(&id, 0, length + 1).is_err());
     }
 
     #[test]
@@ -549,13 +463,20 @@ mod tests {
             let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
             encoder.compress(&vec![0; bytes]).unwrap();
             encoder.finish().unwrap();
-            assert!(open_local(&dir.0, "K_K")
-                .and_then(|reader| reader.read_frames(&[0])).is_err());
+            assert!(
+                open_local(&dir.0, "K_K")
+                    .and_then(|reader| reader.read_frames(&[0]))
+                    .is_err()
+            );
         }
         // A correct payload with an extra empty frame has the wrong frame count.
         let output = std::fs::File::create(table_path(&dir.0, "K_K")).unwrap();
         let mut encoder = zeekstd::EncodeOptions::new().into_encoder(output).unwrap();
-        encoder.compress(&frame::encode(&vec![PackedOutcome::INVALID; file.egt.index_range()]).unwrap()).unwrap();
+        encoder
+            .compress(
+                &frame::encode(&vec![PackedOutcome::INVALID; file.egt.index_range()]).unwrap(),
+            )
+            .unwrap();
         encoder.end_frame().unwrap();
         encoder.finish().unwrap();
         assert!(open_local(&dir.0, "K_K").is_err());

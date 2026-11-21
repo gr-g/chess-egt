@@ -171,9 +171,8 @@ mod tests {
     #[test]
     fn statistics_commands_reject_input_overlays() {
         for command in ["stats", "cache-stats"] {
-            let err =
-                Cli::try_parse_from(["chess-egt", command, "3/", "--input-path", "other"])
-                    .unwrap_err();
+            let err = Cli::try_parse_from(["chess-egt", command, "3/", "--input-path", "other"])
+                .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UnknownArgument);
         }
     }

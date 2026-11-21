@@ -24,7 +24,7 @@ The library API, command-line interface, and file format are not yet finalized.
 - Support scaling on cloud resources (compute-optimized instances and cloud
   object storage) to potentially reach 7-piece completeness and beyond.
 
-This tablebase is intended as a resource for online lookup. Is is not intended
+This tablebase is intended as a resource for online lookup. It is not intended
 for use in chess engines, where the DTZ metric is most suitable and where
 compact win/draw/loss representations are needed.
 
@@ -163,7 +163,7 @@ The JSON response to a position query is similar to the
 ### Scope
 The tablebase supports valid positions with at most eight pieces and no
 castling rights. The depth-to-conversion (DTC) metric is computed without
-taking into account the the 50-move rule.
+taking into account the 50-move rule.
 
 (According to traditional terminology, we should say _8 [men](https://en.wikipedia.org/wiki/Chess_piece#Definitions)_
 instead of _8 pieces_ to make it clear that pawns are counted among the 8
@@ -201,11 +201,13 @@ The following sections describe the tablebase's main building blocks:
   endgame tables and assigns each table a name and storage path.
 - **Indexing layer (`Egt`, `Indexer`)**: Maps positions to a contiguous index
   range `[0, index_range)` within each table.
-- **Retrograde analysis (`solve_pair`)**: Computes outcomes by propagating
-  known results backward to predecessor positions.
-- **Storage and memory layer (`TableFile`, `EgtFileWriter`, `BatchReader`,
-  `SharedFileCache`)**: Reads and writes compressed tables, loads dependencies
-  eagerly for batch jobs, and caches decompressed frames for on-demand probes.
+- **Retrograde analysis**: `solve_pair` in
+  [`src/generator/solver.rs`](src/generator/solver.rs) propagates known outcomes
+  backward to predecessor positions.
+- **Storage and memory layer**: `TableFile` reads compressed tables,
+  `EgtFileWriter` publishes them, `BatchReader` loads tables eagerly for batch
+  jobs, and `SharedFileCache` serves on-demand probes. Per-table statistics
+  and hierarchy summaries are stored separately as JSON.
 
 The project focuses on the core tablebase architecture, table generation, and
 probing. Various other aspects rely on external dependencies:
@@ -553,8 +555,7 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
 - A seek table (without checksum) of `17 + 8 * num_frames` bytes is appended
   in the footer frame. The footer frame count is checked before parsing to
   bound allocation; compressed and decompressed lengths are also validated.
-- Readers cache the seek table. To load a frame not already cached, they fetch
-  its compressed byte range and decompress it.
+- `TableFile` holds the seek table and reads and decompresses frames by byte range.
 - Each frame of _N_ positions has its own palette of _d_ distinct raw
   `PackedOutcome` values, ordered by descending frequency, with ties broken by
   ascending numeric raw value. Its uncompressed serialized layout is:
@@ -576,13 +577,13 @@ the `object_store` buffered writer.
 
 #### Memory management
 
-Generation uses a pair of flat `Vec<AtomicU16>` arrays for the pair being
-solved. These arrays are allocated with `try_reserve_exact`, so allocation
-failure is reported as an error. Finalization processes one table at a time in
-parallel frame batches. Batches use the same Rayon pool as generation, with at
-most one encoder per configured thread.
+Generation uses one flat `Vec<AtomicU16>` per table in the pair (one total for
+a self-twin). Allocation failure is reported as an error. Finalization
+processes one table at a time in parallel frame batches. Batches use the same
+Rayon pool as generation, with at most one encoder per configured thread.
 
-Probing (`Tablebase::probe`) uses a shared cache that keeps track of frames
-already available in memory, evicting the least recently used stored frames to
-keep retained frame data within the configured cache budget (the server's
-`--cache-size` option).
+`BatchReader` eagerly loads the decompressed tables needed for each generation
+or verification job. `SharedFileCache` instead retains `TableFile` metadata
+and loads frames on demand for probes. It evicts the least recently used
+frames to stay within the configured frame budget (the server's `--cache-size`
+option).

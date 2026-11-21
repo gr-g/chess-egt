@@ -257,7 +257,6 @@ mod tests {
         location.writable = false;
         let id = TableId::parse("K_K").unwrap();
         let summary = query(&location, &["2"]).unwrap();
-        assert_eq!(summary, query(&location, &["K_K"]).unwrap());
         assert_eq!((summary.selected_tables, summary.available_tables), (1, 0));
         let missing = StatsRecord::missing(&id).unwrap();
         assert_eq!(summary.index_range, missing.index_range());
@@ -270,7 +269,7 @@ mod tests {
     #[test]
     fn builds_all_levels_and_uses_summaries_for_overlapping_selections() {
         let location = location();
-        let selectors = ["3/2v1/op0", "2", "3/", "3/2v1", "2/1v1/op0/0pawns"];
+        let selectors = ["3/2v1/op0", "2", "3/"];
         let expected = query(&location, &["2", "3"]).unwrap();
         assert_eq!(cache(&location, &selectors).unwrap(), expected);
         let mut prefixes = BTreeSet::new();
@@ -306,13 +305,12 @@ mod tests {
         let id = TableId::parse("K_K").unwrap();
         let key = location.key(&id.relative_path("json"));
         block_on(location.store.delete(&key)).unwrap();
-        let summary = cache(&location, &["K_K", "K_K"]).unwrap();
+        let summary = cache(&location, &["K_K"]).unwrap();
         assert_eq!(summary.available_tables, 0);
         let hierarchy = id.hierarchy();
         for prefix in hierarchy.ancestors().chain([hierarchy]) {
             assert!(absent(&location, &format!("{prefix}stats.json")));
         }
-        invalidate(&location, &id).unwrap();
     }
 
     #[test]

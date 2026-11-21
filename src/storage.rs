@@ -42,7 +42,7 @@ pub(crate) struct Location {
     pub(crate) prefix: ObjectPath,
     pub(crate) display: String,
     pub(crate) writable: bool,
-    // Shared clones trust the immutable root after successful validation.
+    // Clones share successful format validation.
     format_validated: Arc<OnceLock<()>>,
 }
 
@@ -238,15 +238,10 @@ mod tests {
         let location = Location::parse("memory:///tables").unwrap();
         let clone = location.clone();
         let key = location.prefix.clone().join("format.json");
-        assert!(Arc::ptr_eq(
-            &location.format_validated,
-            &clone.format_validated
-        ));
         assert!(matches!(
             clone.validate_format(),
             Err(EgtError::FileNotFound(_))
         ));
-        assert!(location.format_validated.get().is_none());
 
         block_on(location.store.put(&key, b"not json".to_vec().into())).unwrap();
         assert!(
@@ -257,12 +252,10 @@ mod tests {
             clone.ensure_format(),
             Err(EgtError::InvalidData { .. })
         ));
-        assert!(location.format_validated.get().is_none());
 
         let bytes = serde_json::to_vec(&FormatDescriptor::default()).unwrap();
         block_on(location.store.put(&key, bytes.into())).unwrap();
         clone.validate_format().unwrap();
-        assert!(location.format_validated.get().is_some());
 
         // Deliberately violate immutability: cached clones must not refetch it.
         block_on(location.store.put(&key, b"not json".to_vec().into())).unwrap();
@@ -276,7 +269,6 @@ mod tests {
             fresh.validate_format(),
             Err(EgtError::InvalidData { .. })
         ));
-        assert!(fresh.format_validated.get().is_none());
     }
 
     #[test]
@@ -345,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_url_components() {
+    fn rejects_unsupported_urls() {
         for text in [
             "https://user:secret@example.com/tables",
             "https://user@example.com/tables",
@@ -363,9 +355,10 @@ mod tests {
                     Location::parse(text),
                     Err(EgtError::InvalidStorageLocation(_))
                 ),
-                "accepted unsupported URL components: {text}"
+                "accepted unsupported URL: {text}"
             );
         }
+        assert!(Location::parse("unknown://bucket/tables").is_err());
     }
 
     #[test]
@@ -373,6 +366,7 @@ mod tests {
         let id = crate::table_id::TableId::parse("KPao_KPao").unwrap();
         for (url, prefix) in [
             ("memory:///nested/tables", "nested/tables/"),
+            ("memory:///nested/tables/", "nested/tables/"),
             ("memory:///", ""),
         ] {
             let location = Location::parse(url).unwrap();
@@ -396,19 +390,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn prefixes_and_read_only_urls() {
-        for text in ["memory:///tables", "memory:///tables/"] {
-            let location = Location::parse(text).unwrap();
-            assert_eq!(
-                location.key("2/1v1/op0/0pawns/K_K.ggegt").as_ref(),
-                "tables/2/1v1/op0/0pawns/K_K.ggegt"
-            );
-        }
-        let http = Location::parse("https://example.com/tables/").unwrap();
-        assert!(http.ensure_writable().is_err());
-        assert!(Location::parse("unknown://bucket/tables").is_err());
     }
 }

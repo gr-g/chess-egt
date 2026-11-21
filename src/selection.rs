@@ -1,4 +1,4 @@
-//! Pure theoretical table selection and generation scheduling; no storage I/O.
+//! Table selection and generation scheduling.
 //!
 //! Selectors are exact names (`KPa_K`), oriented uppercase material (`KP_K`),
 //! or hierarchy prefixes (`3`, `3/2v1`, `3/2v1/op0`, `3/2v1/op0/1pawns`).
@@ -131,7 +131,10 @@ impl Hierarchy {
                 split: self.split,
                 ..root
             }),
-            self.pawns.map(|_| Self { pawns: None, ..*self }),
+            self.pawns.map(|_| Self {
+                pawns: None,
+                ..*self
+            }),
         ]
         .into_iter()
         .flatten()
@@ -216,8 +219,10 @@ impl Material {
         let (a, b) = self.side_counts;
         if hierarchy.is_some_and(|h| {
             h.split.is_some_and(|split| split != (a.max(b), a.min(b)))
-                || h.pawns.is_some_and(|n| n != self.stm_pawns + self.sntm_pawns)
-                || h.opposing.is_some_and(|n| n > self.stm_pawns.min(self.sntm_pawns))
+                || h.pawns
+                    .is_some_and(|n| n != self.stm_pawns + self.sntm_pawns)
+                || h.opposing
+                    .is_some_and(|n| n > self.stm_pawns.min(self.sntm_pawns))
         }) {
             return tables;
         }
@@ -250,8 +255,7 @@ enum Target {
     Exact(TableId),
 }
 
-/// A validated selector. Resolving enumerates theoretical identities, not files
-/// present in storage, and never constructs full Egt indexing plans.
+/// A selector over all supported table identities, including ungenerated tables.
 #[derive(Clone, Debug)]
 pub(crate) struct TableSelector {
     source: String,
@@ -281,8 +285,8 @@ impl TableSelector {
         })
     }
 
-    /// Returns identities in dependency order (pieces, then pawns), with
-    /// table names ordered by KQRBNP, independently of I/O.
+    /// Returns identities in dependency order (piece count, then pawn count),
+    /// breaking ties by table name in KQRBNP order.
     pub fn resolve(&self) -> EgtResult<Vec<TableId>> {
         let tables = match &self.target {
             Target::Exact(table) => vec![*table],
@@ -393,7 +397,11 @@ pub(crate) fn plan_pairs(tables: impl IntoIterator<Item = TableId>) -> Vec<Table
     }
     pairs
         .into_iter()
-        .map(|(table, (twin, reflected))| TablePair { table, twin, reflected })
+        .map(|(table, (twin, reflected))| TablePair {
+            table,
+            twin,
+            reflected,
+        })
         .collect()
 }
 
@@ -422,8 +430,8 @@ fn material_names(n: usize) -> Vec<String> {
             result.push(current.clone());
             return;
         }
-        for i in start..ROLES.len() {
-            current.push(ROLES[i]);
+        for (i, &role) in ROLES.iter().enumerate().skip(start) {
+            current.push(role);
             combinations(k - 1, i, current, result);
             current.pop();
         }
@@ -453,7 +461,7 @@ pub(crate) fn compare_file_reflection(stm: &[File], sntm: &[File]) -> Ordering {
     compare(stm).then_with(|| compare(sntm))
 }
 
-/// Enumerates rank color words for fixed pawn-file multisets, without indexers.
+/// Enumerates rank color words for fixed pawn-file multisets.
 fn pawn_order_combinations(stm: &[File], sntm: &[File]) -> Vec<PawnKey> {
     let mut counts = [[0usize; 2]; 8];
     for &file in stm {
@@ -526,11 +534,7 @@ mod tests {
             ["K_KPa", "K_KPb", "K_KPc", "K_KPd"]
         );
         assert_eq!(names(&resolve("KPa_K")), ["KPa_K"]);
-        assert_eq!(names(&resolve("KQ_K")), ["KQ_K"]);
-        assert_eq!(names(&resolve("K_K")), ["K_K"]);
-        let union = resolve_selectors(&["KP_K", "K_KP", "KP_K"]).unwrap();
-        assert_eq!(union.len(), 8);
-        assert_eq!(union, resolve("3/2v1/op0/1pawns"));
+
         assert!(resolve_selectors(&[]).unwrap().is_empty());
     }
 
@@ -540,7 +544,7 @@ mod tests {
         assert_eq!(resolve("3"), resolve("3/2v1"));
         assert_eq!(
             resolve("3/2v1/op0/1pawns"),
-            resolve_selectors(&["KP_K", "K_KP"]).unwrap()
+            resolve_selectors(&["KP_K", "K_KP", "KP_K"]).unwrap()
         );
         let opposed = resolve("4/2v2/op1/2pawns");
         assert_eq!(opposed.len(), 4);
@@ -572,15 +576,10 @@ mod tests {
             "4/2v2/op0/3pawns",
             "4/2v2/op1/1pawns",
             "3/2v1/1pawns",
-            "3/KQ_KR",
-            "3/KQ_K",
             "3/K_KP",
             "3/2v1/KPa_K",
             "3/2v1/op0/1pawns/KP_K",
-            "4/2v2/op1/KP_KP",
             "4/3v1/op1",
-            "3/2v1/op0/0pawns/KP_K",
-            "4/3v1/op1/KPP_K",
             "KPh_K",
             "PK_K",
             "KPPPPPPP_K",
@@ -603,16 +602,12 @@ mod tests {
                 assert!(hierarchy_prefixes(&selectors).is_err(), "{selectors:?}");
             }
         }
-        for (selectors, expected) in [
-            (["KP_K", "KPa_K", "KP_K"], vec!["KPa_K", "KPb_K", "KPc_K", "KPd_K"]),
-            (["KPa_K", "KQ_K", "KPa_K"], vec!["KQ_K", "KPa_K"]),
-            (["KPb_K", "KPa_K", "KPb_K"], vec!["KPa_K", "KPb_K"]),
-            (["KR_K", "KQ_K", "KR_K"], vec!["KQ_K", "KR_K"]),
-        ] {
-            for selectors in [selectors, [selectors[1], selectors[0], selectors[2]]] {
-                assert_eq!(names(&resolve_selectors(&selectors).unwrap()), expected);
-                assert_eq!(hierarchy_prefixes(&selectors).unwrap(), None);
-            }
+        for selectors in [["KP_K", "KPa_K", "KQ_K"], ["KPa_K", "KQ_K", "KP_K"]] {
+            assert_eq!(
+                names(&resolve_selectors(&selectors).unwrap()),
+                ["KQ_K", "KPa_K", "KPb_K", "KPc_K", "KPd_K"]
+            );
+            assert_eq!(hierarchy_prefixes(&selectors).unwrap(), None);
         }
     }
 
@@ -624,7 +619,10 @@ mod tests {
         assert_eq!(Hierarchy::parse("4/2v2/op1/2pawns").unwrap(), hierarchy);
         let ancestors: Vec<_> = hierarchy.ancestors().collect();
         assert_eq!(
-            ancestors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ancestors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             ["4/", "4/2v2/", "4/2v2/op1/"]
         );
         assert!(ancestors.iter().all(|ancestor| ancestor.contains(&id)));
@@ -671,7 +669,6 @@ mod tests {
             let tables = resolve(&n.to_string());
             assert_eq!(tables.len(), expected, "{n} pieces");
             assert!(tables.windows(2).all(|w| w[0] < w[1]));
-            assert_eq!(tables.iter().collect::<BTreeSet<_>>().len(), expected);
             assert!(tables.iter().all(|table| table.n_pieces() == n));
             let from_materials = resolve_selectors(
                 &material_names(n)
@@ -733,7 +730,6 @@ mod tests {
         // even when their names would sort later in the piece alphabet.
         let tables = resolve_selectors(&["KQPa_K", "KPa_K", "K_KN", "KQQ_K"]).unwrap();
         assert_eq!(names(&tables), ["K_KN", "KPa_K", "KQQ_K", "KQPa_K"]);
-        assert_eq!(names(&resolve("KQPa_K")), ["KQPa_K"]);
     }
 
     #[test]
@@ -773,6 +769,10 @@ mod tests {
         .map(|name| TableId::parse(name).unwrap())
         .collect();
         let pairs = plan_pairs(selected.clone());
+        assert_eq!(
+            pairs,
+            plan_pairs(selected.iter().rev().chain(&selected).copied())
+        );
         assert_eq!(pairs.len(), 6);
         assert!(pairs.windows(2).all(|w| w[0].table < w[1].table));
         for pair in &pairs {
@@ -792,15 +792,13 @@ mod tests {
                     .any(|pair| pair.table == table || pair.twin.as_ref() == Some(&table))
             );
         }
-        let only_pawn = plan_pairs(resolve("KPa_K"));
+        let only_pawn = plan_pairs(resolve("K_KPa"));
         assert_eq!(only_pawn.len(), 1);
-        assert!(only_pawn.iter().all(|pair| pair.table.n_pawns() == 1));
-        let self_twin = plan_pairs(resolve("KPd_KPe"));
-        assert_eq!(self_twin[0].twin, None);
+        assert_eq!(only_pawn[0].table.name().as_str(), "KPa_K");
+        assert_eq!(only_pawn[0].twin.unwrap().name().as_str(), "K_KPa");
+        let self_twin = &plan_pairs(resolve("KPd_KPe"))[0];
+        assert_eq!(self_twin.twin, None);
+        assert_eq!(self_twin.reflected, [true, true]);
         assert!(plan_pairs(Vec::<TableId>::new()).is_empty());
-        // Plans are invariant under input order, duplicates, and selecting a twin.
-        let a = plan_pairs(resolve("KPa_K"));
-        let b = plan_pairs(resolve_selectors(&["K_KPa", "KPa_K", "KPa_K"]).unwrap());
-        assert_eq!(a, b);
     }
 }

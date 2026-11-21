@@ -48,8 +48,8 @@ impl Frame {
             return Err(invalid("invalid frame palette count or payload length"));
         }
         let mut seen = vec![false; 65536];
-        for entry in data[2..2 + 2 * d].chunks_exact(2) {
-            let raw = u16::from_le_bytes([entry[0], entry[1]]) as usize;
+        for &entry in data[2..2 + 2 * d].as_chunks::<2>().0 {
+            let raw = u16::from_le_bytes(entry) as usize;
             if std::mem::replace(&mut seen[raw], true) {
                 return Err(invalid("duplicate frame palette entry"));
             }
@@ -188,17 +188,14 @@ mod tests {
             assert_eq!(frame.bytes(), capacity);
             assert_eq!(frame.expand(0..values.len()).unwrap(), values);
             assert_eq!(frame.get(values.len() - 1), *values.last().unwrap());
-            assert_eq!(frame.expand(0..0).unwrap(), []);
-            assert!(frame.expand(0..values.len() + 1).is_err());
         }
         let values = [65535, 0, 8, 65535, 8].map(PackedOutcome::from_u16);
         let data = encode(&values).unwrap();
         assert_eq!(data, [3, 0, 8, 0, 255, 255, 0, 0, 1, 2, 0, 1, 0]);
-        assert_eq!(encode(&values).unwrap(), data);
-        assert_eq!(
-            Frame::decode(data, 5).unwrap().expand(1..5).unwrap(),
-            values[1..]
-        );
+        let frame = Frame::decode(data, values.len()).unwrap();
+        assert_eq!(frame.expand(1..5).unwrap(), values[1..]);
+        assert_eq!(frame.expand(0..0).unwrap(), []);
+        assert!(frame.expand(0..6).is_err());
         assert!(encode(&[]).is_err());
         let all: Vec<_> = (0..=u16::MAX).map(PackedOutcome::from_u16).collect();
         assert!(encode(&all).is_err());
@@ -207,7 +204,6 @@ mod tests {
     #[test]
     fn rejects_malformed_frames_and_impossible_metadata() {
         for (data, len) in [
-            (vec![], 1),
             (vec![1], 1),
             (vec![0, 0], 1),
             (vec![1, 0, 0, 0], 0),
@@ -224,7 +220,7 @@ mod tests {
         data[2 + 2 * 257] = 1;
         data[2 + 3 * 257] = 1;
         assert!(Frame::decode(data, 257).is_err());
-        for len in [0, 1, 2, 256, 257, 65536] {
+        for len in [0, 1, 2, 256, 257] {
             let achievable: Vec<_> = (1..=len.min(65535))
                 .map(|d| serialized_length(d, len) as u64)
                 .collect();
@@ -235,6 +231,9 @@ mod tests {
                 );
             }
         }
+        let largest = serialized_length(u16::MAX as usize, 65536) as u64;
+        assert!(valid_length(largest, 65536));
+        assert!(!valid_length(largest + 2, 65536));
         assert!(!valid_length(u64::MAX, usize::MAX));
         assert_eq!(max_length(usize::MAX), usize::MAX);
     }

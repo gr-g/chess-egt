@@ -96,7 +96,6 @@ fn verify_egt(reader: &BatchReader, egt: &Egt) -> EgtResult<usize> {
 fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> EgtResult<usize> {
     let tablename = egt.id();
     let outcomes = reader.read_chunk(&tablename, start, end)?;
-    // Keep the table identity and local index in verification diagnostics.
     let fail = |local_idx: usize, reason: &str| EgtError::ConsistencyCheckFailed {
         endgame: tablename.to_string(),
         index: local_idx,
@@ -109,7 +108,12 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
         let position = match egt.position_from_index(local_idx, Color::White) {
             Ok(position) => position,
             Err(_) if outcome_maybe.is_invalid() => continue,
-            Err(_) => return Err(fail(local_idx, "index is invalid but outcome is not invalid")),
+            Err(_) => {
+                return Err(fail(
+                    local_idx,
+                    "index is invalid but outcome is not invalid",
+                ));
+            }
         };
 
         if outcome_maybe.is_invalid() {
@@ -123,12 +127,11 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
         {
             unique_positions += 1;
         }
-        let outcome = DtcOutcome::try_from(outcome_maybe).map_err(|value| {
-            EgtError::CorruptedOutcome {
+        let outcome =
+            DtcOutcome::try_from(outcome_maybe).map_err(|value| EgtError::CorruptedOutcome {
                 value,
                 index: local_idx,
-            }
-        })?;
+            })?;
         let legals = position.legal_moves();
 
         if legals.is_empty() {
@@ -168,7 +171,6 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
 
     Ok(unique_positions)
 }
-
 
 /// Builds a human-readable diagnostic for a mismatch between the outcome
 /// stored in the file and the best outcome computed from the legal moves.

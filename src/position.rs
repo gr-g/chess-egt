@@ -25,7 +25,9 @@ pub(crate) struct InvalidCounts {
 impl InvalidCounts {
     pub(crate) fn record(&mut self, reason: InvalidPosition) {
         match reason {
-            InvalidPosition::IndexOutOfRange => unreachable!("initialization only decodes in-range indices"),
+            InvalidPosition::IndexOutOfRange => {
+                unreachable!("initialization only decodes in-range indices")
+            }
             InvalidPosition::OppositeCheck => self.opposite_check += 1,
             InvalidPosition::EpSquaresOccupied => self.ep_squares_occupied += 1,
             InvalidPosition::IllegalEpCapture => self.illegal_ep_capture += 1,
@@ -50,7 +52,9 @@ pub(crate) fn position_from_setup(setup: Setup) -> Result<Chess, InvalidPosition
         return Err(InvalidPosition::OppositeCheck);
     }
     if let Some(ep) = setup.ep_square {
-        let capturers = setup.board.attacks_to(ep, setup.turn, setup.board.occupied())
+        let capturers = setup
+            .board
+            .attacks_to(ep, setup.turn, setup.board.occupied())
             & setup.board.pawns();
         debug_assert!(capturers.any(), "EP target has no geometric pawn capturer");
         if !valid_ep_square(&setup) {
@@ -117,19 +121,13 @@ mod tests {
             // Preserve the indexer's acceptance of impossible checks.
             ("r6b/7k/8/8/8/8/2n5/K7 w - - 0 1", None),
         ] {
-            let original = fen.parse::<Fen>().unwrap().into_setup();
-            for mirrored in [false, true] {
-                let setup = if mirrored {
-                    original.clone().into_mirrored()
-                } else {
-                    original.clone()
-                };
-                assert_eq!(
-                    position_from_setup(setup).err(),
-                    expected,
-                    "{fen}, {mirrored}"
-                );
-            }
+            let setup = fen.parse::<Fen>().unwrap().into_setup();
+            assert_eq!(position_from_setup(setup.clone()).err(), expected, "{fen}");
+            assert_eq!(
+                position_from_setup(setup.into_mirrored()).err(),
+                expected,
+                "mirrored {fen}"
+            );
         }
     }
 
@@ -137,7 +135,11 @@ mod tests {
     fn kpkp_invalid_counts() {
         let mut invalid = InvalidCounts::default();
         let mut valid = 0;
-        for id in crate::selection::TableSelector::parse("KP_KP").unwrap().resolve().unwrap() {
+        for id in crate::selection::TableSelector::parse("KP_KP")
+            .unwrap()
+            .resolve()
+            .unwrap()
+        {
             let egt = crate::egt::Egt::new(&id).unwrap();
             let mut part = InvalidCounts::default();
             for index in 0..egt.index_range() {
@@ -149,11 +151,14 @@ mod tests {
             invalid = invalid.merge(part);
         }
         assert_eq!(valid, 3_739_937);
-        assert_eq!(invalid, InvalidCounts {
-            opposite_check: 551_509,
-            ep_squares_occupied: 1_124,
-            illegal_ep_capture: 0,
-        });
+        assert_eq!(
+            invalid,
+            InvalidCounts {
+                opposite_check: 551_509,
+                ep_squares_occupied: 1_124,
+                illegal_ep_capture: 0,
+            }
+        );
     }
 
     #[test]
@@ -163,6 +168,7 @@ mod tests {
             "7k/8/8/8/8/8/8/K6R w - - 0 1",
             "7k/8/8/8/8/8/2n3n1/4K3 w - - 0 1",
             "8/8/8/8/8/8/4k3/4K3 w - - 0 1",
+            "r6b/7k/8/8/8/8/2n5/K7 w - - 0 1",
         ] {
             let mut setup = fen.parse::<Fen>().unwrap().into_setup();
             for turn in Color::ALL {
@@ -190,12 +196,7 @@ mod tests {
             "7k/8/8/3PP3/8/8/8/K7 w - - 0 1",   // Wrong victim color.
         ] {
             let base = fen.parse::<Fen>().unwrap().into_setup();
-            for mirrored in [false, true] {
-                let mut setup = if mirrored {
-                    base.clone().into_mirrored()
-                } else {
-                    base.clone()
-                };
+            for mut setup in [base.clone(), base.into_mirrored()] {
                 for ep in std::iter::once(None).chain(Square::ALL.into_iter().map(Some)) {
                     setup.ep_square = ep;
                     let expected = !setup
@@ -209,7 +210,8 @@ mod tests {
                     assert_eq!(
                         valid_ep_square(&setup),
                         expected,
-                        "{fen}, {mirrored}, {ep:?}"
+                        "{fen}, {:?}, {ep:?}",
+                        setup.turn
                     );
                 }
             }

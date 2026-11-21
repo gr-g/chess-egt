@@ -34,8 +34,12 @@ use crate::egt::Egt;
 // diagonal end up on the a1-h8 diagonal after canonicalization, so both
 // diagonals have to be checked.
 fn kings_on_long_diagonal(kings: Bitboard) -> bool {
-    kings.into_iter().all(|sq| sq.rank().to_usize() == sq.file().to_usize())
-        || kings.into_iter().all(|sq| sq.rank().to_usize() == 7 - sq.file().to_usize())
+    kings
+        .into_iter()
+        .all(|sq| sq.rank().to_usize() == sq.file().to_usize())
+        || kings
+            .into_iter()
+            .all(|sq| sq.rank().to_usize() == 7 - sq.file().to_usize())
 }
 
 fn both_kings_on_diagonal(position: &Chess) -> bool {
@@ -52,7 +56,10 @@ fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
     base_setup.turn = !position.turn();
 
     for to in position.board().by_color(base_setup.turn) {
-        let piece = position.board().piece_at(to).expect("occupied square must have a piece");
+        let piece = position
+            .board()
+            .piece_at(to)
+            .expect("occupied square must have a piece");
         let origins = attacks::attacks(to, piece, occupied) & !occupied;
         for from in origins {
             let mut setup = base_setup.clone();
@@ -62,7 +69,10 @@ fn pawnless_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
             // Quiet relocation preserves material and kings; no pawns or EP
             // need validation. Impossible checks remain accepted, as in indexing.
             if !crate::position::opposite_check(&setup.board, setup.turn) {
-                f(Chess::from_setup_unchecked(setup, position.castles().mode()));
+                f(Chess::from_setup_unchecked(
+                    setup,
+                    position.castles().mode(),
+                ));
             }
         }
     }
@@ -83,7 +93,10 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
     base_setup.ep_square = None;
     let mut emit = |from: Square, to: Square| {
         let mut setup = base_setup.clone();
-        let piece = setup.board.piece_at(to).expect("occupied square must have a piece");
+        let piece = setup
+            .board
+            .piece_at(to)
+            .expect("occupied square must have a piece");
         setup.board.discard_piece_at(to);
         setup.board.set_piece_at(from, piece);
         emit_pawnful_predecessors(&setup, &mut f);
@@ -95,7 +108,8 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
         let to = ep.offset(-backward).expect("EP pawn must be on the board");
         let from = ep.offset(backward).expect("EP origin must be on the board");
         if position.board().piece_at(to) == Some(Role::Pawn.of(us))
-            && !occupied.contains(from) && !occupied.contains(ep)
+            && !occupied.contains(from)
+            && !occupied.contains(ep)
         {
             emit(from, to);
         }
@@ -103,7 +117,10 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
     }
 
     for to in position.board().by_color(us) {
-        let piece = position.board().piece_at(to).expect("occupied square must have a piece");
+        let piece = position
+            .board()
+            .piece_at(to)
+            .expect("occupied square must have a piece");
         if piece.role != Role::Pawn {
             for from in attacks::attacks(to, piece, occupied) & !occupied {
                 emit(from, to);
@@ -116,14 +133,17 @@ fn pawnful_quiet_unmoves(position: &Chess, mut f: impl FnMut(Chess)) {
             if to.rank() == us.relative_rank(Rank::Fourth) {
                 // The previous move can be a double push, as long as it does
                 // not create a legal en-passant.
-                let start = from.offset(backward).expect("double-push origin must be on the board");
+                let start = from
+                    .offset(backward)
+                    .expect("double-push origin must be on the board");
                 if !occupied.contains(start) {
                     let mut successor = base_setup.clone();
                     successor.turn = position.turn();
                     successor.ep_square = Some(from);
                     // The valid source supplies the board and turn; the pawn,
                     // empty target, and empty origin establish structural EP.
-                    let successor = Chess::from_setup_unchecked(successor, position.castles().mode());
+                    let successor =
+                        Chess::from_setup_unchecked(successor, position.castles().mode());
                     if successor.legal_ep_square().is_none() {
                         emit(start, to);
                     }
@@ -144,7 +164,10 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
     {
         return;
     }
-    f(Chess::from_setup_unchecked(setup.clone(), CastlingMode::Standard));
+    f(Chess::from_setup_unchecked(
+        setup.clone(),
+        CastlingMode::Standard,
+    ));
 
     let inactive = !setup.turn;
     let occupied = setup.board.occupied();
@@ -154,7 +177,8 @@ fn emit_pawnful_predecessors(setup: &shakmaty::Setup, f: &mut impl FnMut(Chess))
     for pawn in pushed_pawns {
         let ep = Square::from_coords(pawn.file(), inactive.relative_rank(Rank::Third));
         let start = Square::from_coords(pawn.file(), inactive.relative_rank(Rank::Second));
-        if occupied.contains(ep) || occupied.contains(start)
+        if occupied.contains(ep)
+            || occupied.contains(start)
             || (attacks::pawn_attacks(inactive, ep) & capturers).is_empty()
         {
             continue;
@@ -183,10 +207,8 @@ pub(super) fn quiet_unmoves<F>(
 {
     let position = table.position_from_index_unchecked(local_index, Color::White);
 
-    // The diagonal symmetry adjustment below only applies to pawnless tables,
-    // and never to a source position that is already on the diagonal (`#p=4`).
-    let use_diagonal_symmetry = twin.is_pawnless()
-        && !both_kings_on_diagonal(&position);
+    // Only pawnless successors without both kings on a long diagonal qualify (`#p'=8`).
+    let use_diagonal_symmetry = twin.is_pawnless() && !both_kings_on_diagonal(&position);
 
     let emit = |pred_position: Chess| {
         let pred_idx = if mirrored {
@@ -196,13 +218,11 @@ pub(super) fn quiet_unmoves<F>(
         };
         f(pred_idx);
 
-        // Emit the diagonal predecessor too for `#p=4` -> `#p'=8` moves.
-        // See "Move counters and diagonal symmetry" in the module documentation.
+        // Emit both diagonal predecessors for `#p=4` -> `#p'=8` moves.
+        // See “Move counters and diagonal symmetry” in the module docs.
         if use_diagonal_symmetry {
             let maybe_reflected_idx = twin.diagonal_symmetric(pred_idx);
             if let Some(reflected_idx) = maybe_reflected_idx {
-                // The current index represents 8 positions, while the predecessor index
-                // represents 4 positions. Push the diagonal reflection of the predecessor.
                 f(reflected_idx);
             }
         }
@@ -219,7 +239,6 @@ pub(super) fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) 
     let kings = position.board().by_role(Role::King);
 
     // Count both reflected moves for `#p=8` -> `#p'=4` transitions.
-    // See "Move counters and diagonal symmetry" in the module documentation.
     if kings_on_long_diagonal(kings) {
         // Already `#p=4`: no successor can require an adjustment.
         return legals.len() as u16;
@@ -227,12 +246,9 @@ pub(super) fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) 
 
     let mut counter = 0;
     for m in legals {
-        // Whether `#p'=4` depends only on the two king squares, so only a quiet
-        // king move can require the adjustment. Deriving the successor's king
-        // bitboard directly avoids cloning and replaying the position for every
-        // legal move. Captures and promotions lead to simpler tables, for which
-        // we don't generate unmoves (they are visited only forward, once during
-        // initialization), so they never need an adjustment either.
+        // Only quiet king moves can change the diagonal symmetry within a pair.
+        // Captures and promotions are handled during initialization, not by unmoves.
+        // Updating the king bitboard avoids cloning and replaying each move.
         let adjust = m.role() == Role::King
             && !m.is_capture()
             && !m.is_promotion()
@@ -250,12 +266,16 @@ pub(super) fn symmetry_adjusted_move_counter(position: &Chess, legals: &[Move]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::selection::TableSelector;
     use crate::table_id::TableId;
+    use std::collections::HashMap;
 
     fn tables(material: &str) -> Vec<Egt> {
-        TableSelector::parse(material).unwrap().resolve().unwrap().into_iter()
+        TableSelector::parse(material)
+            .unwrap()
+            .resolve()
+            .unwrap()
+            .into_iter()
             .map(|id| Egt::new(&id).unwrap())
             .collect()
     }
@@ -266,7 +286,9 @@ mod tests {
 
     #[test]
     fn pawnless_unmoves_match_forward_play() {
-        for endgame in ["K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KQ_KR", "KNN_K", "KQR_KB"] {
+        for endgame in [
+            "K_K", "KQ_K", "KR_K", "KB_K", "KN_K", "KQ_KR", "KNN_K", "KQR_KB",
+        ] {
             for egt in tables(endgame) {
                 for turn in [Color::White, Color::Black] {
                     let mut checked = 0;
@@ -286,8 +308,8 @@ mod tests {
     #[test]
     fn pawnless_unmoves_match_forward_play_in_checks_and_terminal_positions() {
         for fen in [
-            "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1", // Checkmate.
-            "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1", // Stalemate.
+            "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1",   // Checkmate.
+            "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",   // Stalemate.
             "4k3/8/8/1B6/8/8/8/K3R3 b - - 0 1", // Discovered double check.
             "4k3/4r3/8/8/8/8/8/K3R3 w - - 0 1", // Pinned previous mover.
             "4r2k/8/8/8/8/8/4R3/4K3 b - - 0 1", // Last move can block check.
@@ -298,15 +320,20 @@ mod tests {
     }
 
     fn test_position(fen: &str) -> Chess {
-        fen.parse::<shakmaty::fen::Fen>().unwrap()
+        fen.parse::<shakmaty::fen::Fen>()
+            .unwrap()
             .into_position(shakmaty::CastlingMode::Standard)
-            .or_else(shakmaty::PositionError::ignore_impossible_check).unwrap()
+            .or_else(shakmaty::PositionError::ignore_impossible_check)
+            .unwrap()
     }
 
     fn color_mirrored(position: &Chess) -> Chess {
-        position.to_setup(EnPassantMode::Always).into_mirrored()
+        position
+            .to_setup(EnPassantMode::Always)
+            .into_mirrored()
             .position(shakmaty::CastlingMode::Standard)
-            .or_else(shakmaty::PositionError::ignore_impossible_check).unwrap()
+            .or_else(shakmaty::PositionError::ignore_impossible_check)
+            .unwrap()
     }
 
     // Exhaust all empty origins and canonical EP states. Checked forward play
@@ -324,21 +351,30 @@ mod tests {
                 setup.board.discard_piece_at(to);
                 setup.board.set_piece_at(from, piece);
                 let m = Move::Normal {
-                    role: piece.role, from, to, capture: None, promotion: None,
+                    role: piece.role,
+                    from,
+                    to,
+                    capture: None,
+                    promotion: None,
                 };
                 let ep_rank = setup.turn.relative_rank(Rank::Sixth);
-                for ep in std::iter::once(None).chain(File::ALL.into_iter()
-                    .map(|file| Some(Square::from_coords(file, ep_rank))))
-                {
+                for ep in std::iter::once(None).chain(
+                    File::ALL
+                        .into_iter()
+                        .map(|file| Some(Square::from_coords(file, ep_rank))),
+                ) {
                     setup.ep_square = ep;
-                    if let Ok(predecessor) = setup.clone().position::<Chess>(CastlingMode::Standard)
+                    if let Ok(predecessor) = setup
+                        .clone()
+                        .position::<Chess>(CastlingMode::Standard)
                         .or_else(shakmaty::PositionError::ignore_impossible_check)
+                        && predecessor.legal_ep_square() == ep
+                        && predecessor
+                            .clone()
+                            .play(m)
+                            .is_ok_and(|next| next == *position)
                     {
-                        if predecessor.legal_ep_square() == ep
-                            && predecessor.clone().play(m).is_ok_and(|next| next == *position)
-                        {
-                            *expected.entry(predecessor).or_insert(0usize) += 1;
-                        }
+                        *expected.entry(predecessor).or_insert(0usize) += 1;
                     }
                 }
             }
@@ -358,7 +394,10 @@ mod tests {
         } else {
             pawnful_quiet_unmoves(position, emit);
         }
-        assert_eq!(actual, expected, "predecessor multisets differ for {position:?}");
+        assert_eq!(
+            actual, expected,
+            "predecessor multisets differ for {position:?}"
+        );
         actual
     }
 
@@ -409,12 +448,16 @@ mod tests {
             let mut checked = 0;
             for turn in [Color::White, Color::Black] {
                 for &pred_idx in &samples {
-                    let Ok(position) = egt.position_from_index(pred_idx, turn) else { continue };
+                    let Ok(position) = egt.position_from_index(pred_idx, turn) else {
+                        continue;
+                    };
                     assert_eq!(egt.position_to_index(&position), pred_idx);
                     ep_predecessors += usize::from(position.legal_ep_square().is_some());
                     let mut successors = HashMap::new();
                     for m in position.legal_moves() {
-                        if m.is_capture() || m.is_promotion() { continue; }
+                        if m.is_capture() || m.is_promotion() {
+                            continue;
+                        }
                         let successor = position.clone().play(m).unwrap();
                         ep_successors += usize::from(successor.legal_ep_square().is_some());
                         let succ_idx = if mirrored {
@@ -428,10 +471,14 @@ mod tests {
                         assert!(twin.position_from_index(succ_idx, Color::White).is_ok());
                         let mut actual = 0;
                         quiet_unmoves(&twin, &egt, succ_idx, reverse_mirrored, |idx| {
-                            if idx == pred_idx { actual += 1; }
+                            if idx == pred_idx {
+                                actual += 1;
+                            }
                         });
-                        assert_eq!(actual, expected,
-                            "{name}, {turn:?}, predecessor {pred_idx}, successor {succ_idx}");
+                        assert_eq!(
+                            actual, expected,
+                            "{name}, {turn:?}, predecessor {pred_idx}, successor {succ_idx}"
+                        );
                     }
                     checked += 1;
                 }
@@ -439,19 +486,22 @@ mod tests {
             assert!(checked > 0, "no valid samples for {name}");
         }
         assert!(ep_predecessors > 0, "samples must include EP expiry");
-        assert!(ep_successors > 0, "samples must include double pushes creating EP");
+        assert!(
+            ep_successors > 0,
+            "samples must include double pushes creating EP"
+        );
     }
 
     #[test]
     fn pawnful_unmoves_match_forward_play_in_ep_and_blocked_positions() {
         for fen in [
-            "7k/8/8/8/8/4P3/8/K7 b - - 0 1", // Single pawn push.
-            "7k/8/8/8/4P3/8/8/K7 b - - 0 1", // Double pawn push without EP.
-            "7k/8/8/8/4P3/4B3/8/K7 b - - 0 1", // Blocked double-push intermediate.
-            "7k/8/8/8/4P3/8/4B3/K7 b - - 0 1", // Blocked double-push origin.
-            "7k/8/8/8/8/8/4P3/K7 b - - 0 1", // Reverse push to backrank is invalid.
-            "4k3/8/8/KPp4r/8/8/8/8 b - - 0 1", // EP exposes a horizontal rook check.
-            "4k3/8/8/KPp4r/8/8/8/8 w - - 0 1", // Double push with illegal horizontal EP.
+            "7k/8/8/8/8/4P3/8/K7 b - - 0 1",       // Single pawn push.
+            "7k/8/8/8/4P3/8/8/K7 b - - 0 1",       // Double pawn push without EP.
+            "7k/8/8/8/4P3/4B3/8/K7 b - - 0 1",     // Blocked double-push intermediate.
+            "7k/8/8/8/4P3/8/4B3/K7 b - - 0 1",     // Blocked double-push origin.
+            "7k/8/8/8/8/8/4P3/K7 b - - 0 1",       // Reverse push to backrank is invalid.
+            "4k3/8/8/KPp4r/8/8/8/8 b - - 0 1",     // EP exposes a horizontal rook check.
+            "4k3/8/8/KPp4r/8/8/8/8 w - - 0 1",     // Double push with illegal horizontal EP.
             "7k/8/8/3pP3/8/8/8/K7 w - - 0 1", // A legal EP right would distinguish a double push.
             "k3r3/8/8/2PpP3/8/8/8/4K3 w - - 0 1", // One legal EP capturer is sufficient.
             "k3r3/8/8/2PpP3/8/8/7R/4K3 b - - 0 1", // Only one of two EP capturers is legal.
@@ -474,17 +524,33 @@ mod tests {
             let original = fen.parse::<shakmaty::fen::Fen>().unwrap().into_setup();
             for mirrored in [false, true] {
                 let mut setup = original.clone();
-                if mirrored { setup.mirror(); }
+                if mirrored {
+                    setup.mirror();
+                }
                 // Both no-EP and structurally valid restored EP states must fail.
-                for ep in [None, Some(if mirrored { shakmaty::Square::E3 } else { shakmaty::Square::E6 })] {
+                for ep in [
+                    None,
+                    Some(if mirrored {
+                        shakmaty::Square::E3
+                    } else {
+                        shakmaty::Square::E6
+                    }),
+                ] {
                     let mut candidate = setup.clone();
                     candidate.ep_square = ep;
-                    assert!(candidate.position::<Chess>(shakmaty::CastlingMode::Standard)
-                        .or_else(shakmaty::PositionError::ignore_impossible_check).is_err());
+                    assert!(
+                        candidate
+                            .position::<Chess>(shakmaty::CastlingMode::Standard)
+                            .or_else(shakmaty::PositionError::ignore_impossible_check)
+                            .is_err()
+                    );
                 }
                 let mut emitted = 0;
                 emit_pawnful_predecessors(&setup, &mut |_| emitted += 1);
-                assert_eq!(emitted, 0, "invalid predecessor board accepted: {fen}, {mirrored}");
+                assert_eq!(
+                    emitted, 0,
+                    "invalid predecessor board accepted: {fen}, {mirrored}"
+                );
             }
         }
     }
@@ -501,7 +567,11 @@ mod tests {
         ] {
             let position = test_position(fen);
             for mirrored in [false, true] {
-                let successor = if mirrored { color_mirrored(&position) } else { position.clone() };
+                let successor = if mirrored {
+                    color_mirrored(&position)
+                } else {
+                    position.clone()
+                };
                 let actual = assert_quiet_unmoves_match_forward_play(&successor);
                 assert_eq!(actual.values().sum::<usize>(), states);
                 let (from, to) = if mirrored {
@@ -510,7 +580,10 @@ mod tests {
                     (Square::D7, Square::D5)
                 };
                 for predecessor in actual.keys() {
-                    assert_eq!(predecessor.board().piece_at(from), Some(Role::Pawn.of(predecessor.turn())));
+                    assert_eq!(
+                        predecessor.board().piece_at(from),
+                        Some(Role::Pawn.of(predecessor.turn()))
+                    );
                     assert!(predecessor.board().piece_at(to).is_none());
                 }
             }
@@ -522,25 +595,47 @@ mod tests {
         use shakmaty::Square;
 
         for (successor_fen, predecessor_fen, ep_squares) in [
-            ("4k3/8/8/3Pp3/8/8/R3K3/8 b - - 0 1",
-             "4k3/8/8/3Pp3/8/8/4K3/R7 w - - 0 1", vec![Square::E6]),
-            ("4k3/8/8/3Pp3/8/P7/4K3/8 b - - 0 1",
-             "4k3/8/8/3Pp3/8/8/P3K3/8 w - - 0 1", vec![Square::E6]),
-            ("7k/8/8/3Pp1Pp/8/7R/8/K7 b - - 0 1",
-             "7k/8/8/3Pp1Pp/8/8/7R/K7 w - - 0 1", vec![Square::E6, Square::H6]),
+            (
+                "4k3/8/8/3Pp3/8/8/R3K3/8 b - - 0 1",
+                "4k3/8/8/3Pp3/8/8/4K3/R7 w - - 0 1",
+                vec![Square::E6],
+            ),
+            (
+                "4k3/8/8/3Pp3/8/P7/4K3/8 b - - 0 1",
+                "4k3/8/8/3Pp3/8/8/P3K3/8 w - - 0 1",
+                vec![Square::E6],
+            ),
+            (
+                "7k/8/8/3Pp1Pp/8/7R/8/K7 b - - 0 1",
+                "7k/8/8/3Pp1Pp/8/8/7R/K7 w - - 0 1",
+                vec![Square::E6, Square::H6],
+            ),
         ] {
             let position = test_position(successor_fen);
             let predecessor = test_position(predecessor_fen);
             for mirrored in [false, true] {
-                let successor = if mirrored { color_mirrored(&position) } else { position.clone() };
+                let successor = if mirrored {
+                    color_mirrored(&position)
+                } else {
+                    position.clone()
+                };
                 let actual = assert_quiet_unmoves_match_forward_play(&successor);
                 for ep in std::iter::once(None).chain(ep_squares.iter().copied().map(Some)) {
                     let mut setup = predecessor.to_setup(EnPassantMode::Always);
                     setup.ep_square = ep;
-                    if mirrored { setup.mirror(); }
+                    if mirrored {
+                        setup.mirror();
+                    }
                     let expected: Chess = setup.position(shakmaty::CastlingMode::Standard).unwrap();
-                    assert_eq!(expected.legal_ep_square(), ep.map(|sq| if mirrored { sq.flip_vertical() } else { sq }));
-                    assert_eq!(actual.get(&expected), Some(&1), "missing restored EP state {expected:?}");
+                    assert_eq!(
+                        expected.legal_ep_square(),
+                        ep.map(|sq| if mirrored { sq.flip_vertical() } else { sq })
+                    );
+                    assert_eq!(
+                        actual.get(&expected),
+                        Some(&1),
+                        "missing restored EP state {expected:?}"
+                    );
                 }
             }
         }
@@ -553,13 +648,30 @@ mod tests {
         let position = test_position("k3r3/8/8/3pP3/8/8/8/4K3 w - - 0 1");
         let predecessor = test_position("k3r3/3p4/8/4P3/8/8/8/4K3 b - - 0 1");
         for mirrored in [false, true] {
-            let successor = if mirrored { color_mirrored(&position) } else { position.clone() };
-            let predecessor = if mirrored { color_mirrored(&predecessor) } else { predecessor.clone() };
+            let successor = if mirrored {
+                color_mirrored(&position)
+            } else {
+                position.clone()
+            };
+            let predecessor = if mirrored {
+                color_mirrored(&predecessor)
+            } else {
+                predecessor.clone()
+            };
             let m = Move::Normal {
                 role: Role::Pawn,
-                from: if mirrored { Square::D7.flip_vertical() } else { Square::D7 },
-                to: if mirrored { Square::D5.flip_vertical() } else { Square::D5 },
-                capture: None, promotion: None,
+                from: if mirrored {
+                    Square::D7.flip_vertical()
+                } else {
+                    Square::D7
+                },
+                to: if mirrored {
+                    Square::D5.flip_vertical()
+                } else {
+                    Square::D5
+                },
+                capture: None,
+                promotion: None,
             };
             let replay = predecessor.clone().play(m).unwrap();
             assert_eq!(replay, successor);
@@ -578,13 +690,19 @@ mod tests {
 
         let predecessor = test_position("8/8/8/8/2p5/8/RPk5/7K w - - 0 1");
         let push = Move::Normal {
-            role: Role::Pawn, from: Square::B2, to: Square::B4,
-            capture: None, promotion: None,
+            role: Role::Pawn,
+            from: Square::B2,
+            to: Square::B4,
+            capture: None,
+            promotion: None,
         };
         let successor = predecessor.clone().play(push).unwrap();
         assert!(successor.is_check());
         assert_eq!(successor.maybe_ep_square(), Some(Square::B3));
-        assert!(successor.legal_ep_square().is_none(), "EP cannot evade the rook check");
+        assert!(
+            successor.legal_ep_square().is_none(),
+            "EP cannot evade the rook check"
+        );
         for (before, after) in [
             (predecessor.clone(), successor.clone()),
             (color_mirrored(&predecessor), color_mirrored(&successor)),
@@ -602,7 +720,9 @@ mod tests {
         let successor_idx = after.position_to_index(&successor);
         let mut hits = 0;
         quiet_unmoves(&after, &before, successor_idx, false, |idx| {
-            if idx == predecessor_idx { hits += 1; }
+            if idx == predecessor_idx {
+                hits += 1;
+            }
         });
         assert_eq!(hits, 1, "missing the b2-b4 predecessor edge");
     }
