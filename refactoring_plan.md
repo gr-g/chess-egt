@@ -503,7 +503,7 @@ four places:
 
 ---
 
-## 11. Verification (`src/verification.rs`)
+## 11. Verification (`src/verification.rs`) (done)
 
 **Implementation.**
 1. Compute the successors once per position:

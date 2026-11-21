@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use rayon::prelude::*;
-use shakmaty::{Chess, Color, MoveList, Position};
+use shakmaty::{Chess, Color, Move, Position};
 
 use crate::egt_file::BatchReader;
 use crate::report::format_timing;
@@ -106,15 +106,10 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
     let mut unique_positions = 0;
     for (relative_idx, outcome_maybe) in outcomes.iter().copied().enumerate() {
         let local_idx = start + relative_idx;
-        let index = local_idx;
-        let Ok(position) = egt.position_from_index(local_idx, Color::White) else {
-            if !outcome_maybe.is_invalid() {
-                return Err(fail(
-                    local_idx,
-                    "index is invalid but outcome is not invalid",
-                ));
-            }
-            continue;
+        let position = match egt.position_from_index(local_idx, Color::White) {
+            Ok(position) => position,
+            Err(_) if outcome_maybe.is_invalid() => continue,
+            Err(_) => return Err(fail(local_idx, "index is invalid but outcome is not invalid")),
         };
 
         if outcome_maybe.is_invalid() {
@@ -128,8 +123,12 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
         {
             unique_positions += 1;
         }
-        let outcome = DtcOutcome::try_from(outcome_maybe)
-            .map_err(|value| EgtError::CorruptedOutcome { value, index })?;
+        let outcome = DtcOutcome::try_from(outcome_maybe).map_err(|value| {
+            EgtError::CorruptedOutcome {
+                value,
+                index: local_idx,
+            }
+        })?;
         let legals = position.legal_moves();
 
         if legals.is_empty() {
@@ -147,9 +146,21 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
                 ));
             }
         } else {
-            let best = best_outcome(reader, &position, &legals)?;
+            let moves: Vec<_> = legals
+                .into_iter()
+                .map(|m| {
+                    let mut successor = position.clone();
+                    successor.play_unchecked(m);
+                    Ok((m, reader.probe_outcome(&successor)?))
+                })
+                .collect::<EgtResult<_>>()?;
+            let best = moves
+                .iter()
+                .map(|(m, successor)| successor.before_move(m))
+                .max()
+                .expect("nonempty legal moves");
             if outcome != best {
-                let details = describe_mismatch(reader, &position, &legals, outcome, best);
+                let details = describe_mismatch(&position, &moves, outcome, best);
                 return Err(fail(local_idx, &details));
             }
         }
@@ -158,40 +169,12 @@ fn verify_block(reader: &BatchReader, egt: &Egt, start: usize, end: usize) -> Eg
     Ok(unique_positions)
 }
 
-/// Computes the best outcome reachable from `position` by playing one of
-/// `legals`, probing each successor in the tablebases.
-fn best_outcome(
-    reader: &BatchReader,
-    position: &Chess,
-    legals: &MoveList,
-) -> EgtResult<DtcOutcome> {
-    let mut best_value: Option<DtcOutcome> = None;
-
-    for m in legals {
-        let mut successor_position = position.clone();
-        successor_position.play_unchecked(*m);
-
-        let successor_outcome = reader.probe_outcome(&successor_position)?;
-        let v_m = successor_outcome.before_move(m);
-
-        if let Some(ref mut best) = best_value {
-            if v_m > *best {
-                *best = v_m;
-            }
-        } else {
-            best_value = Some(v_m);
-        }
-    }
-
-    Ok(best_value.expect("best_value should be Some when legals is non-empty"))
-}
 
 /// Builds a human-readable diagnostic for a mismatch between the outcome
 /// stored in the file and the best outcome computed from the legal moves.
 fn describe_mismatch(
-    reader: &BatchReader,
     position: &Chess,
-    legals: &MoveList,
+    moves: &[(Move, DtcOutcome)],
     outcome: DtcOutcome,
     best: DtcOutcome,
 ) -> String {
@@ -200,17 +183,13 @@ fn describe_mismatch(
         position, outcome, best
     );
     reason.push_str("\nLegal moves and their outcomes:");
-    for m in legals {
-        let mut successor_position = position.clone();
-        successor_position.play_unchecked(*m);
-        // Best-effort diagnostic: skip moves whose successor cannot be probed.
-        if let Ok(successor_outcome) = reader.probe_outcome(&successor_position) {
-            let v_m = successor_outcome.before_move(m);
-            reason.push_str(&format!(
-                "\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}",
-                m, successor_outcome, v_m
-            ));
-        }
+    for (m, successor_outcome) in moves {
+        reason.push_str(&format!(
+            "\n  Move: {:?}, Successor Outcome: {:?}, Value: {:?}",
+            m,
+            successor_outcome,
+            successor_outcome.before_move(m)
+        ));
     }
     reason
 }
