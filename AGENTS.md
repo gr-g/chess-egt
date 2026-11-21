@@ -1,17 +1,12 @@
 # AGENTS.md
 
 - The goal of the project is to produce a chess endgame tablebase (EGT).
-- The project is currently functional with an implementation of the table
-  indexing (`Egt` and `Indexer`), of the file input/output including
-  compression/decompression (`TableFile`, `EgtFileWriter`, `BatchReader`
-  `SharedFileCache`), and of multi-threaded generation of tables through
-  retrograde analysis (`solve_pair`).
-- Tables for all 3-piece, 4-piece and 5-piece endgames were generated and
-  verified successfully, they are available in `~/ggegt/`.
+- The project is fully functional. Tables for all 3-piece, 4-piece and 5-piece
+  endgames were generated and verified successfully, they are available in
+  `~/ggegt/`.
 - An API server is available (`bin/server.rs`) providing stats and position
   outcomes via HTTP, similarly to the Lichess tablebase API.
-- The exact library interface to expose and the command line interface are
-  still to be finalized.
+- The exact library interface to expose is still to be finalized.
 - Keeping code simple, short and elegant has priority over finding a way to
   implement each requirement to the last bit. If it cannot be done with simple,
   short and elegant code, then perhaps it should not be done.
@@ -37,9 +32,11 @@ Compressed size: 3289.07 MiB (1.07 bits/pos). Lowest compression: KBB_KQ (3.80 b
 ```
 
 ## TODO
-- `--list-one-side` and `--stats-one-side`?
-- `--generate` does not replace existing table.
 - Visibility and public interface.
+- Freeze file format ("v1").
+- `generate` does not replace existing tables.
+- `--cache-ttl` option.
+- Zeekstd seek table?
 - Frontend, cloning https://syzygy-tables.info/
 - Explore possibility of generating tables that store together DTC and DTM for
   the same index, not only DTC.

@@ -44,8 +44,8 @@ cargo run --release -- generate 2/ 3/
 cargo run --release -- probe '8/8/8/8/8/2K5/4Q3/7k w - -'
 ```
 
-Tables are stored in `./ggegt` by default. Capture and promotion dependencies
-must already exist or be explicitly selected.
+Tables are stored in `./ggegt` by default. When generating new tables, capture
+and promotion dependencies must already exist or be explicitly selected.
 
 ### Additional commands
 
@@ -194,7 +194,9 @@ index only when at least one en passant capture is legal; otherwise, probing
 ignores them.
 
 ### High-level overview
-The following sections describe the tablebase's main building blocks:
+[`Tablebase`](src/tablebase.rs) is the library entry point for generation,
+verification, probing, and statistics. The following sections describe its
+main building blocks:
 - **Outcome representation**: Encodes win/draw/loss, DTC, and conversion type
   in a compact 16-bit value.
 - **Tablebase organization and naming conventions**: Partitions positions into
@@ -233,10 +235,10 @@ At equal distances, wins prefer checkmate, then capture, then promotion;
 losses prefer promotion, then capture, then checkmate. A capturing promotion
 is classified as a capture.
 
-The public `DtcOutcome` enum represents a win, draw, or loss. During generation,
-outcomes use a packed 16-bit representation, `PackedOutcome`,
-which also represents invalid or unresolved entries. It is structured as
-follows:
+The [`outcome`](src/outcome.rs) module defines `DtcOutcome`, the public enum
+for a win, draw, or loss, and `PackedOutcome`, the 16-bit representation used
+during generation. `PackedOutcome` also represents invalid or unresolved
+entries. It is structured as follows:
 - **Bits 0-2 (WDL and Conversion Type)**:
   - `0b000`: Invalid / Unknown (used for invalid/uncalculated positions)
   - `0b001`: Draw
@@ -251,9 +253,11 @@ follows:
     This allows encoding distances up to $2^{13} - 1 = 8191$ plies.
 
 As a result, the working outcome array for a table with _n_ indexed locations
-requires _2n_ bytes. Loaded dependencies retain per-frame palettes and indices
-rather than expanded outcome arrays. Additional memory overhead comes from block
-summaries, scan buffers, and compression buffers.
+requires _2n_ bytes. Loaded dependencies use a bit less memory: they retain
+only per-frame palettes (i.e. a list of distinct outcomes included in the
+frame) and the corresponding indices, rather than the expanded outcome arrays.
+Additional memory overhead comes from block summaries, scan buffers, and
+compression buffers.
 
 ### Tablebase organization and naming conventions
 
@@ -266,10 +270,10 @@ table covers positions with:
 3. When multiple pawns are assigned to the same file, their relative order is
    also fixed.
 
-Each table is assigned a canonical name (`TableId`) such as `KQ_KPc`, which
-uniquely identifies the material and pawn constraints. The part on the left
-(`KQ`) indicates the STM material (king and queen) and the part on the right
-(`KPc`) indicates the SNTM material (king and pawn on the _c_ file).
+Each table has a [`TableId`](src/table_id.rs), which identifies the material
+and pawn constraints and determines the canonical name, such as `KQ_KPc`.
+The left part (`KQ`) indicates the STM material (king and queen), and the
+right part (`KPc`) indicates the SNTM material (king and pawn on the _c_ file).
 
 To uniquely establish the relative order of pawns in the same file, the
 following convention applies: pawn identifiers (`Pa` through `Ph`) are marked
@@ -317,11 +321,13 @@ side piece counts in descending order, `K` counts mutually opposing pawn pairs
 
 A simple JSON file named `format.json` at the root contains a format
 descriptor. Currently this is: `{"format":"ggegt-v0.13"}`. Readers and
-generators reject roots with older descriptors.
+generators reject roots with older descriptors. [`Location`](src/storage.rs)
+handles the storage root and format descriptor; `TableId::relative_path` builds
+table paths using [`Hierarchy`](src/selection.rs).
 
 The hierarchical layout described above is designed to expose useful facts
-about the dependencies between groups of tables and facilitate grouping tables
-that can be generated together in a single batch. In fact, tables residing in
+about the dependencies between tables and facilitate grouping tables that can
+be generated together in a single batch. In fact, tables residing in
 `<n>/<max>v<min>/op<K>/<N>pawns/` need the following dependent tables to be
 available before they can be generated:
 - Tables in `<n>/<max>v<min>/op<K>/<N-1>pawns/` (conversion by promotion
@@ -329,6 +335,9 @@ available before they can be generated:
 - Tables in `<n-1>/` (conversion by capture, including capturing promotions).
   Captures may also change the material split, pawn count, and number of
   opposing pawn pairs.
+
+[`TableId::dependencies`](src/table_id/dependencies.rs) enumerates the direct
+conversion dependencies for a specific table.
 
 This means, for example, that if all 6-piece tables are available, then the
 following groups of tables can be generated independently from each other:
@@ -356,6 +365,10 @@ structure looks like this:
 
 The `stats` command reports statistics for individual tables
 (`<tablename>.json`) or groups of tables (`stats.json`).
+[`EgtStats` and `AggregateStats`](src/stats.rs) define the per-table and
+aggregate records. [`StatsAccumulator`](src/generator/finalization/stats.rs)
+collects per-table counts during finalization, while the
+[`stats::cache`](src/stats/cache.rs) module reads and rebuilds hierarchy summaries.
 
 Key statistics include the number of unique positions covered by the selected
 tables (`unique_positions`) and the breakdown into `win`, `draw`, and `loss`.
@@ -398,11 +411,10 @@ number of _Positions with castling rights_.
 
 #### Indexing and symmetries
 
-For each endgame table, an `Indexer` maps positions to a contiguous index range
-`[0, index_range)`. It uses board symmetries to reduce duplicate
-representations, making sure that symmetry-equivalent positions share the same
-index, except for the pawnless diagonal-symmetry case
-described below.
+For each endgame table, [`Egt`](src/egt.rs) holds an `Indexer`, which encodes
+and decodes positions in the contiguous range `[0, index_range)`. The indexer
+uses board symmetries so that equivalent positions share the same index,
+except for the pawnless diagonal-symmetry case described below.
 
 The indexing strategy used by this EGT distinguishes three symmetry cases.
 
@@ -457,8 +469,8 @@ combinatorially encoded without overlaps into a fixed-size range. The
 `Egt::index_range()` covers one contiguous range for the entire table, combining
 the pawn and non-pawn indices.
 
-For the detailed indexing algorithm, see the module documentation in
-[`src/egt/indexer.rs`](src/egt/indexer.rs).
+For the detailed algorithm, see the [`egt::indexer`](src/egt/indexer.rs)
+module documentation.
 
 ### Retrograde analysis
 Retrograde analysis generates endgame tablebases by working backward from
@@ -490,7 +502,8 @@ adjust counter updates accordingly. For the formal explanation, see
 [`src/generator/unmoves.rs`](src/generator/unmoves.rs).
 
 #### Initialization phase
-Both tables in the pair being generated are initialized independently. For each of them, a full scan of the table is performed:
+[`initialize_table`](src/generator/solver.rs) scans each table in the pair
+independently:
 1. Indices are decoded, marking as invalid those that do not correspond to a
    valid position.
 2. For valid positions, legal moves are generated. An empty list means
@@ -504,13 +517,15 @@ Both tables in the pair being generated are initialized independently. For each 
    resolves the position as a loss at ply 1.
 
 #### The propagation loop
-At iteration _n_, the solver scans both tables for positions resolved at ply
-_n−1_ and propagates their outcomes to predecessor positions. Iterations start
-at _n = 1_ and continue until no new positions are resolved:
+At iteration _n_, [`solve_pair`](src/generator/solver.rs) scans both tables
+for positions resolved at ply _n−1_ and propagates their outcomes to predecessor
+positions. Iterations start at _n = 1_ and continue until no new positions are
+resolved:
 1. **Propagate losses to wins:**
    - Scan Table A for positions marked as 'loss (conversion_type, n-1)'. For
      each of them:
-     - Generate reverse non-capture non-promotion moves (`quiet_unmoves`).
+     - Generate reverse non-capture non-promotion moves
+       ([`quiet_unmoves`](src/generator/unmoves.rs)).
      - Mark the predecessors in Table B as 'win (conversion_type, n)' if they
        are currently 'unknown'. A predecessor reached by several losses keeps
        the preferred conversion type (Checkmate > Capture > Promotion).
@@ -528,7 +543,9 @@ at _n = 1_ and continue until no new positions are resolved:
      same table).
 3. If no new positions were marked in this iteration, stop.
 4. Increment _n_.
-5. At the end of the process, mark all 'unknown' positions as draws.
+
+When propagation stops, [`finalize_table`](src/generator/finalization.rs)
+writes the remaining 'unknown' positions as draws.
 
 A phase only scans values at ply _n-1_ and only writes values at ply _n_ (or
 counters), so the result does not depend on the order in which positions are
@@ -536,11 +553,11 @@ visited. Running the three conversion types separately makes the conversion
 type of a loss deterministic (the last one to decrement its counter, i.e.
 Promotion > Capture > Checkmate).
 
-To make the scanning more efficient, a record is kept of the highest ply
-resolved in each block of `(65 - n) * (66 - n)` positions (`PlySummary`) and of
-the type of resolution, where `n` counts all pieces, including pawns and kings.
-In this way, blocks can be skipped if the record indicates that no positions
-were resolved at that ply for the given resolution.
+To make scanning more efficient, [`PlySummary`](src/generator/solver.rs)
+tracks the highest resolved ply by resolution type in each block of
+`(65 - n) * (66 - n)` positions, where `n` counts all pieces, including pawns
+and kings. The solver uses these summaries to skip blocks that cannot contain
+positions resolved at the target ply for the given resolution type.
 
 ### Storage and memory layer
 
@@ -555,10 +572,11 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
 - A seek table (without checksum) of `17 + 8 * num_frames` bytes is appended
   in the footer frame. The footer frame count is checked before parsing to
   bound allocation; compressed and decompressed lengths are also validated.
-- `TableFile` holds the seek table and reads and decompresses frames by byte range.
-- Each frame of _N_ positions has its own palette of _d_ distinct raw
-  `PackedOutcome` values, ordered by descending frequency, with ties broken by
-  ascending numeric raw value. Its uncompressed serialized layout is:
+- [`TableFile`](src/egt_file.rs) holds the seek table and reads and decompresses
+  frames by byte range.
+- Each [`Frame`](src/egt_file/frame.rs) of _N_ positions has its own palette
+  of _d_ distinct raw `PackedOutcome` values, ordered by descending frequency,
+  with ties broken by ascending raw value. Its uncompressed layout is:
   1. The palette count _d_ as a little-endian `u16` (1–65,535).
   2. The _d_ palette entries, each a little-endian `u16`.
   3. Zero-based palette indices in the unchanged position order:
@@ -570,20 +588,22 @@ The format of the compressed tables (`.ggegt`) has the following characteristics
   together with Zstd level 19. Palette encoding does not change frame position
   counts or boundaries.
 
-Frames are compressed in parallel and the results are collected. An
-`EgtFileWriter` validates their completeness and geometry before a consuming
-publication operation streams them in order and appends one seek table through
-the `object_store` buffered writer.
+Frames are compressed in parallel and the results are collected.
+The [`EgtFileWriter`](src/egt_file/writer.rs) method `publish` consumes the
+writer and validates the collected frames before streaming them in order and
+appending one seek table through the `object_store` buffered writer.
 
 #### Memory management
 
-Generation uses one flat `Vec<AtomicU16>` per table in the pair (one total for
-a self-twin). Allocation failure is reported as an error. Finalization
-processes one table at a time in parallel frame batches. Batches use the same
-Rayon pool as generation, with at most one encoder per configured thread.
+During generation, [`TableState`](src/generator/solver.rs) holds one flat
+`Vec<AtomicU16>` per table in the pair (one total for a self-twin). Allocation
+failure is reported as an error. Finalization processes one table at a time
+in parallel frame batches. Batches use the same Rayon pool as generation,
+with at most one encoder per configured thread.
 
-`BatchReader` eagerly loads the decompressed tables needed for each generation
-or verification job. `SharedFileCache` instead retains `TableFile` metadata
+[`BatchReader`](src/egt_file/batch.rs) eagerly loads the decompressed tables
+needed for each generation or verification job.
+[`SharedFileCache`](src/egt_file/cache.rs) instead retains `TableFile` metadata
 and loads frames on demand for probes. It evicts the least recently used
 frames to stay within the configured frame budget (the server's `--cache-size`
 option).
