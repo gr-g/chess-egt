@@ -9,7 +9,6 @@
 //! `dtc` is signed in plies: positive for wins, negative for losses, zero for an
 //! already checkmated position. Draws have null `dtc` and `dtc_type`.
 
-mod common;
 
 use axum::{
     Json, Router,
@@ -19,11 +18,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, Tablebase};
+use chess_egt::{AggregateStats, ConversionType, DtcOutcome, EgtError, Tablebase, parse_position};
 use clap::Parser;
-use common::parse_byte_size;
 use serde::{Deserialize, Serialize};
-use shakmaty::{CastlingMode, Chess, Position, PositionError, fen::Fen, san::SanPlus};
+use shakmaty::{CastlingMode, Chess, Position, san::SanPlus};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 
@@ -41,6 +39,27 @@ struct Cli {
 
     #[arg(long, default_value = "127.0.0.1:44348")]
     bind: SocketAddr,
+}
+
+fn parse_byte_size(value: &str) -> Result<usize, String> {
+    let normalized = value.to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = normalized.strip_suffix("kib") {
+        (number, 1024)
+    } else if let Some(number) = normalized.strip_suffix("mib") {
+        (number, 1024 * 1024)
+    } else if let Some(number) = normalized.strip_suffix("gib") {
+        (number, 1024 * 1024 * 1024)
+    } else if let Some(number) = normalized.strip_suffix('b') {
+        (number, 1)
+    } else {
+        (normalized.as_str(), 1)
+    };
+    let bytes = number
+        .parse::<usize>()
+        .map_err(|_| format!("invalid byte size '{value}'"))?;
+    bytes
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size '{value}' is too large"))
 }
 
 #[derive(Clone)]
@@ -181,29 +200,12 @@ impl OutcomeResponse {
             stalemate: position.is_stalemate(),
             insufficient_material: position.is_insufficient_material(),
             dtc,
-            dtc_type: conversion.map(|conversion| match conversion {
-                ConversionType::Checkmate => "checkmate",
-                ConversionType::Capture => "capture",
-                ConversionType::Promotion => "promotion",
-            }),
+            dtc_type: conversion.map(ConversionType::as_str),
             category,
         }
     }
 }
 
-fn parse_position(fen: &str) -> Result<Chess, ApiError> {
-    fen.parse::<Fen>()
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_fen", "Invalid FEN"))?
-        .into_position(CastlingMode::Standard)
-        .or_else(PositionError::ignore_impossible_check)
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_position",
-                "Invalid position",
-            )
-        })
-}
 
 async fn outcome(
     State(state): State<AppState>,
@@ -330,6 +332,14 @@ impl From<EgtError> for ApiError {
                 "invalid_selector",
                 "Invalid table selection",
             ),
+            EgtError::InvalidFen(_) => {
+                Self::new(StatusCode::BAD_REQUEST, "invalid_fen", "Invalid FEN")
+            }
+            EgtError::InvalidPosition(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_position",
+                "Invalid position",
+            ),
             EgtError::UnsupportedPosition(reason) => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_position",
@@ -388,6 +398,7 @@ mod tests {
         http::Request,
     };
     use serde_json::{Value, json};
+    use shakmaty::fen::Fen;
     use tower::ServiceExt;
 
     async fn request(app: &Router, uri: &str, status: StatusCode) -> String {

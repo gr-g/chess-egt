@@ -479,7 +479,7 @@ four places:
 
 ---
 
-## 10. Binaries (`src/bin/`)
+## 10. Binaries (`src/bin/`) (done)
 
 **Implementation.**
 1. Inline `src/bin/common/mod.rs` (`parse_byte_size`) into

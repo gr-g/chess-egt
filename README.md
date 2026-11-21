@@ -38,10 +38,10 @@ including multiple metrics and perfect accounting of the 50-move rule, see
 
 ```sh
 # Generate all tables with two or three pieces.
-cargo run --release -- --generate 2/ 3/
+cargo run --release -- generate 2/ 3/
 
 # Probe a position.
-cargo run --release -- '8/8/8/8/8/2K5/4Q3/7k w - -'
+cargo run --release -- probe '8/8/8/8/8/2K5/4Q3/7k w - -'
 ```
 
 Tables are stored in `./ggegt` by default. Capture and promotion dependencies
@@ -51,29 +51,33 @@ must already exist or be explicitly selected.
 
 ```sh
 # Generate all 4-piece tables (assuming dependencies already exist), using 4 threads.
-cargo run --release -- --path ./ggegt --generate 4/ --threads 4
+cargo run --release -- generate 4/ --path ./ggegt --threads 4
 
 # Generate selected tables locally, using existing dependencies from an S3 bucket.
-cargo run --release -- --path ./ggegt --input-path s3://my-ggegt-bucket/ --generate KQ_KR KP_K
+cargo run --release -- generate KQ_KR KP_K --path ./ggegt --input-path s3://my-ggegt-bucket/
 
 # Verify the internal consistency of existing tables.
-cargo run --release -- --verify KQ_KR KR_KQ
+cargo run --release -- verify KQ_KR KR_KQ
 
 # Enumerate theoretical tables having 5 pieces with 3 on one side.
-cargo run --release -- --list 5/3v2/
+cargo run --release -- list 5/3v2/
 
 # Report statistics on all 4-piece tables.
-cargo run --release -- --stats 4/
+cargo run --release -- stats 4/
 
 # Store summary statistics for groups of tables for faster retrieval.
-cargo run --release -- --cache-stats 2/ 3/ 4/ 5/
+cargo run --release -- cache-stats 2/ 3/ 4/ 5/
 ```
 
 For S3 access, configure credentials through environment variables using the
 conventions supported by [`object_store`](https://docs.rs/object_store/latest/object_store/aws/struct.AmazonS3Builder.html#method.from_env).
 
-`--generate`, `--verify`, `--stats`, `--cache-stats`, and `--list` each accept
-multiple `SELECTOR`s as arguments, in the following forms:
+`--path` can appear before or after the subcommand. `generate`, `verify`, and
+`probe` accept `--input-path` to search an input location before falling back to
+`--path`. `generate` and `verify` accept `--threads` (0 uses Rayon's default).
+
+`generate`, `verify`, `stats`, `cache-stats`, and `list` each require one or more
+selectors, in the following forms:
 
 - **Exact names**, e.g. `KPa_K`: a table identified by its canonical name (see
   below for table naming conventions).
@@ -86,7 +90,7 @@ multiple `SELECTOR`s as arguments, in the following forms:
   - `5/3v2/op1/2pawns`: all tables with 5 pieces, 3 on one side and 2 on the
     other, with one pair of opposing pawns and 2 pawns in total.
 
-Tables are generated in pairs: `--generate KPa_K` will produce a file for
+Tables are generated in pairs: `generate KPa_K` will produce a file for
 `KPa_K` (representing positions where the side-to-move has the pawn) and also a
 file for the "twin" table `K_KPa` (representing positions where the
 side-not-to-move has the pawn).
@@ -98,7 +102,7 @@ cargo test
 
 Two Python scripts are available to export statistics from a current tablebase.
 ```sh
-cargo run --release -- --path ROOT --cache-stats 3/ 4/ 5/ 6/
+cargo run --release -- cache-stats 3/ 4/ 5/ 6/ --path ROOT
 python3 scripts/export_table_stats.py ROOT table_stats.csv
 python3 scripts/export_summary_stats.py ROOT summary_stats.csv
 ```
@@ -348,7 +352,7 @@ structure looks like this:
 <root>/<n>/<max>v<min>/stats.json
 ```
 
-The `--stats` command reports statistics for individual tables
+The `stats` command reports statistics for individual tables
 (`<tablename>.json`) or groups of tables (`stats.json`).
 
 Key statistics include the number of unique positions covered by the selected

@@ -10,6 +10,16 @@ pub enum ConversionType {
     Checkmate,
 }
 
+impl ConversionType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkmate => "checkmate",
+            Self::Capture => "capture",
+            Self::Promotion => "promotion",
+        }
+    }
+}
+
 /// Outcome for the side to move, ordered from worst to best.
 /// Wins minimize plies, losses maximize them; losses reverse the conversion preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

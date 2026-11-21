@@ -61,7 +61,7 @@ pub use stats::{AggregateStats, EgtStats, LongestDtcPosition, Totals};
 #[cfg(test)]
 use std::path::PathBuf;
 pub use table_id::TableId;
-pub use tablebase::{ProbeWithMoves, Tablebase};
+pub use tablebase::{ProbeWithMoves, Tablebase, parse_position};
 
 /// A fresh, test-specific directory under the system temp dir. Tests running in
 /// parallel must not share output directories: they would overwrite (or read

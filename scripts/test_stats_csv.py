@@ -266,7 +266,7 @@ class StatsCsvTests(unittest.TestCase):
                 target = changed["stats"]["totals"] if key in OUTCOMES else changed["stats"]
                 target[key] += 1
                 self.put_json(leaf / "stats.json", changed)
-                with self.assertRaisesRegex(ValueError, "refresh --cache-stats"):
+                with self.assertRaisesRegex(ValueError, "run chess-egt cache-stats"):
                     leaf_stats.leaf_row(self.root, leaf)
 
     def test_missing_sidecar_is_rejected_as_stale_cache(self):

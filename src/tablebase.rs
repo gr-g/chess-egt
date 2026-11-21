@@ -1,10 +1,26 @@
 use std::path::Path;
 
-use shakmaty::{Chess, Move, Position};
+use shakmaty::{CastlingMode, Chess, Move, Position, PositionError, fen::Fen};
 
 use crate::egt_file::{SharedFileCache, Source};
 use crate::storage::Location;
 use crate::{DtcOutcome, EgtError, EgtResult};
+
+/// Parses a standard-chess FEN for probing, accepting impossible checks as indexing does.
+pub fn parse_position(fen: &str) -> EgtResult<Chess> {
+    fen.parse::<Fen>()
+        .map_err(EgtError::InvalidFen)?
+        .into_position(CastlingMode::Standard)
+        .or_else(PositionError::ignore_impossible_check)
+        .map_err(|e| EgtError::InvalidPosition(format!("invalid position: {e:?}")))
+}
+
+#[cfg(test)]
+#[test]
+fn parse_position_accepts_impossible_check() {
+    let position = parse_position("r6b/7k/8/8/8/8/2n5/K7 w - - 0 1").unwrap();
+    assert_eq!(position.checkers().count(), 3);
+}
 
 /// A position's outcome and its legal moves with successor-side-to-move outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]

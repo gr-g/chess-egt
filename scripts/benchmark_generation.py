@@ -92,7 +92,7 @@ def main():
         parser.error("--input-path must be a current tablebase root with format.json")
     # Delegate selector validation to the pure theoretical listing action.
     for selector in args.selectors:
-        subprocess.run([str(binary), "--list", selector], check=True,
+        subprocess.run([str(binary), "list", selector], check=True,
                        stdout=subprocess.DEVNULL, timeout=args.timeout)
     output.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parent.parent
@@ -127,9 +127,8 @@ def main():
                 run = output / f"job{job}-t{threads}-r{repeat}"
                 run.mkdir()
                 tables = run / "tables"
-                command = [str(binary), "--path", str(tables), "--input-path",
-                           str(input_path), "--generate", selector,
-                           "--threads", str(threads)]
+                command = [str(binary), "generate", selector, "--path", str(tables),
+                           "--input-path", str(input_path), "--threads", str(threads)]
                 print(f"Running {selector}, {threads} thread(s), repeat {repeat}", flush=True)
                 timing = measure(command, run / "generation.log", args.timeout)
                 artifacts = sorted(p for p in tables.rglob("*") if p.is_file())

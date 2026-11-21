@@ -37,9 +37,8 @@ cargo build --locked --profile profiling
 timeout --signal=TERM --kill-after=15s 600s \
   valgrind --tool=callgrind --cache-sim=no --branch-sim=no \
   --callgrind-out-file=target/profile-kq-kr.callgrind \
-  target/profiling/chess-egt \
-  --path target/profile-kq-kr-tables --input-path ~/ggegt \
-  --generate KQ_KR --threads 1
+  target/profiling/chess-egt generate KQ_KR --threads 1 \
+  --path target/profile-kq-kr-tables --input-path ~/ggegt
 callgrind_annotate --auto=no --threshold=100 target/profile-kq-kr.callgrind
 callgrind_annotate --auto=no --inclusive=yes --tree=calling --threshold=100 \
   target/profile-kq-kr.callgrind
@@ -132,9 +131,8 @@ Both generated `.ggegt` files were byte-identical between native and Callgrind
 runs. After profiling, both tables passed internal consistency verification:
 
 ```sh
-target/profiling/chess-egt \
-  --path target/profile-kq-kr-tables --input-path ~/ggegt \
-  --verify KQ_KR KR_KQ --threads 1
+target/profiling/chess-egt verify KQ_KR KR_KQ --threads 1 \
+  --path target/profile-kq-kr-tables --input-path ~/ggegt
 ```
 
 No solver changes were made. Any behavior-preserving hot-path optimization

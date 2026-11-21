@@ -19,7 +19,11 @@ pub enum EgtError {
     #[error("invalid piece configuration: {0}")]
     UnsupportedPosition(&'static str),
 
-    /// A FEN or position could not be parsed or is invalid.
+    /// The input could not be parsed as FEN.
+    #[error("invalid position: invalid FEN: {0:?}")]
+    InvalidFen(#[source] shakmaty::fen::ParseFenError),
+
+    /// The chess position is invalid.
     #[error("invalid position: {0}")]
     InvalidPosition(String),
 
